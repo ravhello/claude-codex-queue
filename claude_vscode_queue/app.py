@@ -48,6 +48,28 @@ CLAUDE_EXTERNAL_AUTH_ENV_VARS = {
     "CLAUDE_CODE_USE_BEDROCK",
     "CLAUDE_CODE_USE_VERTEX",
 }
+CODEX_EXTERNAL_AUTH_ENV_VARS = {
+    "CODEX_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_ORG_ID",
+    "OPENAI_PROJECT_ID",
+}
+
+PROVIDER_CLAUDE = "claude"
+PROVIDER_CODEX = "codex"
+
+VALID_CODEX_SANDBOX_MODES = {
+    "danger-full-access",
+    "read-only",
+    "workspace-write",
+}
+VALID_CODEX_APPROVAL_POLICIES = {
+    "never",
+    "on-failure",
+    "on-request",
+    "untrusted",
+}
 
 VALID_PERMISSION_MODES = {
     "acceptEdits",
@@ -105,6 +127,11 @@ class Chat:
     account_key: str | None = None
     account_label: str | None = None
     account_status: str = "unknown"
+    provider: str = PROVIDER_CLAUDE
+    sandbox_mode: str | None = None
+    approval_policy: str | None = None
+    personality: str | None = None
+    archived: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -114,6 +141,10 @@ class Paths:
     state_dir: Path
     queue_file: Path
     log_dir: Path
+
+    @property
+    def codex_home(self) -> Path:
+        return self.windows_home / ".codex"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -189,6 +220,13 @@ def unique_paths(paths: list[Path]) -> list[Path]:
     return result
 
 
+def path_exists(path: Path) -> bool:
+    try:
+        return path.exists()
+    except OSError:
+        return False
+
+
 def is_wsl() -> bool:
     if os.name == "nt":
         return False
@@ -199,13 +237,21 @@ def is_wsl() -> bool:
 
 
 def windows_to_local_path(value: str | Path) -> Path:
-    raw = str(value).strip().strip('"')
+    raw = normalize_windows_path(str(value).strip().strip('"'))
     match = re.match(r"^([a-zA-Z]):[\\/](.*)$", raw)
     if os.name != "nt" and match:
         drive = match.group(1).lower()
         rest = match.group(2).replace("\\", "/")
         return Path("/mnt") / drive / rest
     return Path(raw)
+
+
+def normalize_windows_path(value: str) -> str:
+    if value.startswith("\\\\?\\UNC\\"):
+        return "\\\\" + value[8:]
+    if value.startswith("\\\\?\\"):
+        return value[4:]
+    return value
 
 
 def cwd_accessible(cwd: str | None) -> bool:
@@ -220,7 +266,8 @@ def cwd_accessible(cwd: str | None) -> bool:
 def is_windows_path(value: str | None) -> bool:
     if not value:
         return False
-    return bool(re.match(r"^[a-zA-Z]:[\\/]", value) or value.startswith("\\\\"))
+    normalized = normalize_windows_path(value)
+    return bool(re.match(r"^[a-zA-Z]:[\\/]", normalized) or normalized.startswith("\\\\"))
 
 
 @functools.lru_cache(maxsize=256)
@@ -281,7 +328,7 @@ def candidate_windows_homes(override: str | None = None) -> list[Path]:
         candidates.append(inferred)
     candidates.append(Path.home())
     for globbed in Path("/mnt/c/Users").glob("*") if Path("/mnt/c/Users").exists() else []:
-        if (globbed / ".claude" / "projects").exists():
+        if path_exists(globbed / ".claude" / "projects") or path_exists(globbed / ".codex" / "session_index.jsonl"):
             candidates.append(globbed)
     return unique_paths(candidates)
 
@@ -290,7 +337,7 @@ def resolve_paths(windows_home: str | None = None, state_dir: str | None = None)
     home_candidates = candidate_windows_homes(windows_home)
     selected_home = None
     for home in home_candidates:
-        if (home / ".claude" / "projects").exists():
+        if path_exists(home / ".claude" / "projects") or path_exists(home / ".codex" / "session_index.jsonl"):
             selected_home = home
             break
     if selected_home is None:
@@ -345,6 +392,48 @@ def find_claude_executable(paths: Paths, override: str | None = None) -> Path | 
         return None
     candidates.sort(key=lambda path: (parse_version_from_extension(path.parents[2]), path.stat().st_mtime))
     return candidates[-1]
+
+
+def find_codex_executable(paths: Paths, override: str | None = None) -> Path | None:
+    env_override = override or os.environ.get("CODEX_EXE")
+    if env_override:
+        candidate = windows_to_local_path(env_override)
+        if candidate.exists():
+            return candidate
+
+    which = shutil.which("codex")
+    if which and not is_wsl():
+        return Path(which)
+
+    candidates = [
+        paths.windows_home / "AppData" / "Local" / "npm" / "codex.cmd",
+        paths.windows_home / "AppData" / "Local" / "npm" / "codex.exe",
+        paths.windows_home / "AppData" / "Roaming" / "npm" / "codex.cmd",
+        paths.windows_home / "AppData" / "Roaming" / "npm" / "codex.exe",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    if which:
+        return Path(which)
+    return None
+
+
+def run_codex_cli_command(codex_exe: Path, arguments: list[str], timeout: int = 15) -> subprocess.CompletedProcess[str]:
+    if codex_exe.suffix.lower() in {".cmd", ".bat", ".exe"} or is_windows_path(str(codex_exe)):
+        executable = local_to_windows_path(codex_exe)
+        command = ["cmd.exe", "/d", "/c", "call", executable, *arguments]
+    else:
+        command = [str(codex_exe), *arguments]
+    return subprocess.run(
+        command,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        capture_output=True,
+        timeout=timeout,
+        env=codex_subprocess_env(),
+    )
 
 
 def safe_json_loads(line: str) -> dict[str, Any] | None:
@@ -439,6 +528,43 @@ def active_claude_account(paths: Paths) -> AccountInfo | None:
     )
 
 
+def jwt_payload(token: str | None) -> dict[str, Any]:
+    if not token or token.count(".") < 2:
+        return {}
+    try:
+        encoded = token.split(".", 2)[1]
+        encoded += "=" * (-len(encoded) % 4)
+        value = json.loads(base64.urlsafe_b64decode(encoded.encode("ascii")).decode("utf-8"))
+    except (ValueError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def active_codex_account(paths: Paths) -> AccountInfo | None:
+    auth_path = paths.codex_home / "auth.json"
+    auth = load_json_file(auth_path)
+    tokens = auth.get("tokens") if isinstance(auth.get("tokens"), dict) else {}
+    account_id = tokens.get("account_id") if isinstance(tokens.get("account_id"), str) else None
+    claims = jwt_payload(tokens.get("id_token") if isinstance(tokens.get("id_token"), str) else None)
+    email = claims.get("email") if isinstance(claims.get("email"), str) else None
+    subject = claims.get("sub") if isinstance(claims.get("sub"), str) else None
+    if not any([account_id, email, subject]):
+        return None
+
+    identity = "|".join([account_id or "", email.lower() if email else "", subject or ""])
+    hashed = hash_text(identity) or "unknown"
+    key = f"codex:{hashed}"
+    label = mask_email(email) or f"Codex {hashed[:8]}"
+    return AccountInfo(
+        key=key,
+        label=label,
+        account_uuid_hash=short_hash(account_id),
+        organization_uuid_hash=None,
+        email_hash=short_hash(email.lower() if email else None),
+        source_changed_at=file_mtime_iso(auth_path),
+    )
+
+
 def load_account_index(paths: Paths) -> dict[str, Any]:
     data = load_json_file(account_index_path(paths))
     if not data:
@@ -482,8 +608,33 @@ def register_active_account(paths: Paths, index: dict[str, Any] | None = None) -
     return account
 
 
+def register_active_codex_account(paths: Paths, index: dict[str, Any] | None = None) -> AccountInfo | None:
+    account = active_codex_account(paths)
+    if account is None:
+        return None
+    index = index if index is not None else load_account_index(paths)
+    accounts = index.setdefault("accounts", {})
+    now = now_utc()
+    existing = accounts.get(account.key) if isinstance(accounts.get(account.key), dict) else {}
+    accounts[account.key] = {
+        **existing,
+        "key": account.key,
+        "provider": PROVIDER_CODEX,
+        "label": account.label,
+        "account_uuid_hash": account.account_uuid_hash,
+        "email_hash": account.email_hash,
+        "source_changed_at": account.source_changed_at,
+        "first_seen_at": existing.get("first_seen_at") or now,
+        "last_seen_at": now,
+    }
+    save_account_index(paths, index)
+    return account
+
+
 def chat_account_session_key(chat: Chat) -> str:
     scope = f"ssh:{chat.remote_host}" if chat.remote_kind == "ssh" and chat.remote_host else "local"
+    if chat.provider != PROVIDER_CLAUDE:
+        scope = f"{chat.provider}:{scope}"
     return f"{scope}:{chat.session_id}"
 
 
@@ -537,7 +688,13 @@ def real_model_value(value: Any) -> str | None:
 
 
 def chat_sort_key(chat: Chat) -> dt.datetime:
-    return parse_iso(chat.last_timestamp) or dt.datetime.fromtimestamp(chat.jsonl_path.stat().st_mtime, tz=dt.UTC)
+    parsed = parse_iso(chat.last_timestamp)
+    if parsed:
+        return parsed
+    try:
+        return dt.datetime.fromtimestamp(chat.jsonl_path.stat().st_mtime, tz=dt.UTC)
+    except OSError:
+        return dt.datetime.min.replace(tzinfo=dt.UTC)
 
 
 def discover_chats(claude_home: Path) -> list[Chat]:
@@ -625,6 +782,219 @@ def discover_chats(claude_home: Path) -> list[Chat]:
                 by_session[session_id] = chat
 
     return sorted(by_session.values(), key=chat_sort_key, reverse=True)
+
+
+def load_codex_session_index(codex_home: Path) -> dict[str, dict[str, Any]]:
+    index_path = codex_home / "session_index.jsonl"
+    sessions: dict[str, dict[str, Any]] = {}
+    try:
+        handle = index_path.open("r", encoding="utf-8", errors="replace")
+    except OSError:
+        return sessions
+    with handle:
+        for position, line in enumerate(handle):
+            entry = safe_json_loads(line)
+            if not entry or not isinstance(entry.get("id"), str):
+                continue
+            session_id = entry["id"]
+            timestamp = parse_iso(entry.get("updated_at") if isinstance(entry.get("updated_at"), str) else None)
+            existing = sessions.get(session_id)
+            existing_timestamp = (
+                parse_iso(existing.get("updated_at"))
+                if isinstance(existing, dict) and isinstance(existing.get("updated_at"), str)
+                else None
+            )
+            if existing is None or timestamp is None or existing_timestamp is None or timestamp >= existing_timestamp:
+                sessions[session_id] = {**entry, "_position": position}
+    return sessions
+
+
+def codex_thread_rows(codex_home: Path) -> dict[str, dict[str, Any]]:
+    database = codex_home / "state_5.sqlite"
+    if not database.exists():
+        return {}
+    columns = [
+        "id",
+        "rollout_path",
+        "cwd",
+        "model",
+        "reasoning_effort",
+        "sandbox_policy",
+        "approval_mode",
+        "archived",
+        "updated_at_ms",
+        "recency_at_ms",
+    ]
+    connection: sqlite3.Connection | None = None
+    try:
+        connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True, timeout=1)
+        connection.row_factory = sqlite3.Row
+        available = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
+        selected = [column for column in columns if column in available]
+        if "id" not in selected:
+            return {}
+        rows = connection.execute(f"SELECT {', '.join(selected)} FROM threads").fetchall()
+        return {str(row["id"]): dict(row) for row in rows if row["id"]}
+    except sqlite3.Error:
+        pass
+    finally:
+        if connection is not None:
+            connection.close()
+
+    if not is_wsl() or shutil.which("py.exe") is None:
+        return {}
+    script = r"""
+import json
+import sqlite3
+import sys
+
+columns = json.loads(sys.argv[2])
+connection = sqlite3.connect(sys.argv[1])
+connection.row_factory = sqlite3.Row
+available = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
+selected = [column for column in columns if column in available]
+rows = connection.execute("SELECT " + ", ".join(selected) + " FROM threads").fetchall()
+print(json.dumps([dict(row) for row in rows], ensure_ascii=True))
+"""
+    try:
+        result = subprocess.run(
+            [
+                "py.exe",
+                "-3",
+                "-c",
+                script,
+                local_to_windows_path(database),
+                json.dumps(columns),
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=15,
+        )
+        values = json.loads(result.stdout) if result.returncode == 0 else []
+    except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
+        return {}
+    return {
+        str(row["id"]): row
+        for row in values
+        if isinstance(row, dict) and isinstance(row.get("id"), str)
+    }
+
+
+def codex_rollout_files(codex_home: Path) -> tuple[dict[str, Path], dict[str, Path]]:
+    active: dict[str, Path] = {}
+    archived: dict[str, Path] = {}
+    session_pattern = re.compile(r"([0-9a-f]{8}-[0-9a-f-]{27})\.jsonl$", re.IGNORECASE)
+    for root, destination in [
+        (codex_home / "sessions", active),
+        (codex_home / "archived_sessions", archived),
+    ]:
+        if not root.exists():
+            continue
+        for path in root.glob("**/rollout-*.jsonl"):
+            match = session_pattern.search(path.name)
+            if match:
+                destination[match.group(1).lower()] = path
+    return active, archived
+
+
+def codex_sandbox_mode(value: Any) -> str | None:
+    policy = value
+    if isinstance(value, str):
+        try:
+            policy = json.loads(value)
+        except json.JSONDecodeError:
+            policy = {"type": value}
+    mode = policy.get("type") if isinstance(policy, dict) else None
+    if mode == "disabled":
+        return "danger-full-access"
+    return mode if mode in VALID_CODEX_SANDBOX_MODES else None
+
+
+def codex_cwd_runnable(cwd: str | None, codex_exe: Path | None) -> bool:
+    if not cwd or codex_exe is None:
+        return False
+    normalized = normalize_windows_path(cwd)
+    if is_windows_path(normalized):
+        return cwd_accessible(normalized) or windows_path_accessible(normalized)
+    if codex_exe.suffix.lower() in {".cmd", ".bat", ".exe"}:
+        return False
+    return cwd_accessible(normalized)
+
+
+def codex_timestamp(index_entry: dict[str, Any], row: dict[str, Any]) -> str | None:
+    values: list[dt.datetime] = []
+    indexed = parse_iso(index_entry.get("updated_at") if isinstance(index_entry.get("updated_at"), str) else None)
+    if indexed:
+        values.append(indexed)
+    for key in ["recency_at_ms", "updated_at_ms"]:
+        timestamp = parse_iso(iso_from_epoch_ms(row.get(key)))
+        if timestamp:
+            values.append(timestamp)
+            break
+    if not values:
+        return None
+    return max(values).astimezone().replace(microsecond=0).isoformat()
+
+
+def discover_codex_app_sessions(paths: Paths) -> list[Chat]:
+    index = load_codex_session_index(paths.codex_home)
+    if not index:
+        return []
+    rows = codex_thread_rows(paths.codex_home)
+    active_files, archived_files = codex_rollout_files(paths.codex_home)
+    codex_exe = find_codex_executable(paths)
+    authenticated = active_codex_account(paths) is not None
+    chats: list[Chat] = []
+
+    for session_id, index_entry in index.items():
+        row = rows.get(session_id, {})
+        raw_rollout = row.get("rollout_path") if isinstance(row.get("rollout_path"), str) else None
+        rollout = windows_to_local_path(raw_rollout) if raw_rollout else None
+        archived = bool(row.get("archived"))
+        if rollout is None or not rollout.exists():
+            rollout = active_files.get(session_id.lower())
+            if rollout is None:
+                rollout = archived_files.get(session_id.lower())
+                archived = rollout is not None
+
+        raw_cwd = row.get("cwd") if isinstance(row.get("cwd"), str) else None
+        cwd = normalize_windows_path(raw_cwd) if raw_cwd else None
+        title = index_entry.get("thread_name") if isinstance(index_entry.get("thread_name"), str) else None
+        first_prompt = row.get("first_user_message") if isinstance(row.get("first_user_message"), str) else None
+        display_title = truncate(title, 100) or truncate(first_prompt, 100) or "Codex task"
+        sandbox_mode = codex_sandbox_mode(row.get("sandbox_policy"))
+        approval = row.get("approval_mode") if isinstance(row.get("approval_mode"), str) else None
+        can_queue = bool(
+            not archived
+            and authenticated
+            and rollout is not None
+            and rollout.exists()
+            and codex_cwd_runnable(cwd, codex_exe)
+        )
+        chats.append(
+            Chat(
+                session_id=session_id,
+                title=display_title,
+                cwd=cwd,
+                permission_mode=sandbox_mode,
+                model=real_model_value(row.get("model")),
+                jsonl_path=rollout or Path(session_id),
+                last_timestamp=codex_timestamp(index_entry, row),
+                message_count=-1,
+                last_prompt=first_prompt,
+                effort_level=row.get("reasoning_effort") if isinstance(row.get("reasoning_effort"), str) else None,
+                source="Codex App" if not archived else "Codex App (archiviata)",
+                source_key="codex_app" if not archived else "codex_app_archived",
+                can_queue=can_queue,
+                provider=PROVIDER_CODEX,
+                sandbox_mode=sandbox_mode,
+                approval_policy=approval if approval in VALID_CODEX_APPROVAL_POLICIES else None,
+                archived=archived,
+            )
+        )
+    return sorted(chats, key=chat_sort_key, reverse=True)
 
 
 def workspace_storage_root(paths: Paths) -> Path:
@@ -1134,6 +1504,41 @@ def transfer_chat_to_active_desktop_account(paths: Paths, chat: Chat, move: bool
     }
 
 
+def transfer_codex_chat_to_active_account(paths: Paths, chat: Chat) -> dict[str, Any]:
+    if chat.provider != PROVIDER_CODEX:
+        raise ValueError("La task selezionata non appartiene a Codex.")
+    if chat.archived:
+        raise ValueError("La task Codex e' archiviata: riaprila nell'app Codex prima di associarla.")
+    active = active_codex_account(paths)
+    if active is None:
+        raise ValueError("Account Codex attivo non rilevato.")
+    index = load_account_index(paths)
+    register_active_codex_account(paths, index)
+    sessions = index.setdefault("sessions", {})
+    key = chat_account_session_key(chat)
+    previous = sessions.get(key) if isinstance(sessions.get(key), dict) else {}
+    sessions[key] = {
+        **previous,
+        "account_key": active.key,
+        "label": active.label,
+        "provider": PROVIDER_CODEX,
+        "session_id": chat.session_id,
+        "source": chat.source,
+        "title": chat.title,
+        "cwd": chat.cwd,
+        "first_seen_at": previous.get("first_seen_at") or now_utc(),
+        "last_seen_at": now_utc(),
+    }
+    save_account_index(paths, index)
+    return {
+        "status": "associated",
+        "session_id": chat.session_id,
+        "title": chat.title,
+        "active_account": active.label,
+        "destination": str(chat.jsonl_path),
+    }
+
+
 def desktop_account_fields(account_uuid: str | None, active_account_uuid: str | None) -> dict[str, str | None]:
     if not account_uuid:
         return {"account_key": None, "account_label": None, "account_status": "unknown"}
@@ -1627,6 +2032,70 @@ def annotate_chats_with_accounts(paths: Paths, chats: list[Chat]) -> list[Chat]:
     return annotated
 
 
+def annotate_codex_chats_with_accounts(paths: Paths, chats: list[Chat]) -> list[Chat]:
+    index = load_account_index(paths)
+    active = register_active_codex_account(paths, index)
+    sessions = index.setdefault("sessions", {})
+    accounts = index.setdefault("accounts", {})
+    changed = False
+    annotated: list[Chat] = []
+
+    for chat in chats:
+        session_key = chat_account_session_key(chat)
+        session_record = sessions.get(session_key) if isinstance(sessions.get(session_key), dict) else {}
+        account_key = session_record.get("account_key") if isinstance(session_record.get("account_key"), str) else None
+
+        if account_key is None and active is not None and chat_recent_for_account(chat, active):
+            account_key = active.key
+            session_record = {
+                "account_key": active.key,
+                "label": active.label,
+                "provider": PROVIDER_CODEX,
+                "session_id": chat.session_id,
+                "source": chat.source,
+                "title": chat.title,
+                "cwd": chat.cwd,
+                "first_seen_at": now_utc(),
+                "last_seen_at": now_utc(),
+            }
+            sessions[session_key] = session_record
+            changed = True
+        elif account_key is not None:
+            session_record["last_seen_at"] = now_utc()
+            sessions[session_key] = session_record
+            changed = True
+
+        account_label = None
+        account_status = "unknown"
+        if account_key:
+            account_data = accounts.get(account_key) if isinstance(accounts.get(account_key), dict) else {}
+            account_label = (
+                session_record.get("label")
+                if isinstance(session_record.get("label"), str)
+                else account_data.get("label") if isinstance(account_data.get("label"), str) else f"Codex {account_key[-8:]}"
+            )
+            if active is None:
+                account_status = "known"
+            elif account_key == active.key:
+                account_status = "active"
+            else:
+                account_status = "other"
+
+        annotated.append(
+            dataclasses.replace(
+                chat,
+                can_queue=chat.can_queue and account_status != "other",
+                account_key=account_key,
+                account_label=account_label,
+                account_status=account_status,
+            )
+        )
+
+    if changed:
+        save_account_index(paths, index)
+    return annotated
+
+
 def discover_claude_chats(
     paths: Paths,
     sync_desktop_accounts: bool = True,
@@ -1642,18 +2111,32 @@ def discover_claude_chats(
     return annotate_chats_with_accounts(paths, merge_claude_chat_sources(transcript_chats, agent_chats + desktop_chats))
 
 
+def discover_agent_chats(
+    paths: Paths,
+    sync_desktop_accounts: bool = True,
+    active_desktop_only: bool = False,
+) -> list[Chat]:
+    claude_chats = discover_claude_chats(paths, sync_desktop_accounts, active_desktop_only)
+    codex_chats = annotate_codex_chats_with_accounts(paths, discover_codex_app_sessions(paths))
+    return sorted(claude_chats + codex_chats, key=chat_sort_key, reverse=True)
+
+
 def remember_chat_account(paths: Paths, chat: Chat) -> Chat:
     if chat.remote_kind is not None or chat.account_key:
         return chat
-    active = active_claude_account(paths)
+    active = active_codex_account(paths) if chat.provider == PROVIDER_CODEX else active_claude_account(paths)
     if active is None:
         return chat
     index = load_account_index(paths)
-    register_active_account(paths, index)
+    if chat.provider == PROVIDER_CODEX:
+        register_active_codex_account(paths, index)
+    else:
+        register_active_account(paths, index)
     sessions = index.setdefault("sessions", {})
     sessions[chat_account_session_key(chat)] = {
         "account_key": active.key,
         "label": active.label,
+        "provider": chat.provider,
         "session_id": chat.session_id,
         "source": chat.source,
         "title": chat.title,
@@ -1667,14 +2150,19 @@ def remember_chat_account(paths: Paths, chat: Chat) -> Chat:
     return dataclasses.replace(chat, account_key=active.key, account_label=active.label, account_status="active")
 
 
-def account_mismatch_message(expected_key: str | None, expected_label: str | None, active: AccountInfo | None) -> str | None:
+def account_mismatch_message(
+    expected_key: str | None,
+    expected_label: str | None,
+    active: AccountInfo | None,
+    provider_label: str = "Claude",
+) -> str | None:
     if not expected_key:
         return None
     if active is None:
-        return "Account Claude attivo non rilevato: non invio per non usare una sessione con credenziali sbagliate."
+        return f"Account {provider_label} attivo non rilevato: non invio per non usare una sessione con credenziali sbagliate."
     if expected_key != active.key:
         expected = expected_label or f"Account {expected_key[:8]}"
-        return f"Chat associata a {expected}; account attivo: {active.label}. Cambia account Claude o riassocia la chat prima di inviare."
+        return f"Chat associata a {expected}; account attivo: {active.label}. Cambia account {provider_label} o riassocia la chat prima di inviare."
     return None
 
 
@@ -1693,9 +2181,11 @@ def desktop_account_mismatch_message(paths: Paths, expected_key: str | None, exp
 def account_mismatch_for_chat(paths: Paths, chat: Chat) -> str | None:
     if chat.remote_kind is not None:
         return None
+    if chat.provider == PROVIDER_CODEX:
+        return account_mismatch_message(chat.account_key, chat.account_label, active_codex_account(paths), "Codex")
     if chat.account_key and chat.account_key.startswith("claude-app:"):
         return desktop_account_mismatch_message(paths, chat.account_key, chat.account_label)
-    return account_mismatch_message(chat.account_key, chat.account_label, active_claude_account(paths))
+    return account_mismatch_message(chat.account_key, chat.account_label, active_claude_account(paths), "Claude")
 
 
 def account_mismatch_for_item(paths: Paths, item: dict[str, Any]) -> str | None:
@@ -1703,9 +2193,11 @@ def account_mismatch_for_item(paths: Paths, item: dict[str, Any]) -> str | None:
         return None
     expected_key = item.get("account_key") if isinstance(item.get("account_key"), str) else None
     expected_label = item.get("account_label") if isinstance(item.get("account_label"), str) else None
+    if item.get("provider") == PROVIDER_CODEX:
+        return account_mismatch_message(expected_key, expected_label, active_codex_account(paths), "Codex")
     if expected_key and expected_key.startswith("claude-app:"):
         return desktop_account_mismatch_message(paths, expected_key, expected_label)
-    return account_mismatch_message(expected_key, expected_label, active_claude_account(paths))
+    return account_mismatch_message(expected_key, expected_label, active_claude_account(paths), "Claude")
 
 
 def load_json_file(path: Path) -> dict[str, Any]:
@@ -1769,6 +2261,13 @@ def candidate_settings_files(paths: Paths, cwd: str | None) -> list[Path]:
     return unique_paths(candidates)
 
 
+def candidate_codex_settings_files(paths: Paths, cwd: str | None) -> list[Path]:
+    candidates = [paths.codex_home / "config.toml", paths.codex_home / "AGENTS.md"]
+    for parent in parents_for_settings(cwd):
+        candidates.extend([parent / ".codex" / "config.toml", parent / "AGENTS.md"])
+    return unique_paths(candidates)
+
+
 def sha256_file(path: Path) -> str | None:
     if not path.exists() or not path.is_file():
         return None
@@ -1779,7 +2278,42 @@ def sha256_file(path: Path) -> str | None:
     return digest.hexdigest()
 
 
+def codex_settings_fingerprint(paths: Paths, chat: Chat) -> dict[str, Any]:
+    setting_paths = candidate_codex_settings_files(paths, chat.cwd)
+    files = []
+    for path in setting_paths:
+        exists = path.exists()
+        files.append(
+            {
+                "path": str(path),
+                "exists": exists,
+                "sha256": sha256_file(path) if exists else None,
+            }
+        )
+    return {
+        "created_at": now_utc(),
+        "provider": PROVIDER_CODEX,
+        "session_id": chat.session_id,
+        "cwd": chat.cwd,
+        "jsonl_path": str(chat.jsonl_path),
+        "account": {
+            "key": chat.account_key,
+            "label": chat.account_label,
+            "status": chat.account_status,
+        },
+        "effective": {
+            "model": real_model_value(chat.model),
+            "effortLevel": chat.effort_level,
+            "sandboxMode": chat.sandbox_mode or chat.permission_mode,
+            "approvalPolicy": chat.approval_policy,
+        },
+        "files": files,
+    }
+
+
 def settings_fingerprint(paths: Paths, chat: Chat) -> dict[str, Any]:
+    if chat.provider == PROVIDER_CODEX:
+        return codex_settings_fingerprint(paths, chat)
     if chat.remote_kind == "ssh" and chat.remote_host and chat.remote_cwd:
         return remote_settings_fingerprint(paths, chat)
 
@@ -1805,6 +2339,7 @@ def settings_fingerprint(paths: Paths, chat: Chat) -> dict[str, Any]:
 
     return {
         "created_at": now_utc(),
+        "provider": PROVIDER_CLAUDE,
         "session_id": chat.session_id,
         "cwd": chat.cwd,
         "jsonl_path": str(chat.jsonl_path),
@@ -1824,6 +2359,10 @@ def settings_fingerprint(paths: Paths, chat: Chat) -> dict[str, Any]:
 
 def compare_fingerprints(saved: dict[str, Any], current: dict[str, Any]) -> list[str]:
     diffs: list[str] = []
+    saved_provider = saved.get("provider") or PROVIDER_CLAUDE
+    current_provider = current.get("provider") or PROVIDER_CLAUDE
+    if saved_provider != current_provider:
+        diffs.append(f"provider diverso: {saved_provider} -> {current_provider}")
     if saved.get("session_id") != current.get("session_id"):
         diffs.append("session_id diverso")
     if saved.get("cwd") != current.get("cwd"):
@@ -1833,7 +2372,7 @@ def compare_fingerprints(saved: dict[str, Any], current: dict[str, Any]) -> list
     saved_account = saved.get("account") if isinstance(saved.get("account"), dict) else {}
     current_account = current.get("account") if isinstance(current.get("account"), dict) else {}
     if saved_account.get("key") and current_account.get("key") and saved_account.get("key") != current_account.get("key"):
-        diffs.append("account Claude diverso")
+        diffs.append("account diverso")
     if saved.get("effective") != current.get("effective"):
         diffs.append("impostazioni effettive diverse")
 
@@ -2043,6 +2582,13 @@ def claude_subprocess_env() -> dict[str, str]:
     return env
 
 
+def codex_subprocess_env() -> dict[str, str]:
+    env = os.environ.copy()
+    for name in CODEX_EXTERNAL_AUTH_ENV_VARS:
+        env.pop(name, None)
+    return env
+
+
 def clear_claude_external_auth_powershell() -> str:
     names = ", ".join(powershell_single_quote(name) for name in sorted(CLAUDE_EXTERNAL_AUTH_ENV_VARS))
     return f"""
@@ -2190,7 +2736,7 @@ def save_queue(queue_file: Path, data: dict[str, Any]) -> None:
 
 def select_chat(selector: str | None, chats: list[Chat]) -> Chat:
     if not chats:
-        raise SystemExit("Nessuna chat Claude Code trovata.")
+        raise SystemExit("Nessuna chat Claude o task Codex trovata.")
     if selector is None:
         print_chat_list(chats, limit=30)
         selector = input("Scegli numero, session id, titolo o cwd: ").strip()
@@ -2344,17 +2890,50 @@ def build_claude_arguments(item: dict[str, Any], use_ide: bool) -> list[str]:
     return command
 
 
+def toml_string(value: str) -> str:
+    if "'" not in value:
+        return f"'{value}'"
+    return json.dumps(value, ensure_ascii=True)
+
+
+def build_codex_arguments(item: dict[str, Any]) -> list[str]:
+    command = ["exec", "resume", "--json", "--skip-git-repo-check"]
+    effective = item.get("fingerprint", {}).get("effective", {})
+    if not isinstance(effective, dict):
+        effective = {}
+    model = item.get("model_override") or effective.get("model")
+    effort = item.get("effort_level_override") or effective.get("effortLevel")
+    sandbox = item.get("sandbox_mode_override") or effective.get("sandboxMode")
+    approval = item.get("approval_policy_override") or effective.get("approvalPolicy")
+    if isinstance(model, str) and model.strip():
+        command.extend(["--model", model.strip()])
+    if isinstance(effort, str) and effort.strip():
+        command.extend(["-c", f"model_reasoning_effort={toml_string(effort.strip())}"])
+    if isinstance(sandbox, str) and sandbox in VALID_CODEX_SANDBOX_MODES:
+        command.extend(["-c", f"sandbox_mode={toml_string(sandbox)}"])
+    if isinstance(approval, str) and approval in VALID_CODEX_APPROVAL_POLICIES:
+        command.extend(["-c", f"approval_policy={toml_string(approval)}"])
+    command.extend([item["session_id"], "-"])
+    return command
+
+
 def selected_setting_overrides(values: dict[str, Any]) -> dict[str, str]:
     overrides: dict[str, str] = {}
     model = values.get("model_override")
     effort = values.get("effort_level_override")
     permission = values.get("permission_mode_override")
+    sandbox = values.get("sandbox_mode_override")
+    approval = values.get("approval_policy_override")
     if isinstance(model, str) and model.strip():
         overrides["model_override"] = model.strip()
     if isinstance(effort, str) and effort.strip():
         overrides["effort_level_override"] = effort.strip()
     if isinstance(permission, str) and permission in VALID_PERMISSION_MODES:
         overrides["permission_mode_override"] = permission
+    if isinstance(sandbox, str) and sandbox in VALID_CODEX_SANDBOX_MODES:
+        overrides["sandbox_mode_override"] = sandbox
+    if isinstance(approval, str) and approval in VALID_CODEX_APPROVAL_POLICIES:
+        overrides["approval_policy_override"] = approval
     return overrides
 
 
@@ -2363,6 +2942,8 @@ def item_setting_overrides(item: dict[str, Any]) -> dict[str, Any]:
         "model_override": item.get("model_override"),
         "effort_level_override": item.get("effort_level_override"),
         "permission_mode_override": item.get("permission_mode_override"),
+        "sandbox_mode_override": item.get("sandbox_mode_override"),
+        "approval_policy_override": item.get("approval_policy_override"),
     }
 
 
@@ -2608,6 +3189,100 @@ def run_claude(
     )
 
 
+def run_codex(
+    paths: Paths,
+    codex_exe: Path,
+    item: dict[str, Any],
+    timeout: int,
+) -> ClaudeRunResult:
+    prompt = item["prompt"]
+    arguments = build_codex_arguments(item)
+    cwd = normalize_windows_path(str(item.get("cwd") or ""))
+    if not cwd:
+        raise SystemExit("La task Codex non ha un cwd salvato; non invio per non cambiare contesto.")
+
+    if codex_exe.suffix.lower() in {".cmd", ".bat", ".exe"} or is_windows_path(str(codex_exe)):
+        if not is_windows_path(cwd):
+            raise SystemExit(f"Il CLI Codex Windows non puo' riprendere una task con cwd non Windows: {cwd}")
+        executable = local_to_windows_path(codex_exe)
+        proc = subprocess.run(
+            ["cmd.exe", "/d", "/c", "cd", "/d", cwd, "&&", "call", executable, *arguments],
+            input=prompt,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout,
+            env=codex_subprocess_env(),
+        )
+    else:
+        proc = subprocess.run(
+            [str(codex_exe), *arguments],
+            input=prompt,
+            text=True,
+            cwd=cwd_for_subprocess(cwd),
+            capture_output=True,
+            timeout=timeout,
+            env=codex_subprocess_env(),
+        )
+
+    combined = f"{proc.stdout}\n{proc.stderr}"
+    limited = proc.returncode != 0 and is_rate_limit_text(combined)
+    reset = parse_reset_time(combined)
+    if limited and reset is None:
+        raw_path = item.get("jsonl_path")
+        if not isinstance(raw_path, str):
+            fingerprint = item.get("fingerprint") if isinstance(item.get("fingerprint"), dict) else {}
+            raw_path = fingerprint.get("jsonl_path") if isinstance(fingerprint.get("jsonl_path"), str) else None
+        if raw_path:
+            reset = codex_rate_limit_reset_from_path(windows_to_local_path(raw_path))
+    return ClaudeRunResult(
+        returncode=proc.returncode,
+        stdout=proc.stdout,
+        stderr=proc.stderr,
+        rate_limited=limited,
+        reset_at=reset.astimezone().isoformat() if reset else None,
+    )
+
+
+def run_agent(
+    paths: Paths,
+    claude_exe: Path | None,
+    codex_exe: Path | None,
+    item: dict[str, Any],
+    timeout: int,
+    use_ide: bool,
+) -> ClaudeRunResult:
+    if item.get("provider") == PROVIDER_CODEX:
+        if codex_exe is None:
+            raise SystemExit("CLI Codex non trovato. Esegui `doctor` per dettagli.")
+        return run_codex(paths, codex_exe, item, timeout)
+    if claude_exe is None:
+        raise SystemExit("Claude Code executable non trovato. Esegui `doctor` per dettagli.")
+    return run_claude(paths, claude_exe, item, timeout, use_ide)
+
+
+def print_agent_dry_run_details(
+    paths: Paths,
+    claude_exe: Path | None,
+    codex_exe: Path | None,
+    item: dict[str, Any],
+    use_ide: bool,
+    prompt: str,
+) -> None:
+    if item.get("provider") == PROVIDER_CODEX:
+        if codex_exe is None:
+            raise SystemExit("CLI Codex non trovato.")
+        print(f"provider: {PROVIDER_CODEX}")
+        print(f"cwd: {item.get('cwd')}")
+        print("cmd: " + " ".join([str(codex_exe), *build_codex_arguments(item)]))
+        print(f"prompt: {prompt}")
+        return
+    if claude_exe is None:
+        raise SystemExit("Claude Code executable non trovato.")
+    print_dry_run_details(paths, claude_exe, item, use_ide, prompt)
+
+
 def write_run_log(paths: Paths, item: dict[str, Any], result: ClaudeRunResult) -> str:
     paths.log_dir.mkdir(parents=True, exist_ok=True)
     log_path = paths.log_dir / f"{dt.datetime.now().strftime('%Y%m%d-%H%M%S')}-{item['id']}.log"
@@ -2644,7 +3319,71 @@ def message_text(message: dict[str, Any]) -> str | None:
     return None
 
 
+def codex_tail_objects(path: Path, max_bytes: int = 64 * 1024 * 1024) -> list[dict[str, Any]]:
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            start = max(0, size - max_bytes)
+            handle.seek(start)
+            raw = handle.read()
+    except OSError:
+        return []
+    if start:
+        newline = raw.find(b"\n")
+        raw = raw[newline + 1 :] if newline >= 0 else b""
+    objects: list[dict[str, Any]] = []
+    for line in raw.decode("utf-8", errors="replace").splitlines():
+        obj = safe_json_loads(line)
+        if obj:
+            objects.append(obj)
+    return objects
+
+
+def codex_rate_limit_reset_from_path(path: Path, now: dt.datetime | None = None) -> dt.datetime | None:
+    now = now or local_now()
+    for obj in reversed(codex_tail_objects(path)):
+        if obj.get("type") != "event_msg":
+            continue
+        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+        if payload.get("type") != "token_count":
+            continue
+        limits = payload.get("rate_limits") if isinstance(payload.get("rate_limits"), dict) else {}
+        reached = limits.get("rate_limit_reached_type")
+        windows: list[tuple[str, dict[str, Any]]] = []
+        for key in ["primary", "secondary"]:
+            value = limits.get(key)
+            if isinstance(value, dict):
+                windows.append((key, value))
+        candidates: list[dt.datetime] = []
+        for key, window in windows:
+            used = window.get("used_percent")
+            is_reached = bool(reached and (str(reached).lower() in {key, "both", "primary_and_secondary"}))
+            if reached and not is_reached:
+                continue
+            if not is_reached and not isinstance(used, (int, float)):
+                continue
+            if not is_reached and float(used) < 100:
+                continue
+            reset_epoch = window.get("resets_at")
+            if isinstance(reset_epoch, (int, float)):
+                try:
+                    candidates.append(dt.datetime.fromtimestamp(reset_epoch, tz=dt.UTC).astimezone())
+                except (OSError, OverflowError, ValueError):
+                    pass
+        if candidates:
+            reset = max(candidates)
+            return reset if reset + dt.timedelta(seconds=RATE_LIMIT_RESET_DELAY_SECONDS) > now else None
+        return None
+    return None
+
+
+def codex_rate_limit_reset_from_chat(chat: Chat, now: dt.datetime | None = None) -> dt.datetime | None:
+    return codex_rate_limit_reset_from_path(chat.jsonl_path, now)
+
+
 def latest_rate_limit_reset_from_chat(chat: Chat, now: dt.datetime | None = None) -> dt.datetime | None:
+    if chat.provider == PROVIDER_CODEX:
+        return codex_rate_limit_reset_from_chat(chat, now)
     now = now or local_now()
     latest_timestamp: dt.datetime | None = None
     latest_reset: dt.datetime | None = None
@@ -2709,16 +3448,52 @@ def prompt_recorded_after(claude_home: Path, session_id: str, prompt: str, after
     return False
 
 
+def codex_prompt_recorded_after(path: Path, prompt: str, after: dt.datetime) -> bool:
+    expected = normalize_prompt(prompt)
+    if not expected:
+        return False
+    for obj in codex_tail_objects(path):
+        if obj.get("type") != "event_msg":
+            continue
+        payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+        if payload.get("type") != "user_message":
+            continue
+        timestamp = parse_iso(obj.get("timestamp") if isinstance(obj.get("timestamp"), str) else None)
+        if timestamp is None or timestamp < after:
+            continue
+        message = payload.get("message") if isinstance(payload.get("message"), str) else None
+        if normalize_prompt(message) == expected:
+            return True
+    return False
+
+
+def item_prompt_recorded_after(paths: Paths, item: dict[str, Any], after: dt.datetime) -> bool:
+    if item.get("provider") == PROVIDER_CODEX:
+        raw_path = item.get("jsonl_path")
+        if not isinstance(raw_path, str):
+            fingerprint = item.get("fingerprint") if isinstance(item.get("fingerprint"), dict) else {}
+            raw_path = fingerprint.get("jsonl_path") if isinstance(fingerprint.get("jsonl_path"), str) else None
+        path = windows_to_local_path(raw_path) if raw_path else Path("")
+        return bool(raw_path and codex_prompt_recorded_after(path, item.get("prompt", ""), after))
+    return prompt_recorded_after(paths.claude_home, item["session_id"], item.get("prompt", ""), after)
+
+
 def should_verify_prompt_recorded(item: dict[str, Any]) -> bool:
+    if item.get("provider") == PROVIDER_CODEX:
+        return True
     return item.get("remote_kind") is None and is_windows_path(item.get("cwd") if isinstance(item.get("cwd"), str) else None)
 
 
 def prompt_missing_after_success(paths: Paths, item: dict[str, Any], after: dt.datetime) -> str | None:
     if not should_verify_prompt_recorded(item):
         return None
-    if prompt_recorded_after(paths.claude_home, item["session_id"], item.get("prompt", ""), after):
-        return None
-    return "Claude ha restituito codice 0, ma il prompt non risulta registrato nella transcript: invio considerato non riuscito."
+    for attempt in range(4):
+        if item_prompt_recorded_after(paths, item, after):
+            return None
+        if attempt < 3:
+            time.sleep(0.5)
+    provider = "Codex" if item.get("provider") == PROVIDER_CODEX else "Claude"
+    return f"{provider} ha restituito codice 0, ma il prompt non risulta registrato nella transcript: invio considerato non riuscito."
 
 
 def item_priority(item: dict[str, Any]) -> int:
@@ -2778,6 +3553,8 @@ def recovery_as_item(recovery: dict[str, Any]) -> dict[str, Any]:
         "last_error": recovery.get("last_error"),
         "last_log": recovery.get("last_log"),
         "fingerprint": recovery.get("fingerprint", {}),
+        "provider": recovery.get("provider", PROVIDER_CLAUDE),
+        "jsonl_path": recovery.get("jsonl_path"),
         "remote_kind": recovery.get("remote_kind"),
         "remote_host": recovery.get("remote_host"),
         "remote_cwd": recovery.get("remote_cwd"),
@@ -2801,6 +3578,8 @@ def auto_continue_as_item(auto_continue: dict[str, Any]) -> dict[str, Any]:
         "last_error": auto_continue.get("last_error"),
         "last_log": auto_continue.get("last_log"),
         "fingerprint": auto_continue.get("fingerprint", {}),
+        "provider": auto_continue.get("provider", PROVIDER_CLAUDE),
+        "jsonl_path": auto_continue.get("jsonl_path"),
         "allow_cwd_fallback": bool(auto_continue.get("allow_cwd_fallback")),
         "cwd_fallback": auto_continue.get("cwd_fallback"),
         "remote_kind": auto_continue.get("remote_kind"),
@@ -2845,6 +3624,8 @@ def set_recovery_after_limit(
         "title": item.get("title"),
         "cwd": item.get("cwd"),
         "fingerprint": item.get("fingerprint", {}),
+        "provider": item.get("provider", PROVIDER_CLAUDE),
+        "jsonl_path": item.get("jsonl_path"),
         "attempts": 0,
         "not_before": not_before,
         "last_error": truncate(result.stderr or result.stdout, 500),
@@ -2899,12 +3680,13 @@ def find_chat_for_item(chats: list[Chat], item: dict[str, Any]) -> Chat | None:
     session_id = item.get("session_id")
     if not isinstance(session_id, str):
         return None
+    provider = item.get("provider") if isinstance(item.get("provider"), str) else PROVIDER_CLAUDE
     remote_kind = item.get("remote_kind")
     remote_host = item.get("remote_host")
     remote_cwd = item.get("remote_cwd")
     if remote_kind or remote_host or remote_cwd:
         for chat in chats:
-            if chat.session_id != session_id:
+            if chat.session_id != session_id or chat.provider != provider:
                 continue
             if (
                 same_optional_text(chat.remote_kind, remote_kind)
@@ -2913,11 +3695,16 @@ def find_chat_for_item(chats: list[Chat], item: dict[str, Any]) -> Chat | None:
             ):
                 return chat
         return None
-    return find_chat_by_session(chats, session_id)
+    for chat in chats:
+        if chat.session_id == session_id and chat.provider == provider:
+            return chat
+    return None
 
 
 def chat_execution_fields(chat: Chat) -> dict[str, Any]:
     return {
+        "provider": chat.provider,
+        "jsonl_path": str(chat.jsonl_path),
         "remote_kind": chat.remote_kind,
         "remote_host": chat.remote_host,
         "remote_cwd": chat.remote_cwd,
@@ -2931,38 +3718,51 @@ def command_doctor(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.windows_home, args.state_dir)
     local_chats = discover_chats(paths.claude_home)
     vscode_chats = discover_claude_agent_sessions(paths)
-    all_chats = discover_claude_chats(paths)
+    codex_chats = discover_codex_app_sessions(paths)
+    all_chats = discover_agent_chats(paths)
     claude_exe = find_claude_executable(paths, args.claude)
+    codex_exe = find_codex_executable(paths, getattr(args, "codex", None))
     print(f"Windows home: {paths.windows_home}")
     print(f"Claude home:  {paths.claude_home}")
+    print(f"Codex home:   {paths.codex_home}")
     print(f"State dir:    {paths.state_dir}")
     print(f"Claude exe:   {claude_exe or 'NON TROVATO'}")
+    print(f"Codex CLI:    {codex_exe or 'NON TROVATO'}")
     if claude_exe:
         try:
             result = subprocess.run([str(claude_exe), "--version"], text=True, capture_output=True, timeout=15)
             print(f"Versione:     {result.stdout.strip() or result.stderr.strip()}")
         except (OSError, subprocess.SubprocessError) as exc:
             print(f"Versione:     errore: {exc}")
+    if codex_exe:
+        try:
+            version_result = run_codex_cli_command(codex_exe, ["--version"])
+            login_result = run_codex_cli_command(codex_exe, ["login", "status"])
+            print(f"Codex ver.:   {(version_result.stdout or version_result.stderr).strip()}")
+            print(f"Codex auth:   {(login_result.stdout or login_result.stderr).strip()}")
+        except (OSError, subprocess.SubprocessError) as exc:
+            print(f"Codex stato:  errore: {exc}")
     print(f"Chat Claude Code locali:     {len(local_chats)}")
     print(f"Chat Claude Code VS Code:    {len(vscode_chats)}")
-    print(f"Chat Claude Code totali:     {len(all_chats)}")
+    print(f"Task Codex App:              {len(codex_chats)}")
+    print(f"Chat/task totali:            {len(all_chats)}")
     print(f"Chat accodabili:             {len([chat for chat in all_chats if chat.can_queue])}")
     by_source: dict[str, int] = {}
     for chat in all_chats:
         by_source[chat.source] = by_source.get(chat.source, 0) + 1
     for source, count in sorted(by_source.items()):
         print(f"- {source}: {count}")
-    print("Soluzioni esistenti note:")
-    print("- JCSnap/claude-code-queue: accoda prompt Claude Code e ritenta dopo rate limit.")
-    print("- Claude Code ha eventi queue-operation nelle transcript, ma non un guardiano impostazioni esterno.")
-    return 0 if claude_exe and all_chats else 1
+    print("Provider operativi:")
+    print("- Claude Code: resume tramite CLI con protezione account e impostazioni.")
+    print("- Codex App: resume tramite CLI ufficiale con verifica transcript e limite strutturato.")
+    return 0 if (claude_exe or codex_exe) and all_chats else 1
 
 
 def command_list(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.windows_home, args.state_dir)
-    chats = discover_claude_chats(paths)
+    chats = discover_agent_chats(paths)
     if not chats:
-        print("Nessuna chat Claude Code trovata.")
+        print("Nessuna chat Claude o task Codex trovata.")
         return 1
     print_chat_list(chats, args.limit)
     return 0
@@ -2970,7 +3770,7 @@ def command_list(args: argparse.Namespace) -> int:
 
 def command_add(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.windows_home, args.state_dir)
-    chats = discover_claude_chats(paths)
+    chats = discover_agent_chats(paths)
     chat = select_chat(args.chat, chats)
     account_error = account_mismatch_for_chat(paths, chat)
     if account_error:
@@ -2978,7 +3778,7 @@ def command_add(args: argparse.Namespace) -> int:
         return 1
     if not chat.can_queue:
         print(
-            "Questa chat Claude Code e' solo visibile: il suo contesto non e' disponibile per l'invio."
+            "Questa chat/task e' solo visibile: il suo contesto non e' disponibile per l'invio."
         )
         return 1
     prompts = expand_items(args.items)
@@ -3117,7 +3917,7 @@ def command_reset(args: argparse.Namespace) -> int:
 def command_check_settings(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.windows_home, args.state_dir)
     queue = load_queue(paths.queue_file)
-    chats = discover_claude_chats(paths)
+    chats = discover_agent_chats(paths)
     items = queue.get("items", [])
     if args.item:
         items = [item for item in items if item.get("id") == args.item]
@@ -3165,8 +3965,9 @@ def seconds_until_ready(queue: dict[str, Any], default: int) -> int:
 def command_run(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.windows_home, args.state_dir)
     claude_exe = find_claude_executable(paths, args.claude)
-    if claude_exe is None:
-        print("Claude Code executable non trovato. Esegui `doctor` per dettagli.")
+    codex_exe = find_codex_executable(paths, getattr(args, "codex", None))
+    if claude_exe is None and codex_exe is None:
+        print("Nessun CLI Claude/Codex trovato. Esegui `doctor` per dettagli.")
         return 1
 
     while True:
@@ -3186,7 +3987,7 @@ def command_run(args: argparse.Namespace) -> int:
                 continue
 
             item = recovery_as_item(recovery)
-            chats = discover_claude_chats(paths)
+            chats = discover_agent_chats(paths)
             chat = find_chat_for_item(chats, item)
             if chat is None:
                 recovery["blocked"] = True
@@ -3214,14 +4015,14 @@ def command_run(args: argparse.Namespace) -> int:
 
             if args.dry_run:
                 print("DRY RUN RECOVERY")
-                print_dry_run_details(paths, claude_exe, item, args.ide, RECOVERY_PROMPT)
+                print_agent_dry_run_details(paths, claude_exe, codex_exe, item, args.ide, RECOVERY_PROMPT)
                 return 0
 
             print(f"Recovery: invio '{RECOVERY_PROMPT}' a chat {item['session_id'][:8]}")
             recovery["attempts"] = int(recovery.get("attempts", 0)) + 1
             run_started_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=5)
             try:
-                result = run_claude(paths, claude_exe, item, args.timeout, args.ide)
+                result = run_agent(paths, claude_exe, codex_exe, item, args.timeout, args.ide)
             except subprocess.TimeoutExpired:
                 recovery["blocked"] = True
                 recovery["last_error"] = f"Timeout recovery dopo {args.timeout}s"
@@ -3272,6 +4073,13 @@ def command_run(args: argparse.Namespace) -> int:
             return result.returncode or 1
 
         auto_continue = active_auto_continue(queue)
+        if (
+            auto_continue
+            and auto_continue.get("status") == "monitoring"
+            and not auto_continue_ready(auto_continue)
+            and any(item_ready(item) for item in pending_items(queue))
+        ):
+            auto_continue = None
         if auto_continue:
             if not auto_continue_ready(auto_continue):
                 wait_seconds = seconds_until_ready(queue, args.poll_seconds)
@@ -3290,7 +4098,7 @@ def command_run(args: argparse.Namespace) -> int:
                 continue
 
             item = auto_continue_as_item(auto_continue)
-            chats = discover_claude_chats(paths)
+            chats = discover_agent_chats(paths)
             chat = find_chat_for_item(chats, item)
             if chat is None:
                 update_auto_continue_state(
@@ -3330,11 +4138,44 @@ def command_run(args: argparse.Namespace) -> int:
                 print(f"Auto-continua bloccato: {account_error}")
                 return 1
 
+            if auto_continue.get("monitor_limit", True) and auto_continue.get("status") in {"armed", "monitoring"}:
+                reset_at = latest_rate_limit_reset_from_chat(chat)
+                if reset_at is None:
+                    next_check = (
+                        dt.datetime.now(dt.UTC) + dt.timedelta(seconds=args.poll_seconds)
+                    ).replace(microsecond=0).isoformat()
+                    update_auto_continue_state(
+                        auto_continue,
+                        "monitoring",
+                        not_before=next_check,
+                        last_check_at=now_utc(),
+                        next_check_in_seconds=args.poll_seconds,
+                        last_error=None,
+                    )
+                    save_queue(paths.queue_file, queue)
+                    print("Auto-continua armato: nessun limite attivo rilevato, non invio nulla.")
+                    if args.once:
+                        return RATE_LIMIT_EXIT
+                    if not any(item_ready(queued_item) for queued_item in pending_items(queue)):
+                        time.sleep(args.poll_seconds)
+                    continue
+                ready_at = reset_at + dt.timedelta(seconds=RATE_LIMIT_RESET_DELAY_SECONDS)
+                update_auto_continue_state(
+                    auto_continue,
+                    "waiting_limit",
+                    not_before=ready_at.astimezone().replace(microsecond=0).isoformat(),
+                    last_check_at=now_utc(),
+                    next_check_in_seconds=max(1, int((ready_at - local_now()).total_seconds())),
+                    last_error="Usage limit attivo: attendo il reset e il margine di sicurezza.",
+                )
+                save_queue(paths.queue_file, queue)
+                continue
+
             if args.dry_run:
                 print("DRY RUN AUTO-CONTINUA")
                 if item.get("allow_cwd_fallback"):
                     print(f"cwd fallback: {item.get('cwd_fallback')}")
-                print_dry_run_details(paths, claude_exe, item, args.ide, RECOVERY_PROMPT)
+                print_agent_dry_run_details(paths, claude_exe, codex_exe, item, args.ide, RECOVERY_PROMPT)
                 return 0
 
             print(f"Auto-continua: invio '{RECOVERY_PROMPT}' a chat {item['session_id'][:8]}")
@@ -3351,7 +4192,7 @@ def command_run(args: argparse.Namespace) -> int:
             save_queue(paths.queue_file, queue)
             run_started_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=5)
             try:
-                result = run_claude(paths, claude_exe, item, args.timeout, args.ide)
+                result = run_agent(paths, claude_exe, codex_exe, item, args.timeout, args.ide)
             except subprocess.TimeoutExpired:
                 update_auto_continue_state(
                     auto_continue,
@@ -3392,7 +4233,7 @@ def command_run(args: argparse.Namespace) -> int:
                         next_check_in_seconds=None,
                     )
                     save_queue(paths.queue_file, queue)
-                    print(f"Auto-continua bloccato: Claude richiede approvazione. Log: {auto_continue.get('last_log')}")
+                    print(f"Auto-continua bloccato: il provider richiede approvazione. Log: {auto_continue.get('last_log')}")
                     return 1
                 update_auto_continue_state(
                     auto_continue,
@@ -3452,7 +4293,7 @@ def command_run(args: argparse.Namespace) -> int:
             continue
 
         item = candidates[0]
-        chats = discover_claude_chats(paths)
+        chats = discover_agent_chats(paths)
         chat = find_chat_for_item(chats, item)
         if chat is None:
             item["status"] = STATUS_FAILED
@@ -3480,7 +4321,7 @@ def command_run(args: argparse.Namespace) -> int:
 
         if args.dry_run:
             print("DRY RUN")
-            print_dry_run_details(paths, claude_exe, item, args.ide, truncate(item.get("prompt"), 200))
+            print_agent_dry_run_details(paths, claude_exe, codex_exe, item, args.ide, truncate(item.get("prompt"), 200))
             if args.once:
                 return 0
             item["status"] = STATUS_DONE
@@ -3492,7 +4333,7 @@ def command_run(args: argparse.Namespace) -> int:
         item["attempts"] = int(item.get("attempts", 0)) + 1
         run_started_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=5)
         try:
-            result = run_claude(paths, claude_exe, item, args.timeout, args.ide)
+            result = run_agent(paths, claude_exe, codex_exe, item, args.timeout, args.ide)
         except subprocess.TimeoutExpired:
             item["status"] = STATUS_FAILED
             item["last_error"] = f"Timeout dopo {args.timeout}s"
@@ -3511,7 +4352,7 @@ def command_run(args: argparse.Namespace) -> int:
                 item["status"] = STATUS_FAILED
                 item["last_error"] = missing_prompt_error
                 save_queue(paths.queue_file, queue)
-                print(f"Errore Claude su {item['id']}: {missing_prompt_error}")
+                print(f"Errore provider su {item['id']}: {missing_prompt_error}")
                 return 1
             item["status"] = STATUS_DONE
             item["completed_at"] = now_utc()
@@ -3523,12 +4364,7 @@ def command_run(args: argparse.Namespace) -> int:
             continue
 
         if result.rate_limited:
-            prompt_was_recorded = prompt_recorded_after(
-                paths.claude_home,
-                item["session_id"],
-                item.get("prompt", ""),
-                run_started_at,
-            )
+            prompt_was_recorded = item_prompt_recorded_after(paths, item, run_started_at)
             set_recovery_after_limit(queue, item, result, prompt_was_recorded, args.poll_seconds)
             save_queue(paths.queue_file, queue)
             print(
@@ -3543,7 +4379,7 @@ def command_run(args: argparse.Namespace) -> int:
         item["status"] = STATUS_FAILED
         item["last_error"] = truncate(result.stderr or result.stdout, 1000)
         save_queue(paths.queue_file, queue)
-        print(f"Errore Claude su {item['id']}. Log: {item['last_log']}")
+        print(f"Errore provider su {item['id']}. Log: {item['last_log']}")
         return result.returncode or 1
 
 
@@ -3556,21 +4392,22 @@ def add_common_options(parser: argparse.ArgumentParser, suppress_default: bool =
         help="Cartella stato/coda. Default: <windows-home>/.claude-vscode-queue",
     )
     parser.add_argument("--claude", default=default, help="Percorso esplicito a claude/claude.exe")
+    parser.add_argument("--codex", default=default, help="Percorso esplicito al CLI codex")
 
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="claude-vscode-queue",
-        description="Coda locale per inviare messaggi a Claude Code VS Code quando il session limit si libera.",
+        description="Coda locale e auto-continua per sessioni Claude Code e task dell'app Codex.",
     )
     add_common_options(parser)
     sub = parser.add_subparsers(dest="command", required=True)
 
-    doctor = sub.add_parser("doctor", help="Verifica ambiente, Claude exe e chat")
+    doctor = sub.add_parser("doctor", help="Verifica ambiente, CLI e chat/task")
     add_common_options(doctor, suppress_default=True)
     doctor.set_defaults(func=command_doctor)
 
-    list_cmd = sub.add_parser("list", help="Lista chat Claude Code selezionabili")
+    list_cmd = sub.add_parser("list", help="Lista chat Claude e task Codex selezionabili")
     add_common_options(list_cmd, suppress_default=True)
     list_cmd.add_argument("--limit", type=int, default=25)
     list_cmd.set_defaults(func=command_list)
@@ -3580,12 +4417,22 @@ def build_parser() -> argparse.ArgumentParser:
     add.add_argument("--chat", help="Numero/list selector/session id/titolo/cwd")
     add.add_argument("--not-before", help="ISO datetime prima del quale non inviare")
     add.add_argument("--priority", type=int, default=100, help="Priorita' coda: numero piu' basso = prima")
-    add.add_argument("--model-override", help="Modello da passare a Claude al posto di quello della chat")
-    add.add_argument("--effort-level-override", help="Effort da passare a Claude al posto di quello della chat")
+    add.add_argument("--model-override", help="Modello da usare al posto di quello della chat/task")
+    add.add_argument("--effort-level-override", help="Effort da usare al posto di quello della chat/task")
     add.add_argument(
         "--permission-mode-override",
         choices=sorted(VALID_PERMISSION_MODES),
         help="Permission mode da passare a Claude al posto di quello della chat",
+    )
+    add.add_argument(
+        "--sandbox-mode-override",
+        choices=sorted(VALID_CODEX_SANDBOX_MODES),
+        help="Sandbox Codex da usare al posto di quella della task",
+    )
+    add.add_argument(
+        "--approval-policy-override",
+        choices=sorted(VALID_CODEX_APPROVAL_POLICIES),
+        help="Approval policy Codex da usare al posto di quella della task",
     )
     add.add_argument("items", nargs="*", help="Messaggi in ordine. Usa @file.md per leggere un file, - per stdin.")
     add.set_defaults(func=command_add)
@@ -3598,9 +4445,9 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="Processa la coda e ritenta dopo rate/session limit")
     add_common_options(run, suppress_default=True)
     run.add_argument("--once", action="store_true", help="Un solo tentativo/controllo, poi esce")
-    run.add_argument("--dry-run", action="store_true", help="Mostra cosa invierebbe senza chiamare Claude")
+    run.add_argument("--dry-run", action="store_true", help="Mostra cosa invierebbe senza chiamare il provider")
     run.add_argument("--poll-seconds", type=int, default=300, help="Secondi tra tentativi durante rate limit")
-    run.add_argument("--timeout", type=int, default=21600, help="Timeout per singolo messaggio Claude")
+    run.add_argument("--timeout", type=int, default=21600, help="Timeout per singolo messaggio")
     run.add_argument("--ignore-settings-change", action="store_true", help="Invia anche se le impostazioni sono cambiate")
     run.add_argument("--no-ide", dest="ide", action="store_false", help="Non passare --ide a Claude Code")
     run.set_defaults(func=command_run, ide=True)

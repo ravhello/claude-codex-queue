@@ -12,7 +12,7 @@ $Shortcut.TargetPath = $Launcher
 $Shortcut.Arguments = ""
 $Shortcut.WorkingDirectory = $Project
 $Shortcut.IconLocation = $Icon
-$Shortcut.Description = "Avvia Claude VS Code Queue e apre il browser"
+$Shortcut.Description = "Avvia Claude + Codex Queue e apre il browser"
 $Shortcut.WindowStyle = 7
 $Shortcut.Save()
 

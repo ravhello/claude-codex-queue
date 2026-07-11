@@ -1,7 +1,8 @@
 # Security Policy
 
-This project controls a local Claude Code CLI and reads local Claude/VS Code
-metadata. Treat it as a local automation tool, not as a hosted service.
+This project controls local Claude Code and Codex CLIs and reads local
+Claude/VS Code/Codex metadata. Treat it as a local automation tool, not as a
+hosted service.
 
 ## Supported Versions
 
@@ -23,3 +24,7 @@ The app intentionally clears external Anthropic API-key environment variables
 before invoking Claude Code, so queued sends use the authenticated Claude Code
 session rather than an unrelated API key.
 
+The same rule applies to Codex: external OpenAI API keys, base URLs and account
+overrides are removed from the child process so the official CLI uses its local
+ChatGPT authentication. Authentication files are only used to derive a hashed,
+masked account identity and are never copied into queue state or logs.

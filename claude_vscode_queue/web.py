@@ -41,6 +41,7 @@ def split_messages(raw: str) -> list[str]:
 
 def chat_to_dict(chat: app.Chat) -> dict[str, Any]:
     return {
+        "provider": chat.provider,
         "session_id": chat.session_id,
         "short_id": chat.session_id[:8],
         "title": chat.title,
@@ -48,6 +49,10 @@ def chat_to_dict(chat: app.Chat) -> dict[str, Any]:
         "permission_mode": chat.permission_mode,
         "model": chat.model,
         "effort_level": chat.effort_level,
+        "sandbox_mode": chat.sandbox_mode,
+        "approval_policy": chat.approval_policy,
+        "personality": chat.personality,
+        "archived": chat.archived,
         "last_timestamp": chat.last_timestamp,
         "message_count": chat.message_count,
         "last_prompt": chat.last_prompt,
@@ -81,9 +86,10 @@ def queue_summary(queue: dict[str, Any]) -> dict[str, int]:
 
 
 class WebState:
-    def __init__(self, paths: app.Paths, claude_exe: Path | None):
+    def __init__(self, paths: app.Paths, claude_exe: Path | None, codex_exe: Path | None = None):
         self.paths = paths
         self.claude_exe = claude_exe
+        self.codex_exe = codex_exe
         self.runner: subprocess.Popen[str] | None = None
         self.runner_log = paths.state_dir / "visual-runner.log"
         self.runner_pid_file = paths.state_dir / "visual-runner.pid"
@@ -94,6 +100,8 @@ class WebState:
         self._chats_refresh_started_at = 0.0
         self._version_cache: str | None = None
         self._version_cache_at = 0.0
+        self._codex_version_cache: str | None = None
+        self._codex_version_cache_at = 0.0
 
     def base_command(self) -> list[str]:
         command = [
@@ -108,6 +116,8 @@ class WebState:
         ]
         if self.claude_exe is not None:
             command.extend(["--claude", str(self.claude_exe)])
+        if self.codex_exe is not None:
+            command.extend(["--codex", str(self.codex_exe)])
         return command
 
     def process_command(self, pid: int) -> str | None:
@@ -194,10 +204,15 @@ class WebState:
             sync_accounts=False,
             active_only=True,
         )
-        return app.annotate_chats_with_accounts(
+        claude_chats = app.annotate_chats_with_accounts(
             self.paths,
             app.merge_claude_chat_sources([], desktop_chats),
         )
+        codex_chats = app.annotate_codex_chats_with_accounts(
+            self.paths,
+            app.discover_codex_app_sessions(self.paths),
+        )
+        return sorted(claude_chats + codex_chats, key=app.chat_sort_key, reverse=True)
 
     def refresh_chats_background(self) -> None:
         now = time.monotonic()
@@ -209,7 +224,7 @@ class WebState:
 
         def worker() -> None:
             try:
-                chats = app.discover_claude_chats(
+                chats = app.discover_agent_chats(
                     self.paths,
                     sync_desktop_accounts=True,
                     active_desktop_only=True,
@@ -231,9 +246,8 @@ class WebState:
                 return list(self._chats_cache)
             cached = list(self._chats_cache)
             refreshing = self._chats_refreshing
-            refresh_age = now - self._chats_refresh_started_at if self._chats_refresh_started_at else 9999
         if cached:
-            if not refreshing and refresh_age > 120:
+            if not refreshing:
                 self.refresh_chats_background()
             return cached
         try:
@@ -279,6 +293,23 @@ class WebState:
         with self.lock:
             self._version_cache = version
             self._version_cache_at = now
+        return version
+
+    def codex_version(self, max_age_seconds: int = 300) -> str | None:
+        if self.codex_exe is None:
+            return None
+        now = time.monotonic()
+        with self.lock:
+            if self._codex_version_cache is not None and now - self._codex_version_cache_at < max_age_seconds:
+                return self._codex_version_cache
+        try:
+            result = app.run_codex_cli_command(self.codex_exe, ["--version"], timeout=8)
+            version = (result.stdout or result.stderr).strip()
+        except (OSError, subprocess.SubprocessError) as exc:
+            version = f"errore: {exc}"
+        with self.lock:
+            self._codex_version_cache = version
+            self._codex_version_cache_at = now
         return version
 
     def start_runner(self, poll_seconds: int = 60) -> dict[str, Any]:
@@ -437,7 +468,12 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
 
     def api_doctor(self) -> dict[str, Any]:
         chats = self.state.cached_chats()
+        if not chats:
+            chats = self.state.chats()
         version = self.state.claude_version()
+        codex_version = self.state.codex_version()
+        claude_chats = [chat for chat in chats if chat.provider == app.PROVIDER_CLAUDE]
+        codex_chats = [chat for chat in chats if chat.provider == app.PROVIDER_CODEX]
         return {
             "windows_home": str(self.state.paths.windows_home),
             "claude_home": str(self.state.paths.claude_home),
@@ -445,11 +481,17 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             "queue_file": str(self.state.paths.queue_file),
             "claude_exe": str(self.state.claude_exe) if self.state.claude_exe else None,
             "claude_version": version,
+            "codex_home": str(self.state.paths.codex_home),
+            "codex_exe": str(self.state.codex_exe) if self.state.codex_exe else None,
+            "codex_version": codex_version,
             "chat_count": len(chats),
+            "claude_chat_count": len(claude_chats),
+            "codex_chat_count": len(codex_chats),
             "queueable_chat_count": len([chat for chat in chats if chat.can_queue]),
             "sources": sorted({chat.source for chat in chats}),
             "local_time": app.now_utc(),
             "active_account": app.account_public_dict(app.active_claude_account(self.state.paths)),
+            "active_codex_account": app.account_public_dict(app.active_codex_account(self.state.paths)),
             "account_index": app.account_index_public(self.state.paths),
             "runner": self.state.runner_status(),
         }
@@ -471,7 +513,7 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             raise ValueError(account_error)
         if not chat.can_queue:
             raise ValueError(
-                "Questa chat Claude Code e' solo visibile: il suo contesto non e' disponibile per l'invio."
+                "Questa chat/task e' solo visibile: il suo contesto non e' disponibile per l'invio."
             )
         chat = app.remember_chat_account(self.state.paths, chat)
         fingerprint = app.settings_fingerprint(self.state.paths, chat)
@@ -610,7 +652,7 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             raise ValueError(account_error)
         if not chat.can_queue:
             raise ValueError(
-                "Questa chat Claude Code e' solo visibile: il suo contesto non e' disponibile per auto-continua."
+                "Questa chat/task e' solo visibile: il suo contesto non e' disponibile per auto-continua."
             )
         chat = app.remember_chat_account(self.state.paths, chat)
         overrides = app.selected_setting_overrides(payload)
@@ -632,7 +674,10 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             "title": chat.title,
             "cwd": chat.cwd,
             "source": chat.source,
+            "provider": chat.provider,
+            "jsonl_path": str(chat.jsonl_path),
             "prompt": app.RECOVERY_PROMPT,
+            "monitor_limit": True,
             "attempts": 0,
             "not_before": not_before,
             "last_error": last_error,
@@ -662,11 +707,14 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
         chat = app.find_chat_by_session(chats, session_id)
         if chat is None:
             raise ValueError("Chat non trovata.")
-        result = app.transfer_chat_to_active_desktop_account(
-            self.state.paths,
-            chat,
-            move=bool(payload.get("move")),
-        )
+        if chat.provider == app.PROVIDER_CODEX:
+            result = app.transfer_codex_chat_to_active_account(self.state.paths, chat)
+        else:
+            result = app.transfer_chat_to_active_desktop_account(
+                self.state.paths,
+                chat,
+                move=bool(payload.get("move")),
+            )
         self.state.invalidate_chats()
         chats = self.state.chats(max_age_seconds=0)
         return {
@@ -683,7 +731,7 @@ HTML = r"""<!doctype html>
   <link rel="icon" href="/favicon.ico?v=3" sizes="any">
   <link rel="shortcut icon" href="/favicon.ico?v=3">
   <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=3">
-  <title>Claude VS Code Queue</title>
+  <title>Claude + Codex Queue</title>
   <style>
     :root {
       color-scheme: light;
@@ -742,10 +790,12 @@ HTML = r"""<!doctype html>
     .grow { flex: 1; min-width: 160px; }
     .settings-grid {
       display: grid;
-      grid-template-columns: repeat(4, minmax(130px, 1fr));
+      grid-template-columns: repeat(5, minmax(120px, 1fr));
       gap: 8px;
       margin-top: 10px;
     }
+    .chat-filters { display: grid; grid-template-columns: minmax(0, 1fr) 120px; gap: 8px; }
+    .hidden { display: none !important; }
     .field-label {
       display: grid;
       gap: 4px;
@@ -899,12 +949,13 @@ HTML = r"""<!doctype html>
     @media (max-width: 900px) {
       main { grid-template-columns: 1fr; }
       header { height: auto; padding: 12px 14px; align-items: flex-start; }
+      .settings-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
     }
   </style>
 </head>
 <body>
   <header>
-    <h1>Claude VS Code Queue</h1>
+    <h1>Claude + Codex Queue</h1>
     <div class="row">
       <span class="status"><span id="runner-dot" class="dot off"></span><span id="runner-text">Runner fermo</span></span>
       <button id="refresh-btn">Aggiorna</button>
@@ -920,7 +971,14 @@ HTML = r"""<!doctype html>
       </section>
       <section>
         <h2>Chat</h2>
-        <input id="chat-filter" placeholder="Filtra chat">
+        <div class="chat-filters">
+          <input id="chat-filter" placeholder="Filtra chat o task">
+          <select id="provider-filter" aria-label="Provider">
+            <option value="">Tutte</option>
+            <option value="claude">Claude</option>
+            <option value="codex">Codex</option>
+          </select>
+        </div>
         <div id="chat-list" class="chat-list"></div>
       </section>
     </div>
@@ -931,7 +989,8 @@ HTML = r"""<!doctype html>
         <div class="settings-grid">
           <label class="field-label">Modello<select id="model-select"></select></label>
           <label class="field-label">Effort<select id="effort-select"></select></label>
-          <label class="field-label">Permessi<select id="permission-select"></select></label>
+          <label id="permission-field" class="field-label">Permessi<select id="permission-select"></select></label>
+          <label id="approval-field" class="field-label hidden">Approvazioni<select id="approval-select"></select></label>
           <label class="field-label">Priorita'
             <select id="priority-select">
               <option value="100">Normale</option>
@@ -964,9 +1023,12 @@ HTML = r"""<!doctype html>
   <script>
     const state = { chats: [], selected: null, queue: [], autoContinue: null, runner: {}, autoBusy: false, autoBusyAction: null, settingsSession: null, transferBusy: false, refreshBusy: false };
     const $ = (id) => document.getElementById(id);
-    const MODEL_OPTIONS = ["opus", "sonnet", "haiku", "claude-opus-4-8", "claude-sonnet-4-5"];
-    const EFFORT_OPTIONS = ["low", "medium", "high", "xhigh", "max"];
+    const CLAUDE_MODEL_OPTIONS = ["opus", "sonnet", "haiku", "claude-opus-4-8", "claude-sonnet-4-5"];
+    const CODEX_MODEL_OPTIONS = ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.1-codex-max"];
+    const EFFORT_OPTIONS = ["low", "medium", "high", "xhigh", "ultra", "max"];
     const PERMISSION_OPTIONS = ["default", "acceptEdits", "auto", "bypassPermissions", "dontAsk", "plan"];
+    const SANDBOX_OPTIONS = ["read-only", "workspace-write", "danger-full-access"];
+    const APPROVAL_OPTIONS = ["untrusted", "on-request", "on-failure", "never"];
     const USER_TIME_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
     const USER_LOCALE = navigator.language || "it-IT";
     const DATE_TIME_OPTIONS = {
@@ -1000,16 +1062,21 @@ HTML = r"""<!doctype html>
 
     function renderDoctor(data) {
       const account = data.active_account;
+      const codexAccount = data.active_codex_account;
       const accounts = data.account_index && Array.isArray(data.account_index.accounts) ? data.account_index.accounts : [];
       $("doctor").innerHTML = [
         `<b>Ora PC</b>: ${escapeHtml(formatDateTime(data.local_time || new Date().toISOString()))}`,
         `<b>Claude</b>: ${escapeHtml(data.claude_version || "non trovato")}`,
-        `<b>Account attivo</b>: ${escapeHtml(account ? account.label : "non rilevato")}`,
+        `<b>Account Claude</b>: ${escapeHtml(account ? account.label : "non rilevato")}`,
+        `<b>Codex</b>: ${escapeHtml(data.codex_version || "non trovato")}`,
+        `<b>Account Codex</b>: ${escapeHtml(codexAccount ? codexAccount.label : "non rilevato")}`,
         `<b>Account registrati</b>: ${escapeHtml(String(accounts.length))}`,
-        `<b>Chat Claude</b>: ${data.chat_count}`,
+        `<b>Chat Claude</b>: ${data.claude_chat_count || 0}`,
+        `<b>Task Codex</b>: ${data.codex_chat_count || 0}`,
         `<b>Accodabili</b>: ${data.queueable_chat_count}`,
         `<b>Coda</b>: ${escapeHtml(data.queue_file || "")}`,
-        `<b>Binario</b>: ${escapeHtml(data.claude_exe || "non trovato")}`,
+        `<b>CLI Claude</b>: ${escapeHtml(data.claude_exe || "non trovato")}`,
+        `<b>CLI Codex</b>: ${escapeHtml(data.codex_exe || "non trovato")}`,
       ].join("<br>");
       renderRunner(data.runner || {});
     }
@@ -1030,7 +1097,8 @@ HTML = r"""<!doctype html>
 
     function accountText(chat) {
       if (!chat) return "";
-      if (chat.account_status === "active") return `account attivo: ${chat.account_label || chat.account_short_key || ""}`;
+      const provider = chat.provider === "codex" ? "Codex" : "Claude";
+      if (chat.account_status === "active") return `${provider} attivo: ${chat.account_label || chat.account_short_key || ""}`;
       if (chat.account_status === "other") return `altro account: ${chat.account_label || chat.account_short_key || ""}`;
       if (chat.account_status === "known") return `account: ${chat.account_label || chat.account_short_key || ""}`;
       return "account non associato";
@@ -1056,17 +1124,28 @@ HTML = r"""<!doctype html>
 
     function renderSettingsControls() {
       const chat = selectedChat();
+      const isCodex = !!(chat && chat.provider === "codex");
       const reset = state.settingsSession !== state.selected;
       const previousModel = reset ? "" : $("model-select").value;
       const previousEffort = reset ? "" : $("effort-select").value;
       const previousPermission = reset ? "" : $("permission-select").value;
-      renderSelect($("model-select"), chat && chat.model, MODEL_OPTIONS, previousModel);
+      const previousApproval = reset ? "" : $("approval-select").value;
+      renderSelect($("model-select"), chat && chat.model, isCodex ? CODEX_MODEL_OPTIONS : CLAUDE_MODEL_OPTIONS, previousModel);
       renderSelect($("effort-select"), chat && chat.effort_level, EFFORT_OPTIONS, previousEffort);
-      renderSelect($("permission-select"), chat && chat.permission_mode, PERMISSION_OPTIONS, previousPermission);
+      renderSelect(
+        $("permission-select"),
+        chat && (isCodex ? chat.sandbox_mode : chat.permission_mode),
+        isCodex ? SANDBOX_OPTIONS : PERMISSION_OPTIONS,
+        previousPermission,
+      );
+      renderSelect($("approval-select"), chat && chat.approval_policy, APPROVAL_OPTIONS, previousApproval);
+      $("permission-field").childNodes[0].nodeValue = isCodex ? "Sandbox" : "Permessi";
+      $("approval-field").classList.toggle("hidden", !isCodex);
       const disabled = !(chat && chat.can_queue);
       $("model-select").disabled = disabled;
       $("effort-select").disabled = disabled;
       $("permission-select").disabled = disabled;
+      $("approval-select").disabled = disabled || !isCodex;
       $("priority-select").disabled = disabled;
       $("add-btn").disabled = disabled;
       state.settingsSession = state.selected;
@@ -1074,10 +1153,14 @@ HTML = r"""<!doctype html>
     }
 
     function selectedSettingPayload() {
+      const chat = selectedChat();
+      const isCodex = !!(chat && chat.provider === "codex");
       return {
         model_override: $("model-select").value,
         effort_level_override: $("effort-select").value,
-        permission_mode_override: $("permission-select").value,
+        permission_mode_override: isCodex ? "" : $("permission-select").value,
+        sandbox_mode_override: isCodex ? $("permission-select").value : "",
+        approval_policy_override: isCodex ? $("approval-select").value : "",
         priority: Number($("priority-select").value || 100),
       };
     }
@@ -1099,6 +1182,7 @@ HTML = r"""<!doctype html>
 
     function transferAvailable(chat) {
       if (!chat || chat.remote_kind) return false;
+      if (chat.provider === "codex") return !chat.archived && chat.account_status !== "active";
       if (chat.source_key === "claude_windows_app" && chat.account_status === "active") return false;
       return true;
     }
@@ -1107,11 +1191,14 @@ HTML = r"""<!doctype html>
       const chat = selectedChat();
       const available = transferAvailable(chat);
       const moveToggle = $("transfer-move");
-      moveToggle.disabled = !available || state.transferBusy || !(chat && chat.account_status === "other");
+      const isCodex = !!(chat && chat.provider === "codex");
+      moveToggle.disabled = isCodex || !available || state.transferBusy || !(chat && chat.account_status === "other");
       if (moveToggle.disabled) moveToggle.checked = false;
       $("transfer-btn").disabled = !available || state.transferBusy;
       $("transfer-btn").textContent = state.transferBusy
         ? "Importo..."
+        : isCodex
+        ? "Associa all'account Codex attivo"
         : chat && chat.account_status === "other"
         ? (moveToggle.checked ? "Sposta da altro account" : "Importa da altro account")
         : "Importa nell'account attivo";
@@ -1140,6 +1227,10 @@ HTML = r"""<!doctype html>
       const title = auto.title ? ` · ${auto.title}` : "";
       const runnerText = state.runner && state.runner.running ? "runner attivo" : "runner fermo";
       if (auto.enabled) {
+        if (auto.status === "armed" || auto.status === "monitoring") {
+          const wait = auto.next_check_in_seconds ? `, nuovo controllo tra ${formatDuration(auto.next_check_in_seconds)}` : "";
+          return `Auto-continua attivo su ${shortId}${title}: monitoraggio del limite, nessun messaggio inviato${wait}, ${runnerText}.`;
+        }
         if (auto.status === "waiting_limit") {
           const wait = auto.next_check_in_seconds ? `, controllo tra ${formatDuration(auto.next_check_in_seconds)}` : "";
           return `Auto-continua attivo su ${shortId}${title}: in attesa del limite${auto.not_before ? ` fino a ${formatDateTime(auto.not_before)}` : ""}${wait}, ${runnerText}.`;
@@ -1174,10 +1265,11 @@ HTML = r"""<!doctype html>
 
     function renderChats() {
       const filter = $("chat-filter").value.trim().toLowerCase();
+      const provider = $("provider-filter").value;
       const list = $("chat-list");
       const chats = state.chats.filter((chat) => {
-        const hay = [chat.title, chat.cwd, chat.session_id, chat.last_prompt].join(" ").toLowerCase();
-        return hay.includes(filter);
+        const hay = [chat.title, chat.cwd, chat.session_id, chat.last_prompt, chat.source, chat.provider].join(" ").toLowerCase();
+        return (!provider || chat.provider === provider) && hay.includes(filter);
       }).sort((a, b) => Date.parse(b.last_timestamp || 0) - Date.parse(a.last_timestamp || 0));
       list.innerHTML = "";
       if (!chats.length) {
@@ -1197,11 +1289,12 @@ HTML = r"""<!doctype html>
           <span class="chat-title">${escapeHtml(chat.short_id)} · ${escapeHtml(chat.title || "Senza titolo")}</span>
           <span class="chat-sub">
             <span class="badge">${escapeHtml(chat.source || "")}</span>
+            <span class="badge">${chat.provider === "codex" ? "Codex" : "Claude"}</span>
             ${chat.remote_host ? `<span class="badge">SSH ${escapeHtml(chat.remote_host)}</span>` : ""}
             <span class="badge">${chat.can_queue ? "utilizzabile" : "solo visibile"}</span>
             <span class="badge">${escapeHtml(accountBadge)}</span>
             ${chat.model ? `<span class="badge">${escapeHtml(chat.model)}</span>` : ""}
-            ${escapeHtml(String(chat.message_count || 0))} msg
+            ${chat.message_count >= 0 ? `${escapeHtml(String(chat.message_count || 0))} msg` : ""}
           </span>
           <span class="chat-sub">${escapeHtml(location)}</span>
           <span class="chat-sub">${escapeHtml(formatDateTime(chat.last_timestamp))}</span>
@@ -1209,7 +1302,7 @@ HTML = r"""<!doctype html>
         btn.onclick = () => {
           state.selected = chat.session_id;
           state.settingsSession = null;
-          $("selected-chat").textContent = `${chat.short_id} · ${chat.title || location || ""} · ${chat.can_queue ? "utilizzabile" : "solo visibile"} · ${accountText(chat)}`;
+          $("selected-chat").textContent = `${chat.provider === "codex" ? "Codex" : "Claude"} · ${chat.short_id} · ${chat.title || location || ""} · ${chat.can_queue ? "utilizzabile" : "solo visibile"} · ${accountText(chat)}`;
           renderSettingsControls();
           renderAutoButton();
           renderAutoFeedback();
@@ -1239,12 +1332,16 @@ HTML = r"""<!doctype html>
       const auto = state.autoContinue;
       const runner = state.runner || {};
       const effective = auto && auto.fingerprint && auto.fingerprint.effective ? auto.fingerprint.effective : {};
+      const autoIsCodex = !!(auto && auto.provider === "codex");
       const autoDetails = auto ? [
         `Stato: ${escapeHtml(auto.status || "spento")}`,
         `Runner: ${runner.running ? `attivo${runner.pid ? ` #${escapeHtml(runner.pid)}` : ""}` : "fermo"}`,
         `Modello: ${escapeHtml(auto.model_override || effective.model || "chat")}`,
         `Effort: ${escapeHtml(auto.effort_level_override || effective.effortLevel || "chat")}`,
-        `Permessi: ${escapeHtml(auto.permission_mode_override || effective.permissionMode || "chat")}`,
+        autoIsCodex
+          ? `Sandbox: ${escapeHtml(auto.sandbox_mode_override || effective.sandboxMode || "task")}`
+          : `Permessi: ${escapeHtml(auto.permission_mode_override || effective.permissionMode || "chat")}`,
+        autoIsCodex ? `Approvazioni: ${escapeHtml(auto.approval_policy_override || effective.approvalPolicy || "task")}` : "",
         `Tentativi: ${escapeHtml(String(auto.attempts || 0))}`,
         auto.sending_started_at ? `Invio iniziato: ${escapeHtml(formatDateTime(auto.sending_started_at))}` : "",
         auto.not_before && auto.status !== "sending" ? `Prossimo tentativo: ${escapeHtml(formatDateTime(auto.not_before))}` : "",
@@ -1269,7 +1366,7 @@ HTML = r"""<!doctype html>
         <tr>
           <td style="width:82px"><span class="status-pill ${escapeHtml(item.status || "")}">${escapeHtml(item.status || "")}</span></td>
           <td style="width:90px">${escapeHtml(item.id || "")}<br><span class="meta">${escapeHtml(String(item.attempts || 0))} tent.</span></td>
-          <td>${escapeHtml(item.title || item.session_id || "")}<br><span class="meta">Priorita': ${escapeHtml(String(item.priority ?? 100))} · ${escapeHtml((item.prompt || "").slice(0, 180))}</span></td>
+          <td><span class="badge">${item.provider === "codex" ? "Codex" : "Claude"}</span> ${escapeHtml(item.title || item.session_id || "")}<br><span class="meta">Priorita': ${escapeHtml(String(item.priority ?? 100))} · ${escapeHtml((item.prompt || "").slice(0, 180))}</span></td>
           <td style="width:178px">
             <button onclick="removeItem('${escapeAttr(item.id || "")}')">Rimuovi</button>
             <button onclick="resetItem('${escapeAttr(item.id || "")}')">Reset</button>
@@ -1310,8 +1407,8 @@ HTML = r"""<!doctype html>
     async function addMessages() {
       try {
         const selected = state.chats.find((chat) => chat.session_id === state.selected);
-        if (selected && selected.account_status === "other") throw new Error("Questa chat appartiene a un altro account Claude: cambia account prima di inviare.");
-        if (selected && !selected.can_queue) throw new Error("Questa chat e' solo visibile: non e' accodabile con Claude Code.");
+        if (selected && selected.account_status === "other") throw new Error("Questa chat/task appartiene a un altro account: cambia account o associala prima di inviare.");
+        if (selected && !selected.can_queue) throw new Error("Questa chat/task e' solo visibile e non e' accodabile.");
         const result = await api("/api/add", {
           method: "POST",
           body: JSON.stringify({ session_id: state.selected, messages: $("messages").value, ...selectedSettingPayload() }),
@@ -1366,9 +1463,13 @@ HTML = r"""<!doctype html>
       const selected = selectedChat();
       if (!transferAvailable(selected)) return;
       const move = $("transfer-move").checked && selected.account_status === "other";
+      const isCodex = selected.provider === "codex";
       const action = move ? "Spostare" : "Importare";
       const label = selected.account_status === "other" ? "da un altro account" : "dalla transcript locale";
-      if (!window.confirm(`${action} questa chat ${label} nell'account Claude attivo?`)) return;
+      const question = isCodex
+        ? "Associare questa task all'account Codex attivo? La transcript locale non viene duplicata."
+        : `${action} questa chat ${label} nell'account Claude attivo?`;
+      if (!window.confirm(question)) return;
       state.transferBusy = true;
       renderTransferButton();
       try {
@@ -1427,6 +1528,7 @@ HTML = r"""<!doctype html>
     $("start-btn").onclick = startRunner;
     $("stop-btn").onclick = stopRunner;
     $("chat-filter").oninput = renderChats;
+    $("provider-filter").onchange = renderChats;
 
     refreshAll();
     setInterval(refreshAll, 5000);
@@ -1437,12 +1539,13 @@ HTML = r"""<!doctype html>
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Interfaccia web locale per Claude VS Code Queue.")
+    parser = argparse.ArgumentParser(description="Interfaccia web locale per Claude + Codex Queue.")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8765)
     parser.add_argument("--windows-home")
     parser.add_argument("--state-dir")
     parser.add_argument("--claude")
+    parser.add_argument("--codex")
     return parser
 
 
@@ -1450,7 +1553,8 @@ def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     paths = app.resolve_paths(args.windows_home, args.state_dir)
     claude_exe = app.find_claude_executable(paths, args.claude)
-    state = WebState(paths, claude_exe)
+    codex_exe = app.find_codex_executable(paths, args.codex)
+    state = WebState(paths, claude_exe, codex_exe)
 
     class Handler(QueueRequestHandler):
         pass

@@ -13,6 +13,334 @@ from claude_vscode_queue import app
 
 
 class QueueAppTests(unittest.TestCase):
+    def test_find_codex_executable_prefers_windows_cmd_inside_wsl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            command = root / "AppData" / "Local" / "npm" / "codex.cmd"
+            command.parent.mkdir(parents=True)
+            command.write_text("@echo off\n", encoding="utf-8")
+            paths = app.Paths(root, root / ".claude", root / ".state", root / ".state" / "queue.json", root / ".state" / "logs")
+
+            with patch.object(app, "is_wsl", return_value=True), patch.object(
+                app.shutil, "which", return_value="/mnt/c/fake/npm/codex"
+            ):
+                found = app.find_codex_executable(paths)
+
+            self.assertEqual(found, command)
+
+    def test_auto_continue_monitor_does_not_send_without_active_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude_home = root / ".claude"
+            project = claude_home / "projects" / "p"
+            project.mkdir(parents=True)
+            session = "dddddddd-4444-4444-8444-dddddddddddd"
+            transcript = project / f"{session}.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": session,
+                        "timestamp": app.now_utc(),
+                        "cwd": str(root),
+                        "message": {"content": "working"},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            paths = app.Paths(root, claude_home, root / ".state", root / ".state" / "queue.json", root / ".state" / "logs")
+            chat = app.discover_chats(claude_home)[0]
+            marker = root / "was-called"
+            fake = root / "fake-claude"
+            fake.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+            fake.chmod(fake.stat().st_mode | 0o111)
+            app.save_queue(
+                paths.queue_file,
+                {
+                    "version": 1,
+                    "items": [],
+                    "recovery": None,
+                    "auto_continue": {
+                        "enabled": True,
+                        "status": "armed",
+                        "monitor_limit": True,
+                        "created_at": app.now_utc(),
+                        "session_id": session,
+                        "title": "monitor",
+                        "cwd": str(root),
+                        "prompt": app.RECOVERY_PROMPT,
+                        "attempts": 0,
+                        "not_before": None,
+                        "fingerprint": app.settings_fingerprint(paths, chat),
+                    },
+                },
+            )
+
+            result = app.main(
+                [
+                    "--windows-home",
+                    str(root),
+                    "--state-dir",
+                    str(paths.state_dir),
+                    "--claude",
+                    str(fake),
+                    "run",
+                    "--once",
+                    "--no-ide",
+                    "--poll-seconds",
+                    "1",
+                ]
+            )
+
+            queue = app.load_queue(paths.queue_file)
+            self.assertEqual(result, app.RATE_LIMIT_EXIT)
+            self.assertFalse(marker.exists())
+            self.assertEqual(queue["auto_continue"]["status"], "monitoring")
+            self.assertIsNotNone(queue["auto_continue"]["not_before"])
+            queue["items"] = [
+                {
+                    "id": "pending-while-monitoring",
+                    "status": app.STATUS_PENDING,
+                    "created_at": app.now_utc(),
+                    "order": 0,
+                    "session_id": session,
+                    "title": "queued",
+                    "cwd": str(root),
+                    "prompt": "queued prompt",
+                    "attempts": 0,
+                    "not_before": None,
+                    "fingerprint": app.settings_fingerprint(paths, chat),
+                }
+            ]
+            queue["auto_continue"]["not_before"] = (
+                dt.datetime.now(dt.UTC) + dt.timedelta(hours=1)
+            ).replace(microsecond=0).isoformat()
+            app.save_queue(paths.queue_file, queue)
+
+            queued_result = app.main(
+                [
+                    "--windows-home",
+                    str(root),
+                    "--state-dir",
+                    str(paths.state_dir),
+                    "--claude",
+                    str(fake),
+                    "run",
+                    "--once",
+                    "--no-ide",
+                    "--poll-seconds",
+                    "1",
+                ]
+            )
+
+            refreshed = app.load_queue(paths.queue_file)
+            self.assertEqual(queued_result, 0)
+            self.assertTrue(marker.exists())
+            self.assertEqual(refreshed["items"][0]["status"], app.STATUS_DONE)
+            self.assertTrue(refreshed["auto_continue"]["enabled"])
+
+    def test_discover_codex_app_sessions_reads_index_and_thread_settings(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            codex_home = root / ".codex"
+            sessions = codex_home / "sessions" / "2026" / "01" / "02"
+            sessions.mkdir(parents=True)
+            session = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+            rollout = sessions / f"rollout-2026-01-02T10-00-00-{session}.jsonl"
+            rollout.write_text(
+                json.dumps(
+                    {
+                        "timestamp": "2026-01-02T10:00:00Z",
+                        "type": "session_meta",
+                        "payload": {"id": session, "cwd": str(root)},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (codex_home / "session_index.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps({"id": session, "thread_name": "Old title", "updated_at": "2026-01-02T10:00:00Z"}),
+                        json.dumps({"id": session, "thread_name": "Newest Codex task", "updated_at": "2026-01-02T11:00:00Z"}),
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            connection = sqlite3.connect(codex_home / "state_5.sqlite")
+            connection.execute(
+                "CREATE TABLE threads (id TEXT, rollout_path TEXT, cwd TEXT, model TEXT, reasoning_effort TEXT, "
+                "sandbox_policy TEXT, approval_mode TEXT, archived INTEGER, updated_at_ms INTEGER, "
+                "recency_at_ms INTEGER, first_user_message TEXT)"
+            )
+            connection.execute(
+                "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session,
+                    str(rollout),
+                    str(root),
+                    "gpt-test-codex",
+                    "ultra",
+                    json.dumps({"type": "disabled"}),
+                    "never",
+                    0,
+                    1767351600000,
+                    1767351600000,
+                    "first prompt",
+                ),
+            )
+            connection.commit()
+            connection.close()
+            payload = base64.urlsafe_b64encode(json.dumps({"email": "codex@example.com", "sub": "user-1"}).encode()).rstrip(b"=").decode()
+            (codex_home / "auth.json").write_text(
+                json.dumps({"auth_mode": "chatgpt", "tokens": {"account_id": "acct-1", "id_token": f"x.{payload}.x"}}),
+                encoding="utf-8",
+            )
+            paths = app.resolve_paths(str(root), str(root / ".state"))
+
+            with patch.object(app, "find_codex_executable", return_value=root / "codex"):
+                chats = app.discover_codex_app_sessions(paths)
+
+            self.assertEqual(len(chats), 1)
+            chat = chats[0]
+            self.assertEqual(chat.provider, app.PROVIDER_CODEX)
+            self.assertEqual(chat.title, "Newest Codex task")
+            self.assertEqual(chat.model, "gpt-test-codex")
+            self.assertEqual(chat.effort_level, "ultra")
+            self.assertEqual(chat.sandbox_mode, "danger-full-access")
+            self.assertEqual(chat.approval_policy, "never")
+            self.assertTrue(chat.can_queue)
+
+    def test_run_codex_preserves_settings_and_clears_external_api_key(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            fake = root / "codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, os, sys\n"
+                "prompt = sys.stdin.read()\n"
+                "print(json.dumps({'args': sys.argv[1:], 'prompt': prompt, 'api_key': os.environ.get('OPENAI_API_KEY')}))\n",
+                encoding="utf-8",
+            )
+            fake.chmod(fake.stat().st_mode | 0o111)
+            paths = app.Paths(root, root / ".claude", root / ".state", root / ".state" / "queue.json", root / ".state" / "logs")
+            item = {
+                "provider": app.PROVIDER_CODEX,
+                "session_id": "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb",
+                "cwd": str(root),
+                "prompt": "continua",
+                "fingerprint": {
+                    "effective": {
+                        "model": "gpt-test-codex",
+                        "effortLevel": "ultra",
+                        "sandboxMode": "workspace-write",
+                        "approvalPolicy": "on-request",
+                    }
+                },
+            }
+
+            with patch.dict(app.os.environ, {"OPENAI_API_KEY": "invalid-external-key"}):
+                result = app.run_codex(paths, fake, item, timeout=10)
+
+            self.assertEqual(result.returncode, 0)
+            output = json.loads(result.stdout)
+            self.assertIsNone(output["api_key"])
+            self.assertEqual(output["prompt"], "continua")
+            self.assertEqual(output["args"][:4], ["exec", "resume", "--json", "--skip-git-repo-check"])
+            self.assertIn("model_reasoning_effort='ultra'", output["args"])
+            self.assertIn("sandbox_mode='workspace-write'", output["args"])
+            self.assertIn("approval_policy='on-request'", output["args"])
+            self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", output["args"])
+
+    def test_codex_transcript_detects_prompt_and_structured_limit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            transcript = root / "rollout.jsonl"
+            reset_epoch = int((dt.datetime.now(dt.UTC) + dt.timedelta(hours=1)).timestamp())
+            rows = [
+                {
+                    "timestamp": app.now_utc(),
+                    "type": "event_msg",
+                    "payload": {"type": "user_message", "message": "continua"},
+                },
+                {
+                    "timestamp": app.now_utc(),
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "rate_limits": {
+                            "rate_limit_reached_type": "primary",
+                            "primary": {"used_percent": 100, "resets_at": reset_epoch},
+                        },
+                    },
+                },
+            ]
+            transcript.write_text("\n".join(json.dumps(row) for row in rows), encoding="utf-8")
+            chat = app.Chat(
+                session_id="cccccccc-3333-4333-8333-cccccccccccc",
+                title="Codex",
+                cwd=str(root),
+                permission_mode=None,
+                model="gpt-test",
+                jsonl_path=transcript,
+                last_timestamp=app.now_utc(),
+                message_count=-1,
+                last_prompt=None,
+                provider=app.PROVIDER_CODEX,
+            )
+
+            self.assertTrue(app.codex_prompt_recorded_after(transcript, "continua", dt.datetime.now(dt.UTC) - dt.timedelta(minutes=1)))
+            reset = app.latest_rate_limit_reset_from_chat(chat)
+            self.assertIsNotNone(reset)
+            self.assertEqual(int(reset.timestamp()), reset_epoch)
+
+    def test_run_codex_uses_structured_transcript_reset_when_output_has_no_time(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            reset_epoch = int((dt.datetime.now(dt.UTC) + dt.timedelta(hours=2)).timestamp())
+            transcript = root / "rollout.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "timestamp": app.now_utc(),
+                        "type": "event_msg",
+                        "payload": {
+                            "type": "token_count",
+                            "rate_limits": {
+                                "rate_limit_reached_type": "primary",
+                                "primary": {"used_percent": 100, "resets_at": reset_epoch},
+                            },
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            fake = root / "codex"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import sys\n"
+                "sys.stdin.read()\n"
+                "print('usage limit reached', file=sys.stderr)\n"
+                "raise SystemExit(1)\n",
+                encoding="utf-8",
+            )
+            fake.chmod(fake.stat().st_mode | 0o111)
+            paths = app.Paths(root, root / ".claude", root / ".state", root / ".state" / "queue.json", root / ".state" / "logs")
+            item = {
+                "provider": app.PROVIDER_CODEX,
+                "session_id": "eeeeeeee-5555-4555-8555-eeeeeeeeeeee",
+                "cwd": str(root),
+                "prompt": "continua",
+                "jsonl_path": str(transcript),
+                "fingerprint": {"effective": {}},
+            }
+
+            result = app.run_codex(paths, fake, item, timeout=10)
+
+            self.assertTrue(result.rate_limited)
+            self.assertIsNotNone(result.reset_at)
+            self.assertEqual(int(app.parse_iso(result.reset_at).timestamp()), reset_epoch)
+
     def test_discover_chats_parses_latest_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             claude_home = Path(tmp) / ".claude"
@@ -1649,6 +1977,7 @@ class QueueAppTests(unittest.TestCase):
                     "auto_continue": {
                         "enabled": True,
                         "status": "armed",
+                        "monitor_limit": False,
                         "created_at": app.now_utc(),
                         "session_id": session,
                         "title": "fake",

@@ -4,15 +4,15 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-vscode-queue"
-version = "0.1.0"
-description = "Local queue and auto-continue runner for Claude Code sessions in VS Code and Claude Desktop."
+version = "0.2.0"
+description = "Local queue and auto-continue runner for Claude Code sessions and Codex App tasks."
 readme = "README.md"
 requires-python = ">=3.10"
 license = { file = "LICENSE" }
 authors = [
   { name = "Claude VS Code Queue contributors" }
 ]
-keywords = ["claude-code", "queue", "vscode", "automation", "rate-limit"]
+keywords = ["claude-code", "codex", "queue", "automation", "rate-limit"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
