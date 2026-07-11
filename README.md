@@ -1,191 +1,180 @@
-# Claude + Codex Queue
+<p align="center">
+  <img src="https://raw.githubusercontent.com/ravhello/claude-codex-queue/main/assets/claude-codex-queue-128.png" width="112" alt="Claude + Codex Queue icon">
+</p>
 
-Local queue and auto-continue runner for Claude Code sessions and Codex App
-tasks on Windows.
+<h1 align="center">Claude + Codex Queue</h1>
 
-Current release: **v0.2.1**.
+<p align="center">
+  Queue prompts for existing Claude Code sessions and Codex App tasks.<br>
+  Wait out usage limits, send <code>continua</code>, then resume the queue without wasting the next prompt.
+</p>
 
-It lets you pick an existing Claude Code session, enqueue one or more prompts,
-and send them later with `claude -p --resume <session-id>` when the session
-limit is no longer active. It does not bypass Claude limits. When Claude reports
-a rate/session limit, the next queued prompt is not wasted: the runner waits for
-the reset window, sends `continua` first, and only then resumes the queue.
+<p align="center">
+  <a href="https://github.com/ravhello/claude-codex-queue/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/ravhello/claude-codex-queue/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="https://github.com/ravhello/claude-codex-queue/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/ravhello/claude-codex-queue"></a>
+  <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
+  <a href="https://github.com/ravhello/claude-codex-queue/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/ravhello/claude-codex-queue"></a>
+  <a href="https://github.com/ravhello/claude-codex-queue/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/ravhello/claude-codex-queue?style=social"></a>
+</p>
 
-Codex App tasks are read from the local Codex task index and resumed through
-the official CLI with `codex exec resume <session-id>`. The app preserves the
-task's model, reasoning effort, sandbox mode and approval policy unless an
-explicit per-queue override is selected.
+<p align="center">
+  <a href="#quick-start">Quick start</a> |
+  <a href="#how-limit-recovery-works">Limit recovery</a> |
+  <a href="https://github.com/ravhello/claude-codex-queue/blob/main/ROADMAP.md">Roadmap</a> |
+  <a href="https://github.com/ravhello/claude-codex-queue/discussions">Discussions</a>
+</p>
 
-## Why This Exists
+![Claude + Codex Queue dashboard with anonymized sample data](https://raw.githubusercontent.com/ravhello/claude-codex-queue/main/docs/assets/dashboard.png)
 
-There are already useful Claude Code queue projects, including:
+## Why use it?
 
-- [JCSnap/claude-code-queue](https://github.com/JCSnap/claude-code-queue):
-  packageable CLI queue with priorities, retries, prompt bank and rate-limit
-  handling.
-- [vasiliyk/claude-code-batch](https://github.com/vasiliyk/claude-code-batch):
-  batch-oriented Claude Code task runner.
-- [cheapestinference/claude-code-queue-utility](https://github.com/cheapestinference/claude-code-queue-utility):
-  lightweight queue helper.
+AI coding sessions often stop at the usage-limit boundary. Sending the next real
+prompt immediately can waste it on another limit response. Claude + Codex Queue
+keeps that prompt pending, waits for the reset, resumes the interrupted work
+with `continua`, and only then processes the rest of the queue in order.
 
-This project focuses on a different workflow:
+The app works with sessions you already use. It does not create a separate chat
+system and does not require external Anthropic or OpenAI API keys.
 
-- discovering existing Claude Code chats from VS Code, Claude Desktop and
-  remote VS Code metadata;
-- selecting a real session from a local web UI;
-- preserving the selected chat's model, effort and permission mode unless the
-  user explicitly overrides them;
-- detecting account mismatches and view-only sessions before sends;
-- supporting Claude Desktop Windows Code-tab session metadata, including
-  multi-account synchronization;
-- auto-continue mode for a selected session that waits out the limit and sends
-  `continua` without consuming the next queued prompt.
-- first-class Codex App task discovery, ordering, queueing and auto-continue;
-- structured Codex usage-limit detection from the task transcript;
-- prompt-recording verification after every local Codex send.
+## What it supports
 
-## Features
+| Source | Discover | Queue prompts | Auto-continue | Preserve settings |
+| --- | :---: | :---: | :---: | :---: |
+| Claude Code in VS Code | Yes | Yes | Yes | Model, effort, permissions |
+| Claude Desktop Code sessions | Yes | Yes, when locally resumable | Yes | Model, effort, permissions |
+| Claude Code over Remote SSH | Yes | When enough metadata exists | Yes | Remote effective settings |
+| Codex App tasks | Yes | Yes | Yes | Model, reasoning, sandbox, approvals |
 
-- Local web UI at `http://127.0.0.1:8765/`.
-- CLI for listing chats, adding prompts, checking status and running the queue.
-- Persistent queue stored under the detected Windows user profile.
-- Priority queue: lower numbers run first, FIFO order is preserved within the
-  same priority.
-- Rate/session-limit recovery with a 60 second safety delay after parsed reset
-  times.
-- Settings fingerprint checks before sending.
-- Auto-continue mode for sessions blocked by credits/session limits.
-- Claude Desktop Windows session discovery and repair for compatible metadata.
-- Remote SSH VS Code session detection where enough metadata is available.
-- Codex App tasks read from `~/.codex/session_index.jsonl` and
-  `~/.codex/state_5.sqlite` without scanning multi-hundred-MB transcripts.
-- Provider filter and provider-specific settings controls in the web UI.
+Additional capabilities:
 
-## Requirements
+- newest-real-message sorting across Claude and Codex;
+- persistent FIFO queue with per-prompt priorities;
+- one-minute safety delay after a parsed reset time;
+- multi-account Claude metadata synchronization and chat transfer;
+- account mismatch and view-only checks before actions are enabled;
+- transcript confirmation after every Codex send;
+- local web UI plus a scriptable CLI;
+- no runtime Python dependencies outside the standard library.
 
-- Windows with WSL and Python 3.10+ available in WSL.
-- Claude Code installed and authenticated.
-- Official Codex CLI installed and authenticated with the same ChatGPT account
-  used by the Codex App.
-- VS Code Claude Code extension, or Claude Desktop Windows app if you want the
-  Desktop Code-tab integration.
+## Quick start
 
-## Quick Start
+### Windows app and Desktop shortcut
 
-From the project directory:
+Requirements: Windows, WSL, Python 3.10+ in WSL, and at least one authenticated
+Claude Code or Codex CLI installation.
 
-```bash
-python3 -m claude_codex_queue doctor
-python3 -m claude_codex_queue list
-python3 -m claude_codex_queue.web --host 127.0.0.1 --port 8765
+```powershell
+git clone https://github.com/ravhello/claude-codex-queue.git
+cd claude-codex-queue
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-desktop-shortcut.ps1
 ```
 
-Open:
+Open **Claude + Codex Queue** from the Desktop. The launcher starts the local
+server and opens [http://127.0.0.1:8765/](http://127.0.0.1:8765/).
 
-```text
-http://127.0.0.1:8765/
-```
-
-Add prompts from the CLI:
-
-```bash
-python3 -m claude_codex_queue add --chat 1 "Run tests and fix failures"
-python3 -m claude_codex_queue add --chat c8209e53 --priority 0 "Urgent follow-up"
-python3 -m claude_codex_queue add --chat 1 @prompt.md
-```
-
-Run the queue:
-
-```bash
-python3 -m claude_codex_queue run
-```
-
-Run one non-sending check:
-
-```bash
-python3 -m claude_codex_queue run --dry-run --once
-```
-
-## Web UI Launcher
-
-On Windows, run:
+To run it without installing a shortcut:
 
 ```powershell
 .\start-claude-codex-queue.ps1
 ```
 
-To install a Desktop shortcut:
+### Install the CLI from the latest wheel
 
-```powershell
-.\install-desktop-shortcut.ps1
-```
-
-The scripts are path-relative, so they work from any cloned folder.
-
-## CLI Commands
+Run this inside WSL:
 
 ```bash
-python3 -m claude_codex_queue doctor
-python3 -m claude_codex_queue list --limit 30
-python3 -m claude_codex_queue add --chat <selector> [--priority 100] "msg1" "msg2"
-python3 -m claude_codex_queue status -v
-python3 -m claude_codex_queue check-settings
-python3 -m claude_codex_queue run
-python3 -m claude_codex_queue remove <item-id>
-python3 -m claude_codex_queue reset <item-id>
-python3 -m claude_codex_queue clear
+python3 -m pip install "https://github.com/ravhello/claude-codex-queue/releases/download/v0.2.1/claude_codex_queue-0.2.1-py3-none-any.whl"
+claude-codex-queue doctor
+claude-codex-queue-web --host 127.0.0.1 --port 8765
 ```
 
-`<selector>` can be a visible list number, a session-id prefix, a title fragment
-or a cwd fragment.
+The source checkout is recommended if you want the Windows launcher and Desktop
+shortcut. The wheel is useful for CLI-only installations.
 
-## State and Logs
+## How limit recovery works
 
-By default, state lives in:
+```mermaid
+flowchart LR
+    A["Queued prompt"] --> B["Resume selected session"]
+    B --> C{"Usage limit?"}
+    C -- "No" --> D["Confirm prompt in transcript"]
+    C -- "Yes" --> E["Keep prompt pending"]
+    E --> F["Wait until reset + 60 seconds"]
+    F --> G["Send 'continua'"]
+    G --> H{"Previous work finished?"}
+    H -- "Not yet" --> G
+    H -- "Yes" --> A
+```
+
+Auto-continue can also monitor a selected session with an empty queue. It sends
+nothing while no active limit is detected.
+
+## Safety guarantees
+
+- The project does not bypass or evade provider limits.
+- The next queued prompt remains pending when a limit is detected.
+- Chat settings are fingerprinted and checked before sending.
+- External Anthropic and OpenAI API-key/base-URL overrides are removed from
+  child processes, so local CLI authentication remains authoritative.
+- Codex dangerous bypass mode is never enabled implicitly.
+- Controls are disabled for sessions that are genuinely view-only.
+- Queue state and logs stay local under the detected Windows profile.
+
+Read [SECURITY.md](https://github.com/ravhello/claude-codex-queue/blob/main/SECURITY.md) before sharing diagnostics. Never publish private
+transcripts, authentication files, tokens, or unredacted logs.
+
+## CLI
+
+```bash
+claude-codex-queue doctor
+claude-codex-queue list --limit 30
+claude-codex-queue add --chat <selector> [--priority 100] "message"
+claude-codex-queue status -v
+claude-codex-queue check-settings
+claude-codex-queue run
+claude-codex-queue remove <item-id>
+claude-codex-queue reset <item-id>
+claude-codex-queue clear
+```
+
+`<selector>` accepts a visible row number, session-ID prefix, title fragment,
+or working-directory fragment. Multiple messages can be supplied in order or
+loaded from `@prompt.md`.
+
+## State and compatibility
+
+New installations use:
 
 ```text
 <Windows user profile>\.claude-codex-queue
 ```
 
-Override it with:
-
-```bash
-python3 -m claude_codex_queue --state-dir /path/to/state <command>
-```
-
-Do not commit the state directory. It may contain queue prompts and run logs.
-Existing installations automatically continue using `.claude-vscode-queue`,
-so queues and logs are not reset by the rename. The old Python module, console
-commands and launcher names remain available as compatibility aliases.
-
-## Safety Model
-
-This tool is intentionally conservative:
-
-- It does not bypass or evade Claude limits.
-- It waits and retries after rate/session-limit messages.
-- It sends `continua` before consuming the next queued prompt after a limit.
-- It checks settings before sending and blocks if the chat settings changed.
-- It clears external Anthropic API-key environment variables before invoking
-  Claude Code, avoiding accidental sends through a stale external API key.
-- It clears external OpenAI API-key/base-URL environment variables before
-  invoking Codex, so a stale key cannot override the Codex App ChatGPT login.
-- It never enables Codex's dangerous bypass flag implicitly. Existing task
-  sandbox and approval settings are preserved unless explicitly overridden.
-- Auto-continue first monitors for an active limit and sends nothing while no
-  limit is detected.
+Existing installations automatically keep using `.claude-vscode-queue`, so an
+upgrade does not reset queues or logs. The old Python modules, commands, and
+launcher names remain as compatibility aliases.
 
 ## Development
 
 ```bash
-python3 -m py_compile claude_codex_queue/*.py claude_vscode_queue/app.py claude_vscode_queue/web.py
 python3 -m unittest discover -s tests -v
+python3 -m build
+python3 -m twine check dist/*
 ```
 
-The project has no runtime Python dependencies outside the standard library.
+See [CONTRIBUTING.md](https://github.com/ravhello/claude-codex-queue/blob/main/CONTRIBUTING.md),
+[ARCHITECTURE.md](https://github.com/ravhello/claude-codex-queue/blob/main/docs/ARCHITECTURE.md),
+and the [roadmap](https://github.com/ravhello/claude-codex-queue/blob/main/ROADMAP.md). Questions and setup help belong in
+[Discussions](https://github.com/ravhello/claude-codex-queue/discussions);
+reproducible defects belong in
+[Issues](https://github.com/ravhello/claude-codex-queue/issues).
 
-## Status
+## Project status
 
-Alpha. Tested against local Windows/WSL Claude Code workflows and the Windows
-Codex App with the official Codex CLI. Claude Desktop and Codex local metadata
-are private implementation details and can change between app versions.
+Current release: **v0.2.1**. The project is alpha software tested on Windows/WSL
+with local Claude Code and Codex App workflows. Upstream desktop metadata is not
+a public compatibility contract and may change between provider releases.
+
+Claude + Codex Queue is an independent open-source project. It is not affiliated
+with, endorsed by, or sponsored by Anthropic or OpenAI.
+
+Released under the [MIT License](https://github.com/ravhello/claude-codex-queue/blob/main/LICENSE).

@@ -57,6 +57,8 @@ CODEX_EXTERNAL_AUTH_ENV_VARS = {
     "OPENAI_PROJECT_ID",
 }
 
+UTC = dt.timezone.utc
+
 PROVIDER_CLAUDE = "claude"
 PROVIDER_CODEX = "codex"
 
@@ -196,7 +198,7 @@ def parse_iso(value: str | None) -> dt.datetime | None:
     except ValueError:
         return None
     if parsed.tzinfo is None:
-        parsed = parsed.replace(tzinfo=dt.UTC)
+        parsed = parsed.replace(tzinfo=UTC)
     return parsed
 
 
@@ -204,7 +206,7 @@ def iso_from_epoch_ms(value: Any) -> str | None:
     if not isinstance(value, (int, float)):
         return None
     try:
-        return dt.datetime.fromtimestamp(value / 1000, tz=dt.UTC).replace(microsecond=0).isoformat()
+        return dt.datetime.fromtimestamp(value / 1000, tz=UTC).replace(microsecond=0).isoformat()
     except (OSError, OverflowError, ValueError):
         return None
 
@@ -491,7 +493,7 @@ def account_index_path(paths: Paths) -> Path:
 
 def file_mtime_iso(path: Path) -> str | None:
     try:
-        return dt.datetime.fromtimestamp(path.stat().st_mtime, tz=dt.UTC).astimezone().replace(microsecond=0).isoformat()
+        return dt.datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).astimezone().replace(microsecond=0).isoformat()
     except OSError:
         return None
 
@@ -703,9 +705,9 @@ def chat_sort_key(chat: Chat) -> dt.datetime:
     if parsed:
         return parsed
     try:
-        return dt.datetime.fromtimestamp(chat.jsonl_path.stat().st_mtime, tz=dt.UTC)
+        return dt.datetime.fromtimestamp(chat.jsonl_path.stat().st_mtime, tz=UTC)
     except OSError:
-        return dt.datetime.min.replace(tzinfo=dt.UTC)
+        return dt.datetime.min.replace(tzinfo=UTC)
 
 
 def discover_chats(claude_home: Path) -> list[Chat]:
@@ -787,8 +789,8 @@ def discover_chats(claude_home: Path) -> list[Chat]:
         else:
             old_timestamp = parse_iso(existing.last_timestamp)
             new_timestamp = parse_iso(chat.last_timestamp)
-            old_key = old_timestamp or dt.datetime.fromtimestamp(existing.jsonl_path.stat().st_mtime, tz=dt.UTC)
-            new_key = new_timestamp or dt.datetime.fromtimestamp(jsonl_path.stat().st_mtime, tz=dt.UTC)
+            old_key = old_timestamp or dt.datetime.fromtimestamp(existing.jsonl_path.stat().st_mtime, tz=UTC)
+            new_key = new_timestamp or dt.datetime.fromtimestamp(jsonl_path.stat().st_mtime, tz=UTC)
             if new_key >= old_key:
                 by_session[session_id] = chat
 
@@ -3378,7 +3380,7 @@ def codex_rate_limit_reset_from_path(path: Path, now: dt.datetime | None = None)
             reset_epoch = window.get("resets_at")
             if isinstance(reset_epoch, (int, float)):
                 try:
-                    candidates.append(dt.datetime.fromtimestamp(reset_epoch, tz=dt.UTC).astimezone())
+                    candidates.append(dt.datetime.fromtimestamp(reset_epoch, tz=UTC).astimezone())
                 except (OSError, OverflowError, ValueError):
                     pass
         if candidates:
@@ -3538,17 +3540,17 @@ def active_auto_continue(queue: dict[str, Any]) -> dict[str, Any] | None:
 
 def item_ready(item: dict[str, Any]) -> bool:
     not_before = parse_iso(item.get("not_before"))
-    return not_before is None or not_before <= dt.datetime.now(dt.UTC)
+    return not_before is None or not_before <= dt.datetime.now(UTC)
 
 
 def recovery_ready(recovery: dict[str, Any]) -> bool:
     not_before = parse_iso(recovery.get("not_before"))
-    return not_before is None or not_before <= dt.datetime.now(dt.UTC)
+    return not_before is None or not_before <= dt.datetime.now(UTC)
 
 
 def auto_continue_ready(auto_continue: dict[str, Any]) -> bool:
     not_before = parse_iso(auto_continue.get("not_before"))
-    return not_before is None or not_before <= dt.datetime.now(dt.UTC)
+    return not_before is None or not_before <= dt.datetime.now(UTC)
 
 
 def recovery_as_item(recovery: dict[str, Any]) -> dict[str, Any]:
@@ -3607,7 +3609,7 @@ def retry_time_after_limit(result: ClaudeRunResult, poll_seconds: int) -> str:
     reset_at = parse_iso(result.reset_at)
     if reset_at:
         return (reset_at + dt.timedelta(seconds=RATE_LIMIT_RESET_DELAY_SECONDS)).astimezone().isoformat()
-    return (dt.datetime.now(dt.UTC) + dt.timedelta(seconds=poll_seconds)).replace(microsecond=0).isoformat()
+    return (dt.datetime.now(UTC) + dt.timedelta(seconds=poll_seconds)).replace(microsecond=0).isoformat()
 
 
 def update_auto_continue_state(auto_continue: dict[str, Any], status: str | None = None, **fields: Any) -> None:
@@ -3955,7 +3957,7 @@ def command_check_settings(args: argparse.Namespace) -> int:
 
 def seconds_until_ready(queue: dict[str, Any], default: int) -> int:
     waits: list[int] = []
-    now = dt.datetime.now(dt.UTC)
+    now = dt.datetime.now(UTC)
     recovery = active_recovery(queue)
     if recovery:
         not_before = parse_iso(recovery.get("not_before"))
@@ -4031,7 +4033,7 @@ def command_run(args: argparse.Namespace) -> int:
 
             print(f"Recovery: invio '{RECOVERY_PROMPT}' a chat {item['session_id'][:8]}")
             recovery["attempts"] = int(recovery.get("attempts", 0)) + 1
-            run_started_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=5)
+            run_started_at = dt.datetime.now(UTC) - dt.timedelta(seconds=5)
             try:
                 result = run_agent(paths, claude_exe, codex_exe, item, args.timeout, args.ide)
             except subprocess.TimeoutExpired:
@@ -4153,7 +4155,7 @@ def command_run(args: argparse.Namespace) -> int:
                 reset_at = latest_rate_limit_reset_from_chat(chat)
                 if reset_at is None:
                     next_check = (
-                        dt.datetime.now(dt.UTC) + dt.timedelta(seconds=args.poll_seconds)
+                        dt.datetime.now(UTC) + dt.timedelta(seconds=args.poll_seconds)
                     ).replace(microsecond=0).isoformat()
                     update_auto_continue_state(
                         auto_continue,
@@ -4201,7 +4203,7 @@ def command_run(args: argparse.Namespace) -> int:
                 not_before=None,
             )
             save_queue(paths.queue_file, queue)
-            run_started_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=5)
+            run_started_at = dt.datetime.now(UTC) - dt.timedelta(seconds=5)
             try:
                 result = run_agent(paths, claude_exe, codex_exe, item, args.timeout, args.ide)
             except subprocess.TimeoutExpired:
@@ -4342,7 +4344,7 @@ def command_run(args: argparse.Namespace) -> int:
 
         print(f"Invio {item['id']} a chat {item['session_id'][:8]}: {truncate(item.get('title'), 60)}")
         item["attempts"] = int(item.get("attempts", 0)) + 1
-        run_started_at = dt.datetime.now(dt.UTC) - dt.timedelta(seconds=5)
+        run_started_at = dt.datetime.now(UTC) - dt.timedelta(seconds=5)
         try:
             result = run_agent(paths, claude_exe, codex_exe, item, args.timeout, args.ide)
         except subprocess.TimeoutExpired:

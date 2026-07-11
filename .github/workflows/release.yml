@@ -1,0 +1,41 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Test, build, and attach release assets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Verify tag matches package version
+        run: |
+          package_version="$(python -c 'from claude_codex_queue import __version__; print(__version__)')"
+          test "v${package_version}" = "${GITHUB_REF_NAME}"
+      - name: Test
+        run: python -m unittest discover -s tests -v
+      - name: Build and validate
+        run: |
+          python -m pip install --disable-pip-version-check build twine
+          python -m build
+          python -m twine check dist/*
+          cd dist
+          sha256sum *.whl *.tar.gz > "SHA256SUMS-${GITHUB_REF_NAME#v}.txt"
+      - name: Create or update GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "${GITHUB_REF_NAME}" >/dev/null 2>&1; then
+            gh release upload "${GITHUB_REF_NAME}" dist/* --clobber
+          else
+            gh release create "${GITHUB_REF_NAME}" dist/* --title "Claude + Codex Queue ${GITHUB_REF_NAME}" --generate-notes
+          fi

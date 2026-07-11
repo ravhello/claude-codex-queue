@@ -1,0 +1,81 @@
+name: Bug report
+description: Report a reproducible problem without sharing private session data
+title: "[Bug]: "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a problem. Remove tokens, account identifiers, private prompts, transcripts, and unredacted local paths.
+  - type: input
+    id: version
+    attributes:
+      label: Claude + Codex Queue version
+      placeholder: "0.2.1"
+    validations:
+      required: true
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Session source
+      options:
+        - Claude Code in VS Code
+        - Claude Desktop Code session
+        - Claude Code over Remote SSH
+        - Codex App
+        - CLI or packaging
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include Windows, WSL, Python, Claude CLI, and Codex CLI versions when relevant.
+      placeholder: |
+        Windows:
+        WSL distribution:
+        Python:
+        Claude CLI:
+        Codex CLI:
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: Reproduction
+      description: Provide the smallest sequence that reproduces the problem.
+      placeholder: |
+        1. Select ...
+        2. Click ...
+        3. Observe ...
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Redacted diagnostics
+      description: Paste only the relevant output from doctor/status or the final log lines.
+      render: shell
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Safety checks
+      options:
+        - label: I reproduced this on the latest release or current main.
+          required: true
+        - label: I removed credentials, account identifiers, private prompts, transcripts, and personal paths.
+          required: true

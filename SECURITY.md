@@ -6,13 +6,24 @@ hosted service.
 
 ## Supported Versions
 
-Only the current `main` branch is supported until the project has tagged
-releases.
+| Version | Supported |
+| --- | :---: |
+| 0.2.x | Yes |
+| 0.1.x | No |
+
+The current `main` branch receives fixes before the next tagged release.
 
 ## Reporting a Vulnerability
 
-Open a GitHub issue with a minimal reproduction. Do not include API keys,
-OAuth tokens, Claude logs containing secrets, or private transcripts.
+Use
+[GitHub private vulnerability reporting](https://github.com/ravhello/claude-codex-queue/security/advisories/new)
+with a minimal reproduction. Do not open a public issue for a suspected
+vulnerability.
+
+Do not include API keys, OAuth tokens, authentication files, unredacted account
+identifiers, logs containing secrets, or private transcripts. If a minimal
+reproduction needs sensitive context, describe the shape of the data and wait
+for a maintainer response before sharing it.
 
 ## Local Data
 

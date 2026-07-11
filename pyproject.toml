@@ -13,18 +13,32 @@ license-files = ["LICENSE"]
 authors = [
   { name = "Claude + Codex Queue contributors" }
 ]
-keywords = ["claude-code", "codex", "queue", "automation", "rate-limit"]
+keywords = [
+  "ai-agents",
+  "anthropic",
+  "automation",
+  "claude",
+  "claude-code",
+  "codex",
+  "developer-tools",
+  "openai",
+  "queue",
+  "rate-limit",
+  "wsl",
+]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
   "Environment :: Web Environment",
   "Intended Audience :: Developers",
   "Operating System :: Microsoft :: Windows",
+  "Operating System :: POSIX :: Linux",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
   "Programming Language :: Python :: 3.11",
   "Programming Language :: Python :: 3.12",
   "Topic :: Software Development",
+  "Topic :: Utilities",
 ]
 dependencies = []
 
@@ -32,6 +46,9 @@ dependencies = []
 Homepage = "https://github.com/ravhello/claude-codex-queue"
 Issues = "https://github.com/ravhello/claude-codex-queue/issues"
 Changelog = "https://github.com/ravhello/claude-codex-queue/blob/main/CHANGELOG.md"
+Documentation = "https://github.com/ravhello/claude-codex-queue/blob/main/docs/ARCHITECTURE.md"
+Discussions = "https://github.com/ravhello/claude-codex-queue/discussions"
+Releases = "https://github.com/ravhello/claude-codex-queue/releases"
 Source = "https://github.com/ravhello/claude-codex-queue"
 
 [project.scripts]

@@ -129,7 +129,7 @@ class QueueAppTests(unittest.TestCase):
                 }
             ]
             queue["auto_continue"]["not_before"] = (
-                dt.datetime.now(dt.UTC) + dt.timedelta(hours=1)
+                dt.datetime.now(app.UTC) + dt.timedelta(hours=1)
             ).replace(microsecond=0).isoformat()
             app.save_queue(paths.queue_file, queue)
 
@@ -272,7 +272,7 @@ class QueueAppTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             transcript = root / "rollout.jsonl"
-            reset_epoch = int((dt.datetime.now(dt.UTC) + dt.timedelta(hours=1)).timestamp())
+            reset_epoch = int((dt.datetime.now(app.UTC) + dt.timedelta(hours=1)).timestamp())
             rows = [
                 {
                     "timestamp": app.now_utc(),
@@ -305,7 +305,7 @@ class QueueAppTests(unittest.TestCase):
                 provider=app.PROVIDER_CODEX,
             )
 
-            self.assertTrue(app.codex_prompt_recorded_after(transcript, "continua", dt.datetime.now(dt.UTC) - dt.timedelta(minutes=1)))
+            self.assertTrue(app.codex_prompt_recorded_after(transcript, "continua", dt.datetime.now(app.UTC) - dt.timedelta(minutes=1)))
             reset = app.latest_rate_limit_reset_from_chat(chat)
             self.assertIsNotNone(reset)
             self.assertEqual(int(reset.timestamp()), reset_epoch)
@@ -313,7 +313,7 @@ class QueueAppTests(unittest.TestCase):
     def test_run_codex_uses_structured_transcript_reset_when_output_has_no_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            reset_epoch = int((dt.datetime.now(dt.UTC) + dt.timedelta(hours=2)).timestamp())
+            reset_epoch = int((dt.datetime.now(app.UTC) + dt.timedelta(hours=2)).timestamp())
             transcript = root / "rollout.jsonl"
             transcript.write_text(
                 json.dumps(
@@ -607,7 +607,7 @@ class QueueAppTests(unittest.TestCase):
 
             reset = app.latest_rate_limit_reset_from_chat(
                 chat,
-                now=dt.datetime(2026, 7, 7, 16, 0, tzinfo=dt.UTC),
+                now=dt.datetime(2026, 7, 7, 16, 0, tzinfo=app.UTC),
             )
 
             self.assertIsNotNone(reset)
@@ -873,7 +873,7 @@ class QueueAppTests(unittest.TestCase):
                         "cliSessionId": session,
                         "title": "VSCode Claude chat session recovery",
                         "cwd": str(root),
-                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 22, 32, tzinfo=dt.UTC).timestamp() * 1000),
+                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 22, 32, tzinfo=app.UTC).timestamp() * 1000),
                         "model": "claude-opus-4-8",
                         "effort": "xhigh",
                         "permissionMode": "bypassPermissions",
@@ -891,7 +891,7 @@ class QueueAppTests(unittest.TestCase):
                         "cliSessionId": "961bec34-e1d2-4ff6-b1e8-3826af508a79",
                         "title": "Other account session",
                         "cwd": str(root),
-                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 21, 0, tzinfo=dt.UTC).timestamp() * 1000),
+                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 21, 0, tzinfo=app.UTC).timestamp() * 1000),
                         "model": "claude-opus-4-8",
                         "effort": "high",
                         "permissionMode": "bypassPermissions",
@@ -954,7 +954,7 @@ class QueueAppTests(unittest.TestCase):
                         "cliSessionId": session,
                         "title": "Old account latest chat",
                         "cwd": str(root),
-                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 12, 0, tzinfo=dt.UTC).timestamp() * 1000),
+                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 12, 0, tzinfo=app.UTC).timestamp() * 1000),
                         "model": "claude-opus-4-8",
                         "effort": "xhigh",
                         "permissionMode": "bypassPermissions",
@@ -1006,7 +1006,7 @@ class QueueAppTests(unittest.TestCase):
                         "cliSessionId": session,
                         "title": "Older duplicate",
                         "cwd": str(root),
-                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 10, 0, tzinfo=dt.UTC).timestamp() * 1000),
+                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 10, 0, tzinfo=app.UTC).timestamp() * 1000),
                         "isArchived": False,
                     }
                 ),
@@ -1019,7 +1019,7 @@ class QueueAppTests(unittest.TestCase):
                         "cliSessionId": session,
                         "title": "Newer duplicate",
                         "cwd": str(root),
-                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 11, 0, tzinfo=dt.UTC).timestamp() * 1000),
+                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 11, 0, tzinfo=app.UTC).timestamp() * 1000),
                         "isArchived": False,
                     }
                 ),
@@ -1032,7 +1032,7 @@ class QueueAppTests(unittest.TestCase):
                         "cliSessionId": "ffffffff-ffff-4fff-8fff-ffffffffffff",
                         "title": "Other account marker",
                         "cwd": str(root),
-                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 9, 0, tzinfo=dt.UTC).timestamp() * 1000),
+                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 9, 0, tzinfo=app.UTC).timestamp() * 1000),
                         "isArchived": False,
                     }
                 ),
@@ -1161,7 +1161,7 @@ class QueueAppTests(unittest.TestCase):
                         "cliSessionId": "cdcdcdcd-cdcd-4cdc-8dcd-cdcdcdcdcdcd",
                         "title": "Dirty session",
                         "cwd": str(root),
-                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 12, 0, tzinfo=dt.UTC).timestamp() * 1000),
+                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 12, 0, tzinfo=app.UTC).timestamp() * 1000),
                         "model": None,
                         "effort": None,
                         "permissionMode": None,
@@ -1210,7 +1210,7 @@ class QueueAppTests(unittest.TestCase):
                         "cliSessionId": session,
                         "title": "Other account chat",
                         "cwd": str(root),
-                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 12, 0, tzinfo=dt.UTC).timestamp() * 1000),
+                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 12, 0, tzinfo=app.UTC).timestamp() * 1000),
                         "model": "claude-opus-4-8",
                         "effort": "high",
                         "permissionMode": "bypassPermissions",
@@ -1264,7 +1264,7 @@ class QueueAppTests(unittest.TestCase):
                         "cliSessionId": session,
                         "title": "Move me",
                         "cwd": str(root),
-                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 12, 0, tzinfo=dt.UTC).timestamp() * 1000),
+                        "lastActivityAt": int(dt.datetime(2026, 7, 9, 12, 0, tzinfo=app.UTC).timestamp() * 1000),
                         "model": "claude-opus-4-8",
                         "effort": "xhigh",
                         "permissionMode": "bypassPermissions",
@@ -1646,8 +1646,8 @@ class QueueAppTests(unittest.TestCase):
         retry_at = app.parse_iso(app.retry_time_after_limit(result, poll_seconds=300))
 
         self.assertIsNotNone(retry_at)
-        self.assertEqual(retry_at.hour, 9)
-        self.assertEqual(retry_at.minute, 1)
+        expected = app.parse_iso(result.reset_at) + dt.timedelta(seconds=app.RATE_LIMIT_RESET_DELAY_SECONDS)
+        self.assertEqual(retry_at, expected)
 
     def test_permission_wait_detection(self) -> None:
         text = "Le scritture e ora anche i comandi Bash richiedono approvazione."

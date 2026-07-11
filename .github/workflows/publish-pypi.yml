@@ -1,0 +1,51 @@
+name: Publish to PyPI
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Package version to publish, without the v prefix
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    name: Verify release distribution
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.14"
+      - name: Download exact GitHub release artifacts
+        env:
+          EXPECTED_VERSION: ${{ inputs.version }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir dist
+          gh release download "v${EXPECTED_VERSION}" --repo "${GITHUB_REPOSITORY}" --pattern "*.whl" --pattern "*.tar.gz" --dir dist
+          python -m pip install --disable-pip-version-check twine
+          python -m twine check dist/*
+      - uses: actions/upload-artifact@v7
+        with:
+          name: python-package
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    name: Publish with Trusted Publishing
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/claude-codex-queue
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: python-package
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@v1.14.0
