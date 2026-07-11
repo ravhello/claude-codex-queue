@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- Added CI across supported Python versions plus Windows packaging smoke tests.
+- Added automated GitHub release assets and a manual PyPI Trusted Publishing workflow.
+- Added an anonymized dashboard screenshot, social preview, and faster Quick Start documentation.
+- Added contribution, support, architecture, roadmap, issue, pull request, and conduct guidance.
+
 ## 0.2.1 - 2026-07-11
 
 - Forced LF line endings for shell launchers so fresh Windows checkouts run correctly in WSL.

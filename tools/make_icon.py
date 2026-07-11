@@ -8,6 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 OUT = ROOT / "assets" / "claude-codex-queue.ico"
 PNG32_OUT = ROOT / "assets" / "claude-codex-queue-32.png"
+PNG128_OUT = ROOT / "assets" / "claude-codex-queue-128.png"
 PACKAGE_OUT = ROOT / "claude_vscode_queue" / "assets" / "claude-codex-queue.ico"
 PACKAGE_PNG32_OUT = ROOT / "claude_vscode_queue" / "assets" / "claude-codex-queue-32.png"
 
@@ -102,14 +103,17 @@ def write_ico() -> None:
 
     ico = header + bytes(directory) + bytes(payload)
     png32 = png_from_rgba(32, rgba(32))
+    png128 = png_from_rgba(128, rgba(128))
     OUT.parent.mkdir(parents=True, exist_ok=True)
     PACKAGE_OUT.parent.mkdir(parents=True, exist_ok=True)
     OUT.write_bytes(ico)
     PNG32_OUT.write_bytes(png32)
+    PNG128_OUT.write_bytes(png128)
     PACKAGE_OUT.write_bytes(ico)
     PACKAGE_PNG32_OUT.write_bytes(png32)
     print(OUT)
     print(PNG32_OUT)
+    print(PNG128_OUT)
 
 
 if __name__ == "__main__":
