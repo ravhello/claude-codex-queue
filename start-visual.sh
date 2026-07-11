@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# This launcher is executed by WSL directly from the Windows worktree.
 set -euo pipefail
 
 HOST="127.0.0.1"
