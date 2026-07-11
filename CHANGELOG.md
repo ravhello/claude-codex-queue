@@ -1,5 +1,9 @@
 # Changelog
 
+## 0.2.1 - 2026-07-11
+
+- Forced LF line endings for shell launchers so fresh Windows checkouts run correctly in WSL.
+
 ## 0.2.0 - 2026-07-11
 
 - Renamed the project and package to Claude + Codex Queue / `claude-codex-queue`.

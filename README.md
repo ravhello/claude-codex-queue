@@ -3,7 +3,7 @@
 Local queue and auto-continue runner for Claude Code sessions and Codex App
 tasks on Windows.
 
-Current release: **v0.2.0**.
+Current release: **v0.2.1**.
 
 It lets you pick an existing Claude Code session, enqueue one or more prompts,
 and send them later with `claude -p --resume <session-id>` when the session

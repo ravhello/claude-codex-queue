@@ -15,7 +15,7 @@ from claude_vscode_queue import app
 
 class QueueAppTests(unittest.TestCase):
     def test_public_version_and_legacy_state_compatibility(self) -> None:
-        self.assertEqual(claude_codex_queue.__version__, "0.2.0")
+        self.assertEqual(claude_codex_queue.__version__, "0.2.1")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             legacy = root / app.LEGACY_APP_DIR_NAME
