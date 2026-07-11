@@ -1,24 +1,24 @@
 [build-system]
-requires = ["setuptools>=68"]
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "claude-vscode-queue"
-version = "0.1.0"
-description = "Local queue and auto-continue runner for Claude Code sessions in VS Code and Claude Desktop."
+name = "claude-codex-queue"
+version = "0.2.0"
+description = "Local queue and auto-continue runner for Claude Code sessions and Codex App tasks."
 readme = "README.md"
 requires-python = ">=3.10"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 authors = [
-  { name = "Claude VS Code Queue contributors" }
+  { name = "Claude + Codex Queue contributors" }
 ]
-keywords = ["claude-code", "queue", "vscode", "automation", "rate-limit"]
+keywords = ["claude-code", "codex", "queue", "automation", "rate-limit"]
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Environment :: Console",
   "Environment :: Web Environment",
   "Intended Audience :: Developers",
-  "License :: OSI Approved :: MIT License",
   "Operating System :: Microsoft :: Windows",
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.10",
@@ -29,15 +29,22 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/ravhello/claude-vscode-queue"
-Issues = "https://github.com/ravhello/claude-vscode-queue/issues"
+Homepage = "https://github.com/ravhello/claude-codex-queue"
+Issues = "https://github.com/ravhello/claude-codex-queue/issues"
+Changelog = "https://github.com/ravhello/claude-codex-queue/blob/main/CHANGELOG.md"
+Source = "https://github.com/ravhello/claude-codex-queue"
 
 [project.scripts]
+claude-codex-queue = "claude_vscode_queue.app:main"
+claude-codex-queue-web = "claude_vscode_queue.web:main"
 claude-vscode-queue = "claude_vscode_queue.app:main"
 claude-vscode-queue-web = "claude_vscode_queue.web:main"
 
 [tool.setuptools]
-packages = ["claude_vscode_queue"]
+packages = ["claude_codex_queue", "claude_vscode_queue", "claude_vscode_queue.assets"]
+
+[tool.setuptools.package-data]
+claude_vscode_queue = ["assets/*.ico", "assets/*.png"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
