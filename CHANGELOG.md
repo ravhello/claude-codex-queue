@@ -6,6 +6,7 @@
 - Added automated GitHub release assets and a manual PyPI Trusted Publishing workflow.
 - Added an anonymized dashboard screenshot, social preview, and faster Quick Start documentation.
 - Added contribution, support, architecture, roadmap, issue, pull request, and conduct guidance.
+- Restored declared Python 3.10 compatibility and made reset-delay tests timezone-independent.
 
 ## 0.2.1 - 2026-07-11
 
