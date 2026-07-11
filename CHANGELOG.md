@@ -1,7 +1,8 @@
 # Changelog
 
-## 0.2.0
+## 0.2.0 - 2026-07-11
 
+- Renamed the project and package to Claude + Codex Queue / `claude-codex-queue`.
 - Added Codex App task discovery from the local task index and state database.
 - Added ordered Codex queue sends and auto-continue through `codex exec resume`.
 - Preserved Codex model, effort, sandbox and approval policy by default.

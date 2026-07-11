@@ -6,8 +6,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-OUT = ROOT / "assets" / "claude-queue.ico"
-PNG32_OUT = ROOT / "assets" / "claude-queue-32.png"
+OUT = ROOT / "assets" / "claude-codex-queue.ico"
+PNG32_OUT = ROOT / "assets" / "claude-codex-queue-32.png"
+PACKAGE_OUT = ROOT / "claude_vscode_queue" / "assets" / "claude-codex-queue.ico"
+PACKAGE_PNG32_OUT = ROOT / "claude_vscode_queue" / "assets" / "claude-codex-queue-32.png"
 
 
 def rgba(size: int) -> bytearray:
@@ -98,9 +100,14 @@ def write_ico() -> None:
         payload.extend(png)
         offset += len(png)
 
+    ico = header + bytes(directory) + bytes(payload)
+    png32 = png_from_rgba(32, rgba(32))
     OUT.parent.mkdir(parents=True, exist_ok=True)
-    OUT.write_bytes(header + bytes(directory) + bytes(payload))
-    PNG32_OUT.write_bytes(png_from_rgba(32, rgba(32)))
+    PACKAGE_OUT.parent.mkdir(parents=True, exist_ok=True)
+    OUT.write_bytes(ico)
+    PNG32_OUT.write_bytes(png32)
+    PACKAGE_OUT.write_bytes(ico)
+    PACKAGE_PNG32_OUT.write_bytes(png32)
     print(OUT)
     print(PNG32_OUT)
 

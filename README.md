@@ -3,6 +3,8 @@
 Local queue and auto-continue runner for Claude Code sessions and Codex App
 tasks on Windows.
 
+Current release: **v0.2.0**.
+
 It lets you pick an existing Claude Code session, enqueue one or more prompts,
 and send them later with `claude -p --resume <session-id>` when the session
 limit is no longer active. It does not bypass Claude limits. When Claude reports
@@ -73,9 +75,9 @@ This project focuses on a different workflow:
 From the project directory:
 
 ```bash
-python3 -m claude_vscode_queue doctor
-python3 -m claude_vscode_queue list
-python3 -m claude_vscode_queue.web --host 127.0.0.1 --port 8765
+python3 -m claude_codex_queue doctor
+python3 -m claude_codex_queue list
+python3 -m claude_codex_queue.web --host 127.0.0.1 --port 8765
 ```
 
 Open:
@@ -87,21 +89,21 @@ http://127.0.0.1:8765/
 Add prompts from the CLI:
 
 ```bash
-python3 -m claude_vscode_queue add --chat 1 "Run tests and fix failures"
-python3 -m claude_vscode_queue add --chat c8209e53 --priority 0 "Urgent follow-up"
-python3 -m claude_vscode_queue add --chat 1 @prompt.md
+python3 -m claude_codex_queue add --chat 1 "Run tests and fix failures"
+python3 -m claude_codex_queue add --chat c8209e53 --priority 0 "Urgent follow-up"
+python3 -m claude_codex_queue add --chat 1 @prompt.md
 ```
 
 Run the queue:
 
 ```bash
-python3 -m claude_vscode_queue run
+python3 -m claude_codex_queue run
 ```
 
 Run one non-sending check:
 
 ```bash
-python3 -m claude_vscode_queue run --dry-run --once
+python3 -m claude_codex_queue run --dry-run --once
 ```
 
 ## Web UI Launcher
@@ -109,7 +111,7 @@ python3 -m claude_vscode_queue run --dry-run --once
 On Windows, run:
 
 ```powershell
-.\start-claude-queue.ps1
+.\start-claude-codex-queue.ps1
 ```
 
 To install a Desktop shortcut:
@@ -123,15 +125,15 @@ The scripts are path-relative, so they work from any cloned folder.
 ## CLI Commands
 
 ```bash
-python3 -m claude_vscode_queue doctor
-python3 -m claude_vscode_queue list --limit 30
-python3 -m claude_vscode_queue add --chat <selector> [--priority 100] "msg1" "msg2"
-python3 -m claude_vscode_queue status -v
-python3 -m claude_vscode_queue check-settings
-python3 -m claude_vscode_queue run
-python3 -m claude_vscode_queue remove <item-id>
-python3 -m claude_vscode_queue reset <item-id>
-python3 -m claude_vscode_queue clear
+python3 -m claude_codex_queue doctor
+python3 -m claude_codex_queue list --limit 30
+python3 -m claude_codex_queue add --chat <selector> [--priority 100] "msg1" "msg2"
+python3 -m claude_codex_queue status -v
+python3 -m claude_codex_queue check-settings
+python3 -m claude_codex_queue run
+python3 -m claude_codex_queue remove <item-id>
+python3 -m claude_codex_queue reset <item-id>
+python3 -m claude_codex_queue clear
 ```
 
 `<selector>` can be a visible list number, a session-id prefix, a title fragment
@@ -142,16 +144,19 @@ or a cwd fragment.
 By default, state lives in:
 
 ```text
-<Windows user profile>\.claude-vscode-queue
+<Windows user profile>\.claude-codex-queue
 ```
 
 Override it with:
 
 ```bash
-python3 -m claude_vscode_queue --state-dir /path/to/state <command>
+python3 -m claude_codex_queue --state-dir /path/to/state <command>
 ```
 
 Do not commit the state directory. It may contain queue prompts and run logs.
+Existing installations automatically continue using `.claude-vscode-queue`,
+so queues and logs are not reset by the rename. The old Python module, console
+commands and launcher names remain available as compatibility aliases.
 
 ## Safety Model
 
@@ -173,7 +178,7 @@ This tool is intentionally conservative:
 ## Development
 
 ```bash
-python3 -m py_compile claude_vscode_queue/app.py claude_vscode_queue/web.py
+python3 -m py_compile claude_codex_queue/*.py claude_vscode_queue/app.py claude_vscode_queue/web.py
 python3 -m unittest discover -s tests -v
 ```
 

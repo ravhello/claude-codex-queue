@@ -14,6 +14,7 @@ venv/
 env/
 
 # Local queue state and logs
+.claude-codex-queue/
 .claude-vscode-queue/
 queue.json
 logs/
@@ -24,4 +25,3 @@ logs/
 Thumbs.db
 .idea/
 .vscode/
-

@@ -1,2 +1,2 @@
 @echo off
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start-claude-queue.ps1"
+call "%~dp0start-claude-codex-queue.cmd"

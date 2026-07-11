@@ -21,7 +21,8 @@ from typing import Any
 from urllib.parse import unquote, urlparse
 
 
-APP_DIR_NAME = ".claude-vscode-queue"
+APP_DIR_NAME = ".claude-codex-queue"
+LEGACY_APP_DIR_NAME = ".claude-vscode-queue"
 QUEUE_FILE_NAME = "queue.json"
 ACCOUNT_INDEX_FILE_NAME = "accounts.json"
 LOG_DIR_NAME = "logs"
@@ -320,7 +321,11 @@ def candidate_windows_homes(override: str | None = None) -> list[Path]:
     candidates: list[Path] = []
     if override:
         candidates.append(windows_to_local_path(override))
-    env_home = os.environ.get("CLAUDE_QUEUE_WINDOWS_HOME") or os.environ.get("USERPROFILE")
+    env_home = (
+        os.environ.get("CLAUDE_CODEX_QUEUE_WINDOWS_HOME")
+        or os.environ.get("CLAUDE_QUEUE_WINDOWS_HOME")
+        or os.environ.get("USERPROFILE")
+    )
     if env_home:
         candidates.append(windows_to_local_path(env_home))
     inferred = current_windows_user_home_from_cwd()
@@ -335,15 +340,21 @@ def candidate_windows_homes(override: str | None = None) -> list[Path]:
 
 def resolve_paths(windows_home: str | None = None, state_dir: str | None = None) -> Paths:
     home_candidates = candidate_windows_homes(windows_home)
-    selected_home = None
-    for home in home_candidates:
-        if path_exists(home / ".claude" / "projects") or path_exists(home / ".codex" / "session_index.jsonl"):
-            selected_home = home
-            break
+    selected_home = windows_to_local_path(windows_home) if windows_home else None
+    if selected_home is None:
+        for home in home_candidates:
+            if path_exists(home / ".claude" / "projects") or path_exists(home / ".codex" / "session_index.jsonl"):
+                selected_home = home
+                break
     if selected_home is None:
         selected_home = home_candidates[0] if home_candidates else Path.home()
     claude_home = selected_home / ".claude"
-    state = windows_to_local_path(state_dir) if state_dir else selected_home / APP_DIR_NAME
+    if state_dir:
+        state = windows_to_local_path(state_dir)
+    else:
+        preferred_state = selected_home / APP_DIR_NAME
+        legacy_state = selected_home / LEGACY_APP_DIR_NAME
+        state = preferred_state if path_exists(preferred_state) or not path_exists(legacy_state) else legacy_state
     return Paths(
         windows_home=selected_home,
         claude_home=claude_home,
@@ -4389,7 +4400,7 @@ def add_common_options(parser: argparse.ArgumentParser, suppress_default: bool =
     parser.add_argument(
         "--state-dir",
         default=default,
-        help="Cartella stato/coda. Default: <windows-home>/.claude-vscode-queue",
+        help="Cartella stato/coda. Default: <windows-home>/.claude-codex-queue; riusa automaticamente il percorso legacy",
     )
     parser.add_argument("--claude", default=default, help="Percorso esplicito a claude/claude.exe")
     parser.add_argument("--codex", default=default, help="Percorso esplicito al CLI codex")
@@ -4397,7 +4408,7 @@ def add_common_options(parser: argparse.ArgumentParser, suppress_default: bool =
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="claude-vscode-queue",
+        prog="claude-codex-queue",
         description="Coda locale e auto-continua per sessioni Claude Code e task dell'app Codex.",
     )
     add_common_options(parser)

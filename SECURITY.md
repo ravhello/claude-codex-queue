@@ -16,9 +16,10 @@ OAuth tokens, Claude logs containing secrets, or private transcripts.
 
 ## Local Data
 
-The tool stores queue state and run logs under `.claude-vscode-queue` in the
-detected Windows user profile unless `--state-dir` is provided. Do not commit
-that directory.
+The tool stores queue state and run logs under `.claude-codex-queue` in the
+detected Windows user profile unless `--state-dir` is provided. Existing
+installations keep using the legacy `.claude-vscode-queue` path automatically.
+Do not commit either directory.
 
 The app intentionally clears external Anthropic API-key environment variables
 before invoking Claude Code, so queued sends use the authenticated Claude Code

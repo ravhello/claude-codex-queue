@@ -14,12 +14,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
-from . import app
+from . import __version__, app
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-FAVICON_PATH = PROJECT_ROOT / "assets" / "claude-queue.ico"
-FAVICON_PNG_PATH = PROJECT_ROOT / "assets" / "claude-queue-32.png"
+ASSET_DIR = Path(__file__).resolve().parent / "assets"
+FAVICON_PATH = ASSET_DIR / "claude-codex-queue.ico"
+FAVICON_PNG_PATH = ASSET_DIR / "claude-codex-queue-32.png"
+RUNNER_MODULES = ("claude_codex_queue", "claude_vscode_queue")
 
 
 def split_messages(raw: str) -> list[str]:
@@ -108,7 +110,7 @@ class WebState:
             sys.executable,
             "-u",
             "-m",
-            "claude_vscode_queue",
+            "claude_codex_queue",
             "--windows-home",
             str(self.paths.windows_home),
             "--state-dir",
@@ -143,7 +145,8 @@ class WebState:
         except (OSError, ValueError):
             return None, None
         command = self.process_command(pid)
-        if not command or " -m claude_vscode_queue " not in f" {command} " or " run " not in f" {command} ":
+        padded = f" {command or ''} "
+        if not command or not any(f" -m {module} " in padded for module in RUNNER_MODULES) or " run " not in padded:
             return None, None
         return (pid, command) if self.process_running(pid) else (None, None)
 
@@ -159,7 +162,7 @@ class WebState:
             if not command:
                 continue
             padded = f" {command} "
-            if " -m claude_vscode_queue " in padded and " run " in padded and ".web" not in padded:
+            if any(f" -m {module} " in padded for module in RUNNER_MODULES) and " run " in padded and ".web" not in padded:
                 return pid, command
         return None, None
 
@@ -189,6 +192,7 @@ class WebState:
         except OSError:
             pass
         return {
+            "app_version": __version__,
             "running": running,
             "exit_code": exit_code,
             "pid": pid,
@@ -728,9 +732,9 @@ HTML = r"""<!doctype html>
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <link rel="icon" href="/favicon.ico?v=3" sizes="any">
-  <link rel="shortcut icon" href="/favicon.ico?v=3">
-  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=3">
+  <link rel="icon" href="/favicon.ico?v=4" sizes="any">
+  <link rel="shortcut icon" href="/favicon.ico?v=4">
+  <link rel="icon" type="image/png" sizes="32x32" href="/favicon-32.png?v=4">
   <title>Claude + Codex Queue</title>
   <style>
     :root {
@@ -1066,6 +1070,7 @@ HTML = r"""<!doctype html>
       const accounts = data.account_index && Array.isArray(data.account_index.accounts) ? data.account_index.accounts : [];
       $("doctor").innerHTML = [
         `<b>Ora PC</b>: ${escapeHtml(formatDateTime(data.local_time || new Date().toISOString()))}`,
+        `<b>Versione app</b>: ${escapeHtml(data.app_version || "")}`,
         `<b>Claude</b>: ${escapeHtml(data.claude_version || "non trovato")}`,
         `<b>Account Claude</b>: ${escapeHtml(account ? account.label : "non rilevato")}`,
         `<b>Codex</b>: ${escapeHtml(data.codex_version || "non trovato")}`,

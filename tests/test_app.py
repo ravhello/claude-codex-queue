@@ -9,10 +9,26 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
+import claude_codex_queue
 from claude_vscode_queue import app
 
 
 class QueueAppTests(unittest.TestCase):
+    def test_public_version_and_legacy_state_compatibility(self) -> None:
+        self.assertEqual(claude_codex_queue.__version__, "0.2.0")
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            legacy = root / app.LEGACY_APP_DIR_NAME
+            legacy.mkdir()
+
+            legacy_paths = app.resolve_paths(str(root))
+            self.assertEqual(legacy_paths.state_dir, legacy)
+
+            preferred = root / app.APP_DIR_NAME
+            preferred.mkdir()
+            preferred_paths = app.resolve_paths(str(root))
+            self.assertEqual(preferred_paths.state_dir, preferred)
+
     def test_find_codex_executable_prefers_windows_cmd_inside_wsl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
