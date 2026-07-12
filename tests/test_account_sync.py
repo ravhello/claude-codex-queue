@@ -1,0 +1,876 @@
+from __future__ import annotations
+
+import base64
+import json
+import os
+import sqlite3
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from unittest.mock import patch
+
+from claude_vscode_queue import app
+
+
+class AccountSyncTests(unittest.TestCase):
+    @staticmethod
+    def _paths(root: Path) -> app.Paths:
+        state_dir = root / ".state"
+        return app.Paths(
+            windows_home=root,
+            claude_home=root / ".claude",
+            state_dir=state_dir,
+            queue_file=state_dir / "queue.json",
+            log_dir=state_dir / "logs",
+        )
+
+    @staticmethod
+    def _claude_fixture(
+        root: Path,
+        *,
+        active_account: str = "account-a",
+        other_account: str = "account-b",
+        workspace: str = "workspace",
+    ) -> tuple[app.Paths, Path, Path, Path]:
+        paths = AccountSyncTests._paths(root)
+        (paths.claude_home / "projects").mkdir(parents=True)
+        app_root = (
+            root
+            / "AppData"
+            / "Local"
+            / "Packages"
+            / "Claude_test"
+            / "LocalCache"
+            / "Roaming"
+            / "Claude"
+        )
+        app_root.mkdir(parents=True)
+        (app_root / "config.json").write_text(
+            json.dumps({"lastKnownAccountUuid": active_account}),
+            encoding="utf-8",
+        )
+        sessions_root = app_root / "claude-code-sessions"
+        active_dir = sessions_root / active_account / workspace
+        other_dir = sessions_root / other_account / workspace
+        active_dir.mkdir(parents=True)
+        other_dir.mkdir(parents=True)
+        return paths, app_root, active_dir, other_dir
+
+    @staticmethod
+    def _write_claude_session(
+        destination: Path,
+        session_id: str,
+        cwd: Path,
+        *,
+        archived: bool = False,
+        title: str = "Shared test chat",
+    ) -> Path:
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        app.write_desktop_session_json(
+            destination,
+            {
+                "sessionId": destination.stem,
+                "cliSessionId": session_id,
+                "title": title,
+                "cwd": str(cwd),
+                "lastActivityAt": 1_800_000_000_000,
+                "model": "claude-test",
+                "effort": "high",
+                "permissionMode": "default",
+                "isArchived": archived,
+            },
+        )
+        return destination
+
+    @staticmethod
+    def _set_archived(path: Path, archived: bool) -> None:
+        previous_mtime = path.stat().st_mtime_ns
+        data = json.loads(path.read_text(encoding="utf-8"))
+        data["isArchived"] = archived
+        app.write_desktop_session_json(path, data)
+        changed_mtime = max(time.time_ns(), previous_mtime + 10_000_000)
+        os.utime(path, ns=(changed_mtime, changed_mtime))
+
+    @staticmethod
+    def _read(path: Path) -> dict[str, object]:
+        return json.loads(path.read_text(encoding="utf-8"))
+
+    @staticmethod
+    def _write_transcript(paths: app.Paths, session_id: str, cwd: Path) -> Path:
+        project = paths.claude_home / "projects" / "fixture"
+        project.mkdir(parents=True, exist_ok=True)
+        transcript = project / f"{session_id}.jsonl"
+        transcript.write_text(
+            json.dumps(
+                {
+                    "type": "assistant",
+                    "sessionId": session_id,
+                    "timestamp": "2026-07-12T10:00:00Z",
+                    "cwd": str(cwd),
+                    "message": {"role": "assistant", "model": "claude-test", "content": "ok"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return transcript
+
+    @staticmethod
+    def _codex_rollout(codex_home: Path, session_id: str, *, archived: bool = False) -> Path:
+        root = codex_home / ("archived_sessions" if archived else "sessions") / "2026" / "07" / "12"
+        root.mkdir(parents=True, exist_ok=True)
+        rollout = root / f"rollout-2026-07-12T10-00-00-{session_id}.jsonl"
+        rollout.write_text(
+            json.dumps(
+                {
+                    "timestamp": "2026-07-12T10:00:00Z",
+                    "type": "session_meta",
+                    "payload": {"id": session_id},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return rollout
+
+    @staticmethod
+    def _linked_index(source_id: str, destination_id: str) -> dict[str, object]:
+        return {
+            "version": 1,
+            "accounts": {},
+            "sessions": {},
+            "codex_links": {
+                "group-1": {
+                    "provider": app.PROVIDER_CODEX,
+                    "state": app.DESKTOP_STATE_ACTIVE,
+                    "threads": {
+                        source_id: {
+                            "account_key": "codex:source",
+                            "last_state": app.DESKTOP_STATE_ACTIVE,
+                            "missing_scans": 0,
+                        },
+                        destination_id: {
+                            "account_key": "codex:destination",
+                            "last_state": app.DESKTOP_STATE_ACTIVE,
+                            "missing_scans": 0,
+                            "forked_from": source_id,
+                        },
+                    },
+                }
+            },
+        }
+
+    def test_claude_archive_propagates_from_account_a_to_b(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, _, account_a, account_b = self._claude_fixture(root)
+            session_id = "11111111-1111-4111-8111-111111111111"
+            source = self._write_claude_session(account_a / "local_shared.json", session_id, root)
+
+            first = app.sync_claude_desktop_accounts(paths)
+            replica = account_b / "local_shared.json"
+            self.assertEqual(first["created"], 1)
+            self.assertFalse(self._read(replica)["isArchived"])
+
+            self._set_archived(source, True)
+            result = app.sync_claude_desktop_accounts(paths)
+
+            self.assertEqual(result["archived"], 1)
+            self.assertTrue(self._read(source)["isArchived"])
+            self.assertTrue(self._read(replica)["isArchived"])
+
+    def test_claude_archive_propagates_from_account_b_to_a(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, app_root, account_a, account_b = self._claude_fixture(root)
+            session_id = "12111111-1111-4111-8111-121111111111"
+            source = self._write_claude_session(account_a / "local_shared.json", session_id, root)
+            app.sync_claude_desktop_accounts(paths)
+            replica = account_b / "local_shared.json"
+
+            (app_root / "config.json").write_text(
+                json.dumps({"lastKnownAccountUuid": "account-b"}),
+                encoding="utf-8",
+            )
+            self._set_archived(replica, True)
+            result = app.sync_claude_desktop_accounts(paths)
+
+            self.assertEqual(result["archived"], 1)
+            self.assertTrue(self._read(source)["isArchived"])
+            self.assertTrue(self._read(replica)["isArchived"])
+
+    def test_claude_unarchive_propagates_from_account_b_to_a(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, app_root, account_a, account_b = self._claude_fixture(root)
+            session_id = "22222222-2222-4222-8222-222222222222"
+            source = self._write_claude_session(account_a / "local_shared.json", session_id, root)
+            app.sync_claude_desktop_accounts(paths)
+            replica = account_b / "local_shared.json"
+
+            self._set_archived(source, True)
+            app.sync_claude_desktop_accounts(paths)
+            (app_root / "config.json").write_text(
+                json.dumps({"lastKnownAccountUuid": "account-b"}),
+                encoding="utf-8",
+            )
+            self._set_archived(replica, False)
+            result = app.sync_claude_desktop_accounts(paths)
+
+            self.assertEqual(result["unarchived"], 1)
+            self.assertFalse(self._read(source)["isArchived"])
+            self.assertFalse(self._read(replica)["isArchived"])
+
+    def test_claude_delete_requires_two_scans_and_transcript_cannot_resurrect_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, _, account_a, account_b = self._claude_fixture(root)
+            session_id = "33333333-3333-4333-8333-333333333333"
+            source = self._write_claude_session(account_a / "local_shared.json", session_id, root)
+            transcript = self._write_transcript(paths, session_id, root)
+            app.sync_claude_desktop_accounts(paths)
+            replica = account_b / "local_shared.json"
+
+            source.unlink()
+            first_missing = app.sync_claude_desktop_accounts(paths)
+
+            self.assertEqual(first_missing["pending_deletions"], 1)
+            self.assertFalse(source.exists())
+            self.assertTrue(replica.exists())
+
+            confirmed = app.sync_claude_desktop_accounts(paths)
+
+            self.assertEqual(confirmed["deleted"], 1)
+            self.assertEqual(confirmed["removed"], 1)
+            self.assertFalse(source.exists())
+            self.assertFalse(replica.exists())
+            self.assertTrue(transcript.exists())
+
+            after_tombstone = app.sync_claude_desktop_accounts(paths)
+
+            self.assertEqual(after_tombstone["created"], 0)
+            self.assertEqual(after_tombstone["transcripts_created"], 0)
+            self.assertFalse(list(account_a.glob("*.json")))
+            self.assertFalse(list(account_b.glob("*.json")))
+            state = app.load_desktop_sync_state(paths)
+            session_entries = [
+                root_state["sessions"][session_id]
+                for root_state in state["roots"].values()
+                if session_id in root_state.get("sessions", {})
+            ]
+            self.assertEqual(len(session_entries), 1)
+            self.assertEqual(session_entries[0]["state"], app.DESKTOP_STATE_DELETED)
+
+    def test_claude_delete_from_non_active_account_still_propagates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, _, account_a, account_b = self._claude_fixture(root)
+            session_id = "34343434-3333-4333-8333-343434343434"
+            source = self._write_claude_session(account_a / "local_shared.json", session_id, root)
+            app.sync_claude_desktop_accounts(paths)
+            replica = account_b / "local_shared.json"
+
+            replica.unlink()
+            app.sync_claude_desktop_accounts(paths)
+            confirmed = app.sync_claude_desktop_accounts(paths)
+
+            self.assertEqual(confirmed["deleted"], 1)
+            self.assertFalse(source.exists())
+            self.assertFalse(replica.exists())
+
+    def test_claude_move_suppresses_source_replica_instead_of_resurrecting_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, _, account_a, account_b = self._claude_fixture(root)
+            session_id = "44444444-4444-4444-8444-444444444444"
+            source = self._write_claude_session(account_b / "local_source.json", session_id, root)
+            chat = app.discover_claude_windows_app_sessions(paths, sync_accounts=False)[0]
+
+            moved = app.transfer_chat_to_active_desktop_account(paths, chat, move=True)
+            result = app.sync_claude_desktop_accounts(paths)
+
+            self.assertEqual(moved["status"], "moved")
+            self.assertFalse(source.exists())
+            self.assertTrue(Path(moved["destination"]).exists())
+            self.assertEqual(result["created"], 0)
+            self.assertFalse(
+                any(
+                    self._read(candidate).get("cliSessionId") == session_id
+                    for candidate in account_b.glob("*.json")
+                )
+            )
+            self.assertTrue(
+                any(
+                    self._read(candidate).get("cliSessionId") == session_id
+                    for candidate in account_a.glob("*.json")
+                )
+            )
+
+    def test_claude_sync_does_not_create_account_workspace_cross_product(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, app_root, account_a, account_b = self._claude_fixture(root)
+            account_b.rename(account_b.parent / "workspace-b")
+            account_b = account_b.parent / "workspace-b"
+            first_id = "45454545-4444-4444-8444-454545454545"
+            second_id = "46464646-4444-4444-8444-464646464646"
+            self._write_claude_session(account_a / "local_first.json", first_id, root)
+            self._write_claude_session(account_b / "local_second.json", second_id, root)
+
+            app.sync_claude_desktop_accounts(paths)
+
+            sessions_root = app_root / "claude-code-sessions"
+            records = app.desktop_session_records(paths)
+            by_session: dict[str, list[app.DesktopSessionRecord]] = {}
+            for record in records:
+                session_id = app.desktop_record_cli_session_id(record)
+                if session_id:
+                    by_session.setdefault(session_id, []).append(record)
+            self.assertEqual(len(by_session[first_id]), 2)
+            self.assertEqual(len(by_session[second_id]), 2)
+            self.assertEqual({record.account_uuid for record in by_session[first_id]}, {"account-a", "account-b"})
+            self.assertEqual({record.account_uuid for record in by_session[second_id]}, {"account-a", "account-b"})
+            self.assertFalse((sessions_root / "account-a" / "workspace-b").exists())
+            self.assertFalse((sessions_root / "account-b" / "workspace").exists())
+
+    def test_account_identity_is_stable_when_email_claim_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            paths.claude_home.mkdir(parents=True)
+
+            def write_claude(email: str) -> None:
+                (root / ".claude.json").write_text(
+                    json.dumps({"oauthAccount": {"accountUuid": "stable-claude", "emailAddress": email}}),
+                    encoding="utf-8",
+                )
+
+            def write_codex(email: str) -> None:
+                paths.codex_home.mkdir(exist_ok=True)
+                payload = base64.urlsafe_b64encode(
+                    json.dumps({"email": email, "sub": "stable-subject"}).encode()
+                ).rstrip(b"=").decode()
+                (paths.codex_home / "auth.json").write_text(
+                    json.dumps({"tokens": {"account_id": "stable-account", "id_token": f"x.{payload}.x"}}),
+                    encoding="utf-8",
+                )
+
+            write_claude("first@example.com")
+            write_codex("first@example.com")
+            first_claude = app.active_claude_account(paths)
+            first_codex = app.active_codex_account(paths)
+            write_claude("second@example.com")
+            write_codex("second@example.com")
+
+            self.assertEqual(first_claude.key, app.active_claude_account(paths).key)
+            self.assertEqual(first_codex.key, app.active_codex_account(paths).key)
+
+    def test_codex_discovery_uses_store_union_but_drops_ghosts_and_subagents(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            codex_home = paths.codex_home
+            codex_home.mkdir()
+            indexed_id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
+            database_only_id = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb"
+            rollout_only_id = "cccccccc-3333-4333-8333-cccccccccccc"
+            ghost_id = "dddddddd-4444-4444-8444-dddddddddddd"
+            subagent_id = "eeeeeeee-5555-4555-8555-eeeeeeeeeeee"
+            indexed_rollout = self._codex_rollout(codex_home, indexed_id)
+            database_rollout = self._codex_rollout(codex_home, database_only_id)
+            self._codex_rollout(codex_home, rollout_only_id, archived=True)
+            subagent_rollout = self._codex_rollout(codex_home, subagent_id)
+            (codex_home / "session_index.jsonl").write_text(
+                "\n".join(
+                    [
+                        json.dumps(
+                            {
+                                "id": indexed_id,
+                                "thread_name": "Indexed task",
+                                "updated_at": "2026-07-12T10:00:00Z",
+                            }
+                        ),
+                        json.dumps(
+                            {
+                                "id": ghost_id,
+                                "thread_name": "Deleted ghost",
+                                "updated_at": "2026-07-12T10:00:00Z",
+                            }
+                        ),
+                    ]
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            connection = sqlite3.connect(codex_home / "state_5.sqlite")
+            try:
+                connection.execute(
+                    "CREATE TABLE threads ("
+                    "id TEXT, rollout_path TEXT, cwd TEXT, title TEXT, first_user_message TEXT, "
+                    "source TEXT, thread_source TEXT, archived INTEGER)"
+                )
+                connection.executemany(
+                    "INSERT INTO threads VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            indexed_id,
+                            str(indexed_rollout),
+                            str(root),
+                            "Database indexed title",
+                            "indexed prompt",
+                            "cli",
+                            "cli",
+                            0,
+                        ),
+                        (
+                            database_only_id,
+                            str(database_rollout),
+                            str(root),
+                            "Database-only task",
+                            "database prompt",
+                            "cli",
+                            "cli",
+                            0,
+                        ),
+                        (
+                            subagent_id,
+                            str(subagent_rollout),
+                            str(root),
+                            "Internal subagent",
+                            "subagent prompt",
+                            "subagent",
+                            "subagent",
+                            0,
+                        ),
+                    ],
+                )
+                connection.commit()
+            finally:
+                connection.close()
+
+            with patch.object(app, "find_codex_executable", return_value=None):
+                chats = app.discover_codex_app_sessions(paths)
+
+            by_id = {chat.session_id: chat for chat in chats}
+            self.assertEqual(set(by_id), {indexed_id, database_only_id, rollout_only_id})
+            self.assertEqual(by_id[indexed_id].title, "Indexed task")
+            self.assertEqual(by_id[database_only_id].title, "Database-only task")
+            self.assertTrue(by_id[rollout_only_id].archived)
+            self.assertNotIn(ghost_id, by_id)
+            self.assertNotIn(subagent_id, by_id)
+
+    def test_codex_transfer_forks_with_app_server_and_records_link_ledger(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            source_id = "ffffffff-6666-4666-8666-ffffffffffff"
+            destination_id = "abababab-7777-4777-8777-abababababab"
+            source_rollout = root / "source.jsonl"
+            source_rollout.write_text("{}\n", encoding="utf-8")
+            destination_rollout = root / "destination.jsonl"
+            destination_rollout.write_text("{}\n", encoding="utf-8")
+            chat = app.Chat(
+                session_id=source_id,
+                title="Transfer this task",
+                cwd=str(root),
+                permission_mode="workspace-write",
+                model="gpt-test-codex",
+                jsonl_path=source_rollout,
+                last_timestamp="2026-07-12T10:00:00Z",
+                message_count=-1,
+                last_prompt="test transfer",
+                source="Codex App",
+                source_key="codex_app",
+                provider=app.PROVIDER_CODEX,
+                account_key="codex:source",
+                account_label="Source account",
+                account_status="other",
+            )
+            active = app.AccountInfo(
+                key="codex:destination",
+                label="Destination account",
+                account_uuid_hash="destination",
+                organization_uuid_hash=None,
+                email_hash=None,
+                source_changed_at=None,
+            )
+
+            with (
+                patch.object(app, "active_codex_account", side_effect=lambda _: active),
+                patch.object(app, "find_codex_executable", return_value=root / "codex"),
+                patch.object(
+                    app,
+                    "codex_app_server_request",
+                    return_value={"thread": {"id": destination_id}},
+                ) as app_server,
+                patch.object(
+                    app,
+                    "codex_local_thread_states",
+                    return_value={
+                        source_id: app.DESKTOP_STATE_ACTIVE,
+                        destination_id: app.DESKTOP_STATE_ACTIVE,
+                    },
+                ),
+                patch.object(
+                    app,
+                    "codex_thread_rows",
+                    return_value={destination_id: {"rollout_path": str(destination_rollout)}},
+                ),
+            ):
+                result = app.transfer_codex_chat_to_active_account(paths, chat)
+
+            self.assertEqual(result["status"], "forked")
+            self.assertEqual(result["session_id"], destination_id)
+            app_server.assert_called_once_with(
+                root / "codex",
+                "thread/fork",
+                {"threadId": source_id, "excludeTurns": True},
+                codex_home=paths.codex_home,
+            )
+            index = app.load_account_index(paths)
+            self.assertEqual(index["sessions"][f"codex:local:{source_id}"]["account_key"], "codex:source")
+            self.assertEqual(
+                index["sessions"][f"codex:local:{destination_id}"]["account_key"],
+                "codex:destination",
+            )
+            self.assertEqual(index["sessions"][f"codex:local:{destination_id}"]["forked_from"], source_id)
+            self.assertEqual(len(index["codex_links"]), 1)
+            link = next(iter(index["codex_links"].values()))
+            self.assertEqual(link["state"], app.DESKTOP_STATE_ACTIVE)
+            self.assertEqual(set(link["threads"]), {source_id, destination_id})
+            self.assertEqual(link["threads"][destination_id]["forked_from"], source_id)
+
+    def test_codex_transfer_reuses_existing_copy_for_active_account(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            source_id = "fafafafa-6666-4666-8666-fafafafafafa"
+            destination_id = "acacacac-7777-4777-8777-acacacacacac"
+            source_rollout = root / "source.jsonl"
+            source_rollout.write_text("{}\n", encoding="utf-8")
+            chat = app.Chat(
+                session_id=source_id,
+                title="Already transferred task",
+                cwd=str(root),
+                permission_mode="workspace-write",
+                model="gpt-test-codex",
+                jsonl_path=source_rollout,
+                last_timestamp="2026-07-12T10:00:00Z",
+                message_count=-1,
+                last_prompt="test transfer reuse",
+                source="Codex App",
+                source_key="codex_app",
+                provider=app.PROVIDER_CODEX,
+                account_key="codex:source",
+                account_label="Source account",
+                account_status="other",
+            )
+            active = app.AccountInfo(
+                key="codex:destination",
+                label="Destination account",
+                account_uuid_hash="destination",
+                organization_uuid_hash=None,
+                email_hash=None,
+                source_changed_at=None,
+            )
+            app.save_account_index(paths, self._linked_index(source_id, destination_id))
+
+            with (
+                patch.object(app, "active_codex_account", side_effect=lambda _: active),
+                patch.object(app, "find_codex_executable", return_value=root / "codex"),
+                patch.object(
+                    app,
+                    "codex_local_thread_states",
+                    return_value={
+                        source_id: app.DESKTOP_STATE_ACTIVE,
+                        destination_id: app.DESKTOP_STATE_ACTIVE,
+                    },
+                ),
+                patch.object(app, "codex_thread_rows", return_value={}),
+                patch.object(app, "codex_app_server_request") as app_server,
+            ):
+                result = app.transfer_codex_chat_to_active_account(paths, chat)
+
+            self.assertEqual(result["status"], "already_copied")
+            self.assertEqual(result["session_id"], destination_id)
+            app_server.assert_not_called()
+
+    def test_codex_linked_archive_uses_cli_for_the_other_account_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            source_id = "12121212-8888-4888-8888-121212121212"
+            destination_id = "34343434-9999-4999-8999-343434343434"
+            app.save_account_index(paths, self._linked_index(source_id, destination_id))
+            states = {
+                source_id: app.DESKTOP_STATE_ARCHIVED,
+                destination_id: app.DESKTOP_STATE_ACTIVE,
+            }
+            commands: list[list[str]] = []
+
+            def fake_cli(
+                _: Path,
+                arguments: list[str],
+                timeout: int = 15,
+                *,
+                codex_home: Path | None = None,
+            ) -> app.subprocess.CompletedProcess[str]:
+                self.assertEqual(codex_home, paths.codex_home)
+                commands.append(arguments)
+                if arguments[0] == "archive":
+                    states[arguments[-1]] = app.DESKTOP_STATE_ARCHIVED
+                elif arguments[0] == "unarchive":
+                    states[arguments[-1]] = app.DESKTOP_STATE_ACTIVE
+                return app.subprocess.CompletedProcess(arguments, 0, "", "")
+
+            with (
+                patch.object(app, "find_codex_executable", return_value=root / "codex"),
+                patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
+                patch.object(app, "run_codex_cli_command", side_effect=fake_cli),
+            ):
+                result = app.sync_codex_linked_threads(paths)
+
+            self.assertEqual(result["updated"], 1)
+            self.assertFalse(result["errors"])
+            self.assertEqual(commands, [["archive", destination_id]])
+            group = app.load_account_index(paths)["codex_links"]["group-1"]
+            self.assertEqual(group["state"], app.DESKTOP_STATE_ARCHIVED)
+            self.assertEqual(group["threads"][source_id]["last_state"], app.DESKTOP_STATE_ARCHIVED)
+            self.assertEqual(group["threads"][destination_id]["last_state"], app.DESKTOP_STATE_ARCHIVED)
+
+    def test_codex_linked_lifecycle_waits_until_destination_account_is_active(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            source_id = "45454545-aaaa-4aaa-8aaa-454545454545"
+            destination_id = "67676767-bbbb-4bbb-8bbb-676767676767"
+            app.save_account_index(paths, self._linked_index(source_id, destination_id))
+            states = {
+                source_id: app.DESKTOP_STATE_ARCHIVED,
+                destination_id: app.DESKTOP_STATE_ACTIVE,
+            }
+            commands: list[list[str]] = []
+            active = app.AccountInfo("codex:source", "source", None, None, None, None)
+
+            def fake_cli(_: Path, arguments: list[str], timeout: int = 15, **__: object) -> app.subprocess.CompletedProcess[str]:
+                commands.append(arguments)
+                states[arguments[-1]] = app.DESKTOP_STATE_ARCHIVED
+                return app.subprocess.CompletedProcess(arguments, 0, "", "")
+
+            with (
+                patch.object(app, "find_codex_executable", return_value=root / "codex"),
+                patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
+                patch.object(app, "run_codex_cli_command", side_effect=fake_cli),
+                patch.object(app, "active_codex_account", side_effect=lambda _: active),
+            ):
+                waiting = app.sync_codex_linked_threads(paths)
+                commands_after_waiting = list(commands)
+                active = app.dataclasses.replace(active, key="codex:destination", label="destination")
+                applied = app.sync_codex_linked_threads(paths)
+
+            self.assertGreaterEqual(waiting["pending"], 1)
+            self.assertFalse(commands_after_waiting)
+            self.assertEqual(applied["updated"], 1)
+            self.assertEqual(commands, [["archive", destination_id]])
+
+    def test_codex_linked_archive_propagates_from_destination_to_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            source_id = "14141414-8888-4888-8888-141414141414"
+            destination_id = "36363636-9999-4999-8999-363636363636"
+            app.save_account_index(paths, self._linked_index(source_id, destination_id))
+            states = {
+                source_id: app.DESKTOP_STATE_ACTIVE,
+                destination_id: app.DESKTOP_STATE_ARCHIVED,
+            }
+            commands: list[list[str]] = []
+
+            def fake_cli(
+                _: Path,
+                arguments: list[str],
+                timeout: int = 15,
+                *,
+                codex_home: Path | None = None,
+            ) -> app.subprocess.CompletedProcess[str]:
+                self.assertEqual(codex_home, paths.codex_home)
+                commands.append(arguments)
+                states[arguments[-1]] = app.DESKTOP_STATE_ARCHIVED
+                return app.subprocess.CompletedProcess(arguments, 0, "", "")
+
+            with (
+                patch.object(app, "find_codex_executable", return_value=root / "codex"),
+                patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
+                patch.object(app, "run_codex_cli_command", side_effect=fake_cli),
+            ):
+                result = app.sync_codex_linked_threads(paths)
+
+            self.assertEqual(result["updated"], 1)
+            self.assertFalse(result["errors"])
+            self.assertEqual(commands, [["archive", source_id]])
+            group = app.load_account_index(paths)["codex_links"]["group-1"]
+            self.assertEqual(group["state"], app.DESKTOP_STATE_ARCHIVED)
+            self.assertEqual(group["threads"][source_id]["last_state"], app.DESKTOP_STATE_ARCHIVED)
+            self.assertEqual(group["threads"][destination_id]["last_state"], app.DESKTOP_STATE_ARCHIVED)
+
+    def test_codex_linked_unarchive_propagates_to_the_other_account_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            source_id = "16161616-8888-4888-8888-161616161616"
+            destination_id = "38383838-9999-4999-8999-383838383838"
+            index = self._linked_index(source_id, destination_id)
+            group = index["codex_links"]["group-1"]
+            group["state"] = app.DESKTOP_STATE_ARCHIVED
+            group["threads"][source_id]["last_state"] = app.DESKTOP_STATE_ARCHIVED
+            group["threads"][destination_id]["last_state"] = app.DESKTOP_STATE_ARCHIVED
+            app.save_account_index(paths, index)
+            states = {
+                source_id: app.DESKTOP_STATE_ARCHIVED,
+                destination_id: app.DESKTOP_STATE_ACTIVE,
+            }
+            commands: list[list[str]] = []
+
+            def fake_cli(
+                _: Path,
+                arguments: list[str],
+                timeout: int = 15,
+                *,
+                codex_home: Path | None = None,
+            ) -> app.subprocess.CompletedProcess[str]:
+                self.assertEqual(codex_home, paths.codex_home)
+                commands.append(arguments)
+                states[arguments[-1]] = app.DESKTOP_STATE_ACTIVE
+                return app.subprocess.CompletedProcess(arguments, 0, "", "")
+
+            with (
+                patch.object(app, "find_codex_executable", return_value=root / "codex"),
+                patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
+                patch.object(app, "run_codex_cli_command", side_effect=fake_cli),
+            ):
+                result = app.sync_codex_linked_threads(paths)
+
+            self.assertEqual(result["updated"], 1)
+            self.assertFalse(result["errors"])
+            self.assertEqual(commands, [["unarchive", source_id]])
+            group = app.load_account_index(paths)["codex_links"]["group-1"]
+            self.assertEqual(group["state"], app.DESKTOP_STATE_ACTIVE)
+            self.assertEqual(group["threads"][source_id]["last_state"], app.DESKTOP_STATE_ACTIVE)
+            self.assertEqual(group["threads"][destination_id]["last_state"], app.DESKTOP_STATE_ACTIVE)
+
+    def test_codex_linked_delete_waits_two_scans_then_uses_cli_for_remaining_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            source_id = "56565656-aaaa-4aaa-8aaa-565656565656"
+            destination_id = "78787878-bbbb-4bbb-8bbb-787878787878"
+            app.save_account_index(paths, self._linked_index(source_id, destination_id))
+            states = {destination_id: app.DESKTOP_STATE_ACTIVE}
+            commands: list[list[str]] = []
+
+            def fake_cli(
+                _: Path,
+                arguments: list[str],
+                timeout: int = 15,
+                *,
+                codex_home: Path | None = None,
+            ) -> app.subprocess.CompletedProcess[str]:
+                self.assertEqual(codex_home, paths.codex_home)
+                commands.append(arguments)
+                if arguments[0] == "delete":
+                    states.pop(arguments[-1], None)
+                return app.subprocess.CompletedProcess(arguments, 0, "", "")
+
+            with (
+                patch.object(app, "find_codex_executable", return_value=root / "codex"),
+                patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
+                patch.object(app, "run_codex_cli_command", side_effect=fake_cli),
+            ):
+                first = app.sync_codex_linked_threads(paths)
+                commands_after_first = list(commands)
+                second = app.sync_codex_linked_threads(paths)
+                settled = app.sync_codex_linked_threads(paths)
+
+            self.assertEqual(first["pending"], 1)
+            self.assertEqual(first["deleted"], 0)
+            self.assertFalse(commands_after_first)
+            self.assertEqual(second["deleted"], 1)
+            self.assertFalse(second["errors"])
+            self.assertEqual(commands, [["delete", "--force", destination_id]])
+            self.assertNotIn(destination_id, states)
+            group = app.load_account_index(paths)["codex_links"]["group-1"]
+            self.assertEqual(group["state"], app.DESKTOP_STATE_DELETED)
+            self.assertEqual(group["threads"][source_id]["last_state"], app.DESKTOP_STATE_DELETED)
+            self.assertEqual(group["threads"][destination_id]["last_state"], app.DESKTOP_STATE_DELETED)
+            self.assertFalse(settled["errors"])
+            self.assertEqual(settled["deleted"], 0)
+
+    def test_codex_linked_delete_from_destination_removes_source_after_two_scans(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            source_id = "58585858-aaaa-4aaa-8aaa-585858585858"
+            destination_id = "80808080-bbbb-4bbb-8bbb-808080808080"
+            app.save_account_index(paths, self._linked_index(source_id, destination_id))
+            states = {source_id: app.DESKTOP_STATE_ACTIVE}
+            commands: list[list[str]] = []
+
+            def fake_cli(
+                _: Path,
+                arguments: list[str],
+                timeout: int = 15,
+                *,
+                codex_home: Path | None = None,
+            ) -> app.subprocess.CompletedProcess[str]:
+                self.assertEqual(codex_home, paths.codex_home)
+                commands.append(arguments)
+                states.pop(arguments[-1], None)
+                return app.subprocess.CompletedProcess(arguments, 0, "", "")
+
+            with (
+                patch.object(app, "find_codex_executable", return_value=root / "codex"),
+                patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
+                patch.object(app, "run_codex_cli_command", side_effect=fake_cli),
+            ):
+                first = app.sync_codex_linked_threads(paths)
+                second = app.sync_codex_linked_threads(paths)
+                settled = app.sync_codex_linked_threads(paths)
+
+            self.assertEqual(first["pending"], 1)
+            self.assertEqual(second["deleted"], 1)
+            self.assertEqual(commands, [["delete", "--force", source_id]])
+            self.assertFalse(states)
+            self.assertFalse(second["errors"])
+            self.assertFalse(settled["errors"])
+            group = app.load_account_index(paths)["codex_links"]["group-1"]
+            self.assertEqual(group["state"], app.DESKTOP_STATE_DELETED)
+            self.assertEqual(group["threads"][source_id]["last_state"], app.DESKTOP_STATE_DELETED)
+            self.assertEqual(group["threads"][destination_id]["last_state"], app.DESKTOP_STATE_DELETED)
+
+    def test_codex_empty_store_pauses_instead_of_deleting_linked_copies(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            source_id = "89898989-cccc-4ccc-8ccc-898989898989"
+            destination_id = "90909090-dddd-4ddd-8ddd-909090909090"
+            app.save_account_index(paths, self._linked_index(source_id, destination_id))
+
+            with (
+                patch.object(app, "codex_local_thread_states", return_value={}),
+                patch.object(app, "run_codex_cli_command") as cli,
+            ):
+                first = app.sync_codex_linked_threads(paths)
+                second = app.sync_codex_linked_threads(paths)
+
+            self.assertTrue(first["errors"])
+            self.assertTrue(second["errors"])
+            cli.assert_not_called()
+            group = app.load_account_index(paths)["codex_links"]["group-1"]
+            self.assertEqual(group["state"], app.DESKTOP_STATE_ACTIVE)
+            self.assertEqual(group["threads"][source_id]["missing_scans"], 0)
+            self.assertEqual(group["threads"][destination_id]["missing_scans"], 0)
+
+
+if __name__ == "__main__":
+    unittest.main()

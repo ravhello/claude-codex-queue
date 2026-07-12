@@ -40,3 +40,15 @@ The same rule applies to Codex: external OpenAI API keys, base URLs and account
 overrides are removed from the child process so the official CLI uses its local
 ChatGPT authentication. Authentication files are only used to derive a hashed,
 masked account identity and are never copied into queue state or logs.
+
+`desktop-sync-state.json` contains replica paths, lifecycle state and durable
+deletion tombstones, but no transcript contents or credentials. Claude metadata
+changed by replication is copied to `account-transfer-backups/` before it is
+overwritten or removed. Treat those backups as private because titles and local
+working-directory paths may be present.
+
+Copying a Codex task to another account copies the task context into a new local
+thread ID. The web UI requires an explicit confirmation. Archive, unarchive and
+delete propagation is performed only for copies linked by this action and only
+through official Codex commands. Deletion is destructive; use disposable tasks
+when testing it.

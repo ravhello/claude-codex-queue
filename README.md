@@ -51,11 +51,31 @@ Additional capabilities:
 - newest-real-message sorting across Claude and Codex;
 - persistent FIFO queue with per-prompt priorities;
 - one-minute safety delay after a parsed reset time;
-- multi-account Claude metadata synchronization and chat transfer;
+- multi-account Claude Code synchronization with archive, unarchive and delete propagation;
+- Codex task forks for the active ChatGPT-authenticated account, with linked lifecycle sync;
 - account mismatch and view-only checks before actions are enabled;
 - transcript confirmation after every Codex send;
 - local web UI plus a scriptable CLI;
 - no runtime Python dependencies outside the standard library.
+
+### Multi-account chat copies
+
+Claude Desktop Code sessions are replicated once per known account. Archive and
+unarchive changes propagate in either direction. A missing known replica is
+observed twice before it is treated as a deletion; the app then writes a durable
+tombstone, backs up the remaining metadata and removes the other replicas. A
+surviving Claude transcript cannot recreate a tombstoned chat.
+
+For Codex, **Copy to active ChatGPT account** uses Codex app-server
+`thread/fork` and creates a new thread ID instead of relabelling the old task.
+Only copies linked by this app share archive, unarchive and delete state. Those
+operations use the official `codex archive`, `codex unarchive` and
+`codex delete --force` commands; the project never edits Codex SQLite or rollout
+files directly.
+
+Here, “ChatGPT account” means the account authenticating Codex. This feature
+does not copy ordinary conversations from chatgpt.com, and the Claude feature
+does not copy ordinary claude.ai chats.
 
 ## Quick start
 
@@ -118,6 +138,8 @@ nothing while no active limit is detected.
 - External Anthropic and OpenAI API-key/base-URL overrides are removed from
   child processes, so local CLI authentication remains authoritative.
 - Codex dangerous bypass mode is never enabled implicitly.
+- Codex account copies receive a new thread ID and require an explicit confirmation.
+- Destructive lifecycle changes are debounced and verified before linked copies are changed.
 - Controls are disabled for sessions that are genuinely view-only.
 - Queue state and logs stay local under the detected Windows profile.
 

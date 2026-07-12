@@ -8,12 +8,14 @@ import functools
 import hashlib
 import json
 import os
+import queue as queue_module
 import re
 import shutil
 import sqlite3
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -25,6 +27,7 @@ APP_DIR_NAME = ".claude-codex-queue"
 LEGACY_APP_DIR_NAME = ".claude-vscode-queue"
 QUEUE_FILE_NAME = "queue.json"
 ACCOUNT_INDEX_FILE_NAME = "accounts.json"
+DESKTOP_SYNC_STATE_FILE_NAME = "desktop-sync-state.json"
 LOG_DIR_NAME = "logs"
 QUEUE_VERSION = 1
 
@@ -82,6 +85,13 @@ VALID_PERMISSION_MODES = {
     "dontAsk",
     "plan",
 }
+
+DESKTOP_STATE_ACTIVE = "active"
+DESKTOP_STATE_ARCHIVED = "archived"
+DESKTOP_STATE_DELETED = "deleted"
+DESKTOP_SYNC_STATE_VERSION = 1
+_DESKTOP_SYNC_LOCK = threading.RLock()
+_ACCOUNT_INDEX_LOCK = threading.RLock()
 
 RATE_LIMIT_PATTERNS = [
     r"\brate[- ]?limit(?:ed)?\b",
@@ -474,6 +484,13 @@ def codex_executable_is_windows(codex_exe: Path) -> bool:
     return codex_exe.suffix.lower() in {".cmd", ".bat", ".exe"} or is_windows_path(str(codex_exe))
 
 
+def codex_cli_command(codex_exe: Path, arguments: list[str]) -> list[str]:
+    if codex_executable_is_windows(codex_exe):
+        executable = local_to_windows_path(codex_exe)
+        return ["cmd.exe", "/d", "/c", "call", executable, *arguments]
+    return [str(codex_exe), *arguments]
+
+
 def run_codex_cli_command(
     codex_exe: Path,
     arguments: list[str],
@@ -481,20 +498,17 @@ def run_codex_cli_command(
     *,
     codex_home: Path | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    runs_on_windows = codex_executable_is_windows(codex_exe)
-    if runs_on_windows:
-        executable = local_to_windows_path(codex_exe)
-        command = ["cmd.exe", "/d", "/c", "call", executable, *arguments]
-    else:
-        command = [str(codex_exe), *arguments]
     return subprocess.run(
-        command,
+        codex_cli_command(codex_exe, arguments),
         text=True,
         encoding="utf-8",
         errors="replace",
         capture_output=True,
         timeout=timeout,
-        env=codex_subprocess_env(codex_home, windows=runs_on_windows),
+        env=codex_subprocess_env(
+            codex_home,
+            windows=codex_executable_is_windows(codex_exe),
+        ),
     )
 
 
@@ -573,8 +587,10 @@ def active_claude_account(paths: Paths) -> AccountInfo | None:
     if not any([account_uuid, email, organization_uuid, refresh_token, access_token]):
         return None
 
-    if account_uuid or email:
-        key_source = "|".join([account_uuid or "", email.lower() if email else "", organization_uuid or ""])
+    if account_uuid:
+        key_source = account_uuid
+    elif email:
+        key_source = "|".join([email.lower(), organization_uuid or ""])
     else:
         key_source = "|".join([organization_uuid or "", short_hash(refresh_token, 24) or short_hash(access_token, 24) or ""])
     key = hash_text(key_source) or "unknown"
@@ -613,7 +629,8 @@ def active_codex_account(paths: Paths) -> AccountInfo | None:
     if not any([account_id, email, subject]):
         return None
 
-    identity = "|".join([account_id or "", email.lower() if email else "", subject or ""])
+    # account_id is stable across token refreshes; email is display metadata, not identity.
+    identity = account_id or subject or (email.lower() if email else "")
     hashed = hash_text(identity) or "unknown"
     key = f"codex:{hashed}"
     label = mask_email(email) or f"Codex {hashed[:8]}"
@@ -642,17 +659,48 @@ def load_account_index(paths: Paths) -> dict[str, Any]:
 
 
 def save_account_index(paths: Paths, index: dict[str, Any]) -> None:
-    path = account_index_path(paths)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(index, indent=2, ensure_ascii=False), encoding="utf-8")
+    with _ACCOUNT_INDEX_LOCK:
+        path = account_index_path(paths)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(index, indent=2, ensure_ascii=False) + "\n"
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            handle.write(payload)
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
 
 
-def register_active_account(paths: Paths, index: dict[str, Any] | None = None) -> AccountInfo | None:
+def migrate_account_key(index: dict[str, Any], account: AccountInfo, provider: str) -> None:
+    if not account.account_uuid_hash:
+        return
+    accounts = index.setdefault("accounts", {})
+    for old_key, old_data in list(accounts.items()):
+        if old_key == account.key or not isinstance(old_data, dict):
+            continue
+        old_provider = old_data.get("provider") or PROVIDER_CLAUDE
+        if old_provider != provider or old_data.get("account_uuid_hash") != account.account_uuid_hash:
+            continue
+        current = accounts.get(account.key) if isinstance(accounts.get(account.key), dict) else {}
+        accounts[account.key] = {**old_data, **current, "key": account.key}
+        del accounts[old_key]
+        sessions = index.get("sessions") if isinstance(index.get("sessions"), dict) else {}
+        for session in sessions.values():
+            if isinstance(session, dict) and session.get("account_key") == old_key:
+                session["account_key"] = account.key
+        links = index.get("codex_links") if isinstance(index.get("codex_links"), dict) else {}
+        for group in links.values():
+            threads = group.get("threads") if isinstance(group, dict) and isinstance(group.get("threads"), dict) else {}
+            for thread in threads.values():
+                if isinstance(thread, dict) and thread.get("account_key") == old_key:
+                    thread["account_key"] = account.key
+
+
+def _register_active_account_unlocked(paths: Paths, index: dict[str, Any] | None = None) -> AccountInfo | None:
     account = active_claude_account(paths)
     if account is None:
         return None
     index = index if index is not None else load_account_index(paths)
     accounts = index.setdefault("accounts", {})
+    migrate_account_key(index, account, PROVIDER_CLAUDE)
     now = now_utc()
     existing = accounts.get(account.key) if isinstance(accounts.get(account.key), dict) else {}
     accounts[account.key] = {
@@ -670,12 +718,18 @@ def register_active_account(paths: Paths, index: dict[str, Any] | None = None) -
     return account
 
 
-def register_active_codex_account(paths: Paths, index: dict[str, Any] | None = None) -> AccountInfo | None:
+def register_active_account(paths: Paths, index: dict[str, Any] | None = None) -> AccountInfo | None:
+    with _ACCOUNT_INDEX_LOCK:
+        return _register_active_account_unlocked(paths, index)
+
+
+def _register_active_codex_account_unlocked(paths: Paths, index: dict[str, Any] | None = None) -> AccountInfo | None:
     account = active_codex_account(paths)
     if account is None:
         return None
     index = index if index is not None else load_account_index(paths)
     accounts = index.setdefault("accounts", {})
+    migrate_account_key(index, account, PROVIDER_CODEX)
     now = now_utc()
     existing = accounts.get(account.key) if isinstance(accounts.get(account.key), dict) else {}
     accounts[account.key] = {
@@ -691,6 +745,11 @@ def register_active_codex_account(paths: Paths, index: dict[str, Any] | None = N
     }
     save_account_index(paths, index)
     return account
+
+
+def register_active_codex_account(paths: Paths, index: dict[str, Any] | None = None) -> AccountInfo | None:
+    with _ACCOUNT_INDEX_LOCK:
+        return _register_active_codex_account_unlocked(paths, index)
 
 
 def chat_account_session_key(chat: Chat) -> str:
@@ -879,11 +938,20 @@ def codex_thread_rows(codex_home: Path) -> dict[str, dict[str, Any]]:
         "id",
         "rollout_path",
         "cwd",
+        "title",
+        "first_user_message",
+        "source",
+        "thread_source",
         "model",
         "reasoning_effort",
         "sandbox_policy",
         "approval_mode",
         "archived",
+        "archived_at",
+        "created_at",
+        "updated_at",
+        "recency_at",
+        "created_at_ms",
         "updated_at_ms",
         "recency_at_ms",
     ]
@@ -995,23 +1063,323 @@ def codex_timestamp(index_entry: dict[str, Any], row: dict[str, Any]) -> str | N
         if timestamp:
             values.append(timestamp)
             break
+    for key in ["recency_at", "updated_at", "created_at"]:
+        value = row.get(key)
+        if not isinstance(value, (int, float)):
+            continue
+        try:
+            values.append(dt.datetime.fromtimestamp(value, tz=UTC))
+        except (OSError, OverflowError, ValueError):
+            pass
+        break
     if not values:
         return None
     return max(values).astimezone().replace(microsecond=0).isoformat()
 
 
-def discover_codex_app_sessions(paths: Paths) -> list[Chat]:
-    index = load_codex_session_index(paths.codex_home)
-    if not index:
-        return []
+def codex_app_server_request(
+    codex_exe: Path,
+    method: str,
+    params: dict[str, Any],
+    timeout: int = 45,
+    *,
+    codex_home: Path | None = None,
+) -> dict[str, Any]:
+    command = codex_cli_command(codex_exe, ["app-server", "--listen", "stdio://"])
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+        bufsize=1,
+        env=codex_subprocess_env(
+            codex_home,
+            windows=codex_executable_is_windows(codex_exe),
+        ),
+    )
+    responses: queue_module.Queue[dict[str, Any]] = queue_module.Queue()
+    stderr_lines: list[str] = []
+
+    def read_stdout() -> None:
+        assert process.stdout is not None
+        for line in process.stdout:
+            value = safe_json_loads(line)
+            if value:
+                responses.put(value)
+
+    def read_stderr() -> None:
+        assert process.stderr is not None
+        for line in process.stderr:
+            stderr_lines.append(line.rstrip())
+            if len(stderr_lines) > 50:
+                del stderr_lines[:-50]
+
+    threading.Thread(target=read_stdout, daemon=True).start()
+    threading.Thread(target=read_stderr, daemon=True).start()
+
+    def send(message: dict[str, Any]) -> None:
+        if process.stdin is None:
+            raise ValueError("stdin di Codex app-server non disponibile.")
+        process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+
+    def wait_for(request_id: int, deadline: float) -> dict[str, Any]:
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                detail = truncate(" ".join(stderr_lines), 500) or "timeout"
+                raise ValueError(f"Codex app-server non ha risposto a {method}: {detail}")
+            try:
+                value = responses.get(timeout=remaining)
+            except queue_module.Empty as exc:
+                detail = truncate(" ".join(stderr_lines), 500) or "timeout"
+                raise ValueError(f"Codex app-server non ha risposto a {method}: {detail}") from exc
+            if value.get("id") == request_id:
+                return value
+
+    deadline = time.monotonic() + timeout
+    try:
+        send({
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "clientInfo": {"name": "claude-codex-queue", "version": "1"},
+                "capabilities": {"experimentalApi": True},
+            },
+        })
+        initialize = wait_for(1, deadline)
+        if isinstance(initialize.get("error"), dict):
+            raise ValueError(f"Inizializzazione Codex app-server fallita: {initialize['error']}")
+        send({"method": "initialized"})
+        send({"id": 2, "method": method, "params": params})
+        response = wait_for(2, deadline)
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        try:
+            process.wait(timeout=3)
+        except subprocess.TimeoutExpired:
+            process.terminate()
+            try:
+                process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait(timeout=3)
+
+    error = response.get("error")
+    if isinstance(error, dict):
+        message = error.get("message") if isinstance(error.get("message"), str) else json.dumps(error)
+        raise ValueError(f"Codex {method} non riuscito: {message}")
+    value = response.get("result")
+    if not isinstance(value, dict):
+        raise ValueError(f"Risposta Codex {method} non valida.")
+    return value
+
+
+def codex_local_thread_states(paths: Paths) -> dict[str, str]:
     rows = codex_thread_rows(paths.codex_home)
     active_files, archived_files = codex_rollout_files(paths.codex_home)
+    states: dict[str, str] = {}
+    for session_id in set(rows) | set(active_files) | set(archived_files):
+        row = rows.get(session_id, {})
+        archived = bool(row.get("archived"))
+        if session_id.lower() in archived_files and session_id.lower() not in active_files:
+            archived = True
+        states[session_id] = DESKTOP_STATE_ARCHIVED if archived else DESKTOP_STATE_ACTIVE
+    return states
+
+
+def run_codex_lifecycle(
+    paths: Paths,
+    codex_exe: Path,
+    action: str,
+    session_id: str,
+) -> None:
+    if action not in {DESKTOP_STATE_ACTIVE, DESKTOP_STATE_ARCHIVED, DESKTOP_STATE_DELETED}:
+        raise ValueError(f"Stato Codex non supportato: {action}")
+    arguments = {
+        DESKTOP_STATE_ACTIVE: ["unarchive", session_id],
+        DESKTOP_STATE_ARCHIVED: ["archive", session_id],
+        DESKTOP_STATE_DELETED: ["delete", "--force", session_id],
+    }[action]
+    result = run_codex_cli_command(
+        codex_exe,
+        arguments,
+        timeout=30,
+        codex_home=paths.codex_home,
+    )
+    if result.returncode != 0:
+        detail = truncate(result.stderr or result.stdout, 500) or f"exit {result.returncode}"
+        raise ValueError(f"Codex {arguments[0]} non riuscito per {session_id[:8]}: {detail}")
+    states = codex_local_thread_states(paths)
+    observed = states.get(session_id)
+    expected = None if action == DESKTOP_STATE_DELETED else action
+    if observed != expected:
+        raise ValueError(
+            f"Codex {arguments[0]} non verificato per {session_id[:8]}: stato osservato {observed or 'assente'}."
+        )
+
+
+def sync_codex_linked_threads(paths: Paths) -> dict[str, Any]:
+    result: dict[str, Any] = {"groups": 0, "updated": 0, "deleted": 0, "pending": 0, "errors": []}
+    with _ACCOUNT_INDEX_LOCK:
+        index = load_account_index(paths)
+        links = index.get("codex_links") if isinstance(index.get("codex_links"), dict) else {}
+        if not links:
+            return result
+        states = codex_local_thread_states(paths)
+        tracked_live_threads = any(
+            isinstance(thread, dict) and thread.get("last_state") != DESKTOP_STATE_DELETED
+            for group in links.values()
+            if isinstance(group, dict)
+            for thread in (
+                group["threads"].values()
+                if isinstance(group.get("threads"), dict)
+                else []
+            )
+        )
+        if tracked_live_threads and not states:
+            result["errors"].append("Store Codex temporaneamente vuoto o non leggibile: sincronizzazione sospesa.")
+            return result
+        codex_exe = find_codex_executable(paths)
+        active_account = active_codex_account(paths)
+        changed = False
+
+        for group_id, group in links.items():
+            if not isinstance(group, dict):
+                continue
+            threads = group.get("threads") if isinstance(group.get("threads"), dict) else {}
+            if not threads:
+                continue
+            result["groups"] += 1
+            events: list[tuple[int, str]] = []
+            for session_id, record in threads.items():
+                if not isinstance(record, dict):
+                    continue
+                current = states.get(session_id)
+                previous = record.get("last_state")
+                if current is not None:
+                    if previous in {DESKTOP_STATE_ACTIVE, DESKTOP_STATE_ARCHIVED} and current != previous:
+                        priority = 2 if current == DESKTOP_STATE_ARCHIVED else 1
+                        events.append((priority, current))
+                    if record.get("missing_scans"):
+                        record["missing_scans"] = 0
+                        changed = True
+                    continue
+                if previous == DESKTOP_STATE_DELETED:
+                    continue
+                missing_scans = int(record.get("missing_scans") or 0) + 1
+                record["missing_scans"] = missing_scans
+                changed = True
+                if missing_scans >= 2:
+                    events.append((3, DESKTOP_STATE_DELETED))
+                else:
+                    result["pending"] += 1
+
+            canonical = group.get("state")
+            if canonical not in {DESKTOP_STATE_ACTIVE, DESKTOP_STATE_ARCHIVED, DESKTOP_STATE_DELETED}:
+                canonical = next((states.get(session_id) for session_id in threads if states.get(session_id)), DESKTOP_STATE_ACTIVE)
+            if events:
+                canonical = max(events, key=lambda event: event[0])[1]
+            if group.get("state") != canonical:
+                group["state"] = canonical
+                group["state_changed_at"] = now_utc()
+                changed = True
+
+            if codex_exe is not None:
+                for session_id, thread_record in threads.items():
+                    current = states.get(session_id)
+                    needs_action = (
+                        canonical == DESKTOP_STATE_DELETED and current is not None
+                    ) or (
+                        canonical in {DESKTOP_STATE_ACTIVE, DESKTOP_STATE_ARCHIVED}
+                        and current is not None
+                        and current != canonical
+                    )
+                    if not needs_action:
+                        continue
+                    linked_account_key = (
+                        thread_record.get("account_key")
+                        if isinstance(thread_record, dict) and isinstance(thread_record.get("account_key"), str)
+                        else None
+                    )
+                    if active_account is not None and linked_account_key and linked_account_key != active_account.key:
+                        thread_record["pending_state"] = canonical
+                        result["pending"] += 1
+                        changed = True
+                        continue
+                    try:
+                        run_codex_lifecycle(paths, codex_exe, canonical, session_id)
+                        if isinstance(thread_record, dict):
+                            thread_record.pop("pending_state", None)
+                        if canonical == DESKTOP_STATE_DELETED:
+                            result["deleted"] += 1
+                            states.pop(session_id, None)
+                        else:
+                            result["updated"] += 1
+                            states[session_id] = canonical
+                    except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                        result["errors"].append(str(exc))
+
+            for session_id, record in threads.items():
+                if not isinstance(record, dict):
+                    continue
+                current = states.get(session_id)
+                if current is not None:
+                    if record.get("last_state") != current:
+                        record["last_state"] = current
+                        changed = True
+                elif canonical == DESKTOP_STATE_DELETED:
+                    # Once deletion is canonical, every absent linked copy is deleted.
+                    # This includes copies removed by the propagation command itself,
+                    # which did not accumulate their own missing-scan counter.
+                    if record.get("last_state") != DESKTOP_STATE_DELETED or record.get("missing_scans"):
+                        record["last_state"] = DESKTOP_STATE_DELETED
+                        record["missing_scans"] = 0
+                        changed = True
+            group["last_error"] = result["errors"][-1] if result["errors"] else None
+            links[group_id] = group
+
+        if changed:
+            index["codex_links"] = links
+            save_account_index(paths, index)
+    return result
+
+
+def discover_codex_app_sessions(paths: Paths) -> list[Chat]:
+    try:
+        sync_codex_linked_threads(paths)
+    except (OSError, subprocess.SubprocessError, ValueError):
+        pass
+    index = load_codex_session_index(paths.codex_home)
+    rows = codex_thread_rows(paths.codex_home)
+    active_files, archived_files = codex_rollout_files(paths.codex_home)
+    session_ids = set(index) | set(rows) | set(active_files) | set(archived_files)
+    if not session_ids:
+        return []
     codex_exe = find_codex_executable(paths)
     authenticated = active_codex_account(paths) is not None
     chats: list[Chat] = []
 
-    for session_id, index_entry in index.items():
+    for session_id in session_ids:
+        index_entry = index.get(session_id, {})
         row = rows.get(session_id, {})
+        if not row and session_id.lower() not in active_files and session_id.lower() not in archived_files:
+            # session_index.jsonl is append-only: an index-only entry is a deleted local ghost.
+            continue
+        thread_source = row.get("thread_source")
+        raw_source = row.get("source")
+        source_text = " ".join(
+            value for value in [thread_source, raw_source] if isinstance(value, str)
+        ).casefold()
+        if session_id not in index and "subagent" in source_text:
+            continue
         raw_rollout = row.get("rollout_path") if isinstance(row.get("rollout_path"), str) else None
         rollout = windows_to_local_path(raw_rollout) if raw_rollout else None
         archived = bool(row.get("archived"))
@@ -1024,6 +1392,8 @@ def discover_codex_app_sessions(paths: Paths) -> list[Chat]:
         raw_cwd = row.get("cwd") if isinstance(row.get("cwd"), str) else None
         cwd = normalize_windows_path(raw_cwd) if raw_cwd else None
         title = index_entry.get("thread_name") if isinstance(index_entry.get("thread_name"), str) else None
+        if not title and isinstance(row.get("title"), str):
+            title = row["title"]
         first_prompt = row.get("first_user_message") if isinstance(row.get("first_user_message"), str) else None
         display_title = truncate(title, 100) or truncate(first_prompt, 100) or "Codex task"
         sandbox_mode = codex_sandbox_mode(row.get("sandbox_policy"))
@@ -1224,11 +1594,16 @@ def write_desktop_session_json(path: Path, data: dict[str, Any]) -> None:
     temp_path.replace(path)
 
 
-def desktop_session_data_for_path(source_data: dict[str, Any], cli_session_id: str, destination: Path) -> dict[str, Any]:
+def desktop_session_data_for_path(
+    source_data: dict[str, Any],
+    cli_session_id: str,
+    destination: Path,
+    archived: bool | None = None,
+) -> dict[str, Any]:
     data = dict(source_data)
     data["cliSessionId"] = cli_session_id
     data["sessionId"] = destination.stem
-    data["isArchived"] = False
+    data["isArchived"] = bool(source_data.get("isArchived")) if archived is None else archived
     return sanitize_desktop_session_data(data)
 
 
@@ -1252,15 +1627,161 @@ def desktop_account_session_dir(
 def desktop_account_workspace_uuids(
     sessions_root: Path,
     account_uuid: str,
-    all_workspace_uuids: set[str],
+    preferred_workspace_uuid: str | None = None,
 ) -> list[str]:
     account_dir = sessions_root / account_uuid
-    workspace_uuids = set(all_workspace_uuids)
+    if preferred_workspace_uuid and (account_dir / preferred_workspace_uuid).is_dir():
+        return [preferred_workspace_uuid]
     if account_dir.exists():
-        workspace_uuids.update(path.name for path in account_dir.iterdir() if path.is_dir())
-    if not workspace_uuids:
-        workspace_uuids.add(str(uuid.uuid4()))
-    return sorted(workspace_uuids)
+        workspaces = [path for path in account_dir.iterdir() if path.is_dir()]
+        if workspaces:
+            workspaces.sort(key=lambda path: path.stat().st_mtime_ns, reverse=True)
+            return [workspaces[0].name]
+    return [preferred_workspace_uuid or str(uuid.uuid4())]
+
+
+def desktop_sync_state_path(paths: Paths) -> Path:
+    return paths.state_dir / DESKTOP_SYNC_STATE_FILE_NAME
+
+
+def load_desktop_sync_state(paths: Paths) -> dict[str, Any]:
+    state = load_json_file(desktop_sync_state_path(paths))
+    if not state:
+        return {"version": DESKTOP_SYNC_STATE_VERSION, "roots": {}}
+    if not isinstance(state.get("roots"), dict):
+        state["roots"] = {}
+    state["version"] = DESKTOP_SYNC_STATE_VERSION
+    return state
+
+
+def save_desktop_sync_state(paths: Paths, state: dict[str, Any]) -> None:
+    path = desktop_sync_state_path(paths)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        handle.write(payload)
+        temp_path = Path(handle.name)
+    temp_path.replace(path)
+
+
+def desktop_sync_root_key(root: Path) -> str:
+    try:
+        normalized = str(root.resolve()).casefold()
+    except OSError:
+        normalized = str(root.absolute()).casefold()
+    return hash_text(normalized) or normalized
+
+
+def desktop_replica_slot(account_uuid: str, workspace_uuid: str) -> str:
+    return f"{account_uuid}/{workspace_uuid}"
+
+
+def desktop_record_slot(record: DesktopSessionRecord) -> str:
+    return desktop_replica_slot(record.account_uuid, record.workspace_uuid)
+
+
+def desktop_record_state(record: DesktopSessionRecord) -> str:
+    return DESKTOP_STATE_ARCHIVED if record.data.get("isArchived") is True else DESKTOP_STATE_ACTIVE
+
+
+def desktop_record_mtime_ns(record: DesktopSessionRecord) -> int:
+    try:
+        return record.path.stat().st_mtime_ns
+    except OSError:
+        return 0
+
+
+def desktop_record_snapshot(record: DesktopSessionRecord) -> dict[str, Any]:
+    try:
+        relative_path = record.path.relative_to(record.sessions_root).as_posix()
+    except ValueError:
+        relative_path = record.path.name
+    return {
+        "account_uuid": record.account_uuid,
+        "workspace_uuid": record.workspace_uuid,
+        "path": relative_path,
+        "state": desktop_record_state(record),
+        "mtime_ns": desktop_record_mtime_ns(record),
+        "present": True,
+        "missing_scans": 0,
+    }
+
+
+def desktop_primary_records(records: list[DesktopSessionRecord]) -> dict[tuple[str, str], DesktopSessionRecord]:
+    primary: dict[tuple[str, str], DesktopSessionRecord] = {}
+    for record in records:
+        session_id = desktop_record_cli_session_id(record)
+        if not session_id:
+            continue
+        key = (session_id, desktop_record_slot(record))
+        existing = primary.get(key)
+        if existing is None or desktop_record_mtime_ns(record) >= desktop_record_mtime_ns(existing):
+            primary[key] = record
+    return primary
+
+
+def desktop_sync_root_state(state: dict[str, Any], root: Path) -> dict[str, Any]:
+    roots = state.setdefault("roots", {})
+    key = desktop_sync_root_key(root)
+    root_state = roots.get(key) if isinstance(roots.get(key), dict) else {}
+    root_state.setdefault("sessions", {})
+    if not isinstance(root_state["sessions"], dict):
+        root_state["sessions"] = {}
+    roots[key] = root_state
+    return root_state
+
+
+def refresh_desktop_sync_snapshots(paths: Paths, state: dict[str, Any]) -> None:
+    records_by_root: dict[Path, list[DesktopSessionRecord]] = {}
+    for record in desktop_session_records(paths):
+        records_by_root.setdefault(record.root, []).append(record)
+    for root in claude_windows_app_roots(paths):
+        root_state = desktop_sync_root_state(state, root)
+        sessions = root_state["sessions"]
+        primary = desktop_primary_records(records_by_root.get(root, []))
+        by_session: dict[str, dict[str, DesktopSessionRecord]] = {}
+        for (session_id, slot), record in primary.items():
+            by_session.setdefault(session_id, {})[slot] = record
+        for session_id, session_records in by_session.items():
+            entry = sessions.get(session_id) if isinstance(sessions.get(session_id), dict) else {}
+            if entry.get("state") == DESKTOP_STATE_DELETED:
+                continue
+            previous = entry.get("replicas") if isinstance(entry.get("replicas"), dict) else {}
+            replicas = {slot: desktop_record_snapshot(record) for slot, record in session_records.items()}
+            for slot, snapshot in previous.items():
+                if slot in replicas or not isinstance(snapshot, dict):
+                    continue
+                if (
+                    snapshot.get("excluded")
+                    or snapshot.get("scan_blocked")
+                    or int(snapshot.get("missing_scans") or 0) > 0
+                ):
+                    replicas[slot] = snapshot
+            entry["replicas"] = replicas
+            entry.setdefault("state", max(session_records.values(), key=desktop_record_mtime_ns) and desktop_record_state(max(session_records.values(), key=desktop_record_mtime_ns)))
+            entry.setdefault("state_changed_at_ns", max(desktop_record_mtime_ns(record) for record in session_records.values()))
+            sessions[session_id] = entry
+
+
+def suppress_desktop_replica(paths: Paths, record: DesktopSessionRecord) -> None:
+    with _DESKTOP_SYNC_LOCK:
+        state = load_desktop_sync_state(paths)
+        root_state = desktop_sync_root_state(state, record.root)
+        sessions = root_state["sessions"]
+        session_id = desktop_record_cli_session_id(record)
+        if not session_id:
+            return
+        entry = sessions.get(session_id) if isinstance(sessions.get(session_id), dict) else {
+            "state": desktop_record_state(record),
+            "state_changed_at_ns": desktop_record_mtime_ns(record),
+            "replicas": {},
+        }
+        replicas = entry.setdefault("replicas", {})
+        snapshot = desktop_record_snapshot(record)
+        snapshot.update({"present": False, "missing_scans": 0, "excluded": True})
+        replicas[desktop_record_slot(record)] = snapshot
+        sessions[session_id] = entry
+        save_desktop_sync_state(paths, state)
 
 
 def sync_claude_desktop_accounts(paths: Paths) -> dict[str, Any]:
@@ -1273,99 +1794,269 @@ def sync_claude_desktop_accounts(paths: Paths) -> dict[str, Any]:
         "updated": 0,
         "repaired": 0,
         "deduped": 0,
+        "archived": 0,
+        "unarchived": 0,
+        "deleted": 0,
+        "removed": 0,
+        "pending_deletions": 0,
+        "tombstone_skips": 0,
         "backups": [],
     }
-    transcript_chats = discover_chats(paths.claude_home)
-    records = desktop_session_records(paths)
-    for record in records:
-        sanitized = sanitize_desktop_session_data(record.data)
-        if sanitized != record.data:
-            backup = backup_desktop_session_file(paths, record.path)
-            result["backups"].append(str(backup))
-            write_desktop_session_json(record.path, sanitized)
-            result["repaired"] += 1
-    if result["repaired"]:
+
+    with _DESKTOP_SYNC_LOCK:
+        state = load_desktop_sync_state(paths)
+        transcript_chats = {
+            chat.session_id: chat
+            for chat in discover_chats(paths.claude_home)
+            if chat.session_id and chat.cwd and chat.can_queue
+        }
         records = desktop_session_records(paths)
-    records_by_root: dict[Path, list[DesktopSessionRecord]] = {}
-    for record in records:
-        records_by_root.setdefault(record.root, []).append(record)
+        for record in records:
+            sanitized = sanitize_desktop_session_data(record.data)
+            if sanitized != record.data:
+                backup = backup_desktop_session_file(paths, record.path)
+                result["backups"].append(str(backup))
+                write_desktop_session_json(record.path, sanitized)
+                result["repaired"] += 1
+        if result["repaired"]:
+            records = desktop_session_records(paths)
 
-    for root in claude_windows_app_roots(paths):
-        root_records = records_by_root.get(root, [])
-        sessions_root = root / "claude-code-sessions"
-        account_uuids = {
-            record.account_uuid
-            for record in root_records
-            if record.account_uuid
-        }
-        if sessions_root.exists():
-            account_uuids.update(path.name for path in sessions_root.iterdir() if path.is_dir())
-        all_workspace_uuids = {record.workspace_uuid for record in root_records if record.workspace_uuid}
-        if sessions_root.exists():
-            for account_dir in sessions_root.iterdir():
-                if account_dir.is_dir():
-                    all_workspace_uuids.update(path.name for path in account_dir.iterdir() if path.is_dir())
-        active_account_uuid = active_desktop_account_uuid(root)
-        if active_account_uuid:
-            account_uuids.add(active_account_uuid)
-        if not account_uuids:
-            continue
-        workspace_uuids_by_account = {
-            account_uuid: desktop_account_workspace_uuids(sessions_root, account_uuid, all_workspace_uuids)
-            for account_uuid in account_uuids
-        }
+        records_by_root: dict[Path, list[DesktopSessionRecord]] = {}
+        for record in records:
+            records_by_root.setdefault(record.root, []).append(record)
 
-        records_by_session: dict[str, list[DesktopSessionRecord]] = {}
-        for record in root_records:
-            cli_session_id = desktop_record_cli_session_id(record)
-            if not cli_session_id or not desktop_record_visible(record):
+        for root in claude_windows_app_roots(paths):
+            root_records = records_by_root.get(root, [])
+            sessions_root = root / "claude-code-sessions"
+            root_state = desktop_sync_root_state(state, root)
+            session_state = root_state["sessions"]
+            active_account_uuid = active_desktop_account_uuid(root)
+            active_workspace_uuid = active_desktop_workspace_uuid(root, active_account_uuid)
+
+            account_uuids = {record.account_uuid for record in root_records if record.account_uuid}
+            if sessions_root.exists():
+                account_uuids.update(path.name for path in sessions_root.iterdir() if path.is_dir())
+            if active_account_uuid:
+                account_uuids.add(active_account_uuid)
+            if not account_uuids:
                 continue
-            records_by_session.setdefault(cli_session_id, []).append(record)
-        result["roots"] += 1
-        result["accounts"] += len(account_uuids)
-        result["sessions"] += len(records_by_session)
+            fallback_workspace_uuid = (
+                max(root_records, key=desktop_record_mtime_ns).workspace_uuid
+                if root_records
+                else None
+            )
+            workspace_uuids_by_account = {
+                account_uuid: desktop_account_workspace_uuids(
+                    sessions_root,
+                    account_uuid,
+                    (active_workspace_uuid or fallback_workspace_uuid)
+                    if account_uuid == active_account_uuid
+                    else fallback_workspace_uuid,
+                )
+                for account_uuid in account_uuids
+            }
 
-        for cli_session_id, session_records in list(records_by_session.items()):
-            source_record = max(session_records, key=desktop_record_timestamp_ms)
-            for account_uuid in sorted(account_uuids):
-                for workspace_uuid in workspace_uuids_by_account[account_uuid]:
-                    target_records = [
+            records_by_session: dict[str, list[DesktopSessionRecord]] = {}
+            for record in root_records:
+                session_id = desktop_record_cli_session_id(record)
+                if session_id:
+                    records_by_session.setdefault(session_id, []).append(record)
+
+            # Keep one metadata file per logical session/account workspace. Every removal is backed up.
+            for session_id, session_records in records_by_session.items():
+                by_slot: dict[str, list[DesktopSessionRecord]] = {}
+                for record in session_records:
+                    by_slot.setdefault(desktop_record_slot(record), []).append(record)
+                kept: list[DesktopSessionRecord] = []
+                for slot_records in by_slot.values():
+                    primary = max(slot_records, key=desktop_record_mtime_ns)
+                    kept.append(primary)
+                    for duplicate in slot_records:
+                        if duplicate.path == primary.path or not duplicate.path.exists():
+                            continue
+                        backup = backup_desktop_session_file(paths, duplicate.path)
+                        result["backups"].append(str(backup))
+                        duplicate.path.unlink()
+                        result["deduped"] += 1
+                records_by_session[session_id] = kept
+
+            all_session_ids = set(records_by_session) | set(session_state) | set(transcript_chats)
+            result["roots"] += 1
+            result["accounts"] += len(account_uuids)
+            result["sessions"] += len(all_session_ids)
+
+            for session_id in sorted(all_session_ids):
+                session_records = [record for record in records_by_session.get(session_id, []) if record.path.exists()]
+                entry = session_state.get(session_id) if isinstance(session_state.get(session_id), dict) else {}
+                previous_state = entry.get("state") if entry.get("state") in {
+                    DESKTOP_STATE_ACTIVE,
+                    DESKTOP_STATE_ARCHIVED,
+                    DESKTOP_STATE_DELETED,
+                } else None
+                previous_replicas = entry.get("replicas") if isinstance(entry.get("replicas"), dict) else {}
+                current_by_slot = {
+                    desktop_record_slot(record): record
+                    for record in session_records
+                }
+                events: list[tuple[int, int, str, DesktopSessionRecord | None]] = []
+
+                if previous_state != DESKTOP_STATE_DELETED:
+                    for slot, previous in previous_replicas.items():
+                        if not isinstance(previous, dict) or previous.get("excluded"):
+                            continue
+                        current = current_by_slot.get(slot)
+                        if current is not None:
+                            old_state = previous.get("state")
+                            new_state = desktop_record_state(current)
+                            previous["missing_scans"] = 0
+                            previous["present"] = True
+                            previous["scan_blocked"] = False
+                            if old_state in {DESKTOP_STATE_ACTIVE, DESKTOP_STATE_ARCHIVED} and new_state != old_state:
+                                priority = 2 if new_state == DESKTOP_STATE_ARCHIVED else 1
+                                events.append((desktop_record_mtime_ns(current), priority, new_state, current))
+                            continue
+
+                        account_uuid = previous.get("account_uuid")
+                        relative_path = previous.get("path")
+                        previous_path = sessions_root / str(relative_path) if isinstance(relative_path, str) else None
+                        parent_readable = previous_path is not None and previous_path.parent.is_dir()
+                        file_is_really_missing = previous_path is not None and not previous_path.exists()
+                        if parent_readable and file_is_really_missing:
+                            missing_scans = int(previous.get("missing_scans") or 0) + 1
+                            previous["missing_scans"] = missing_scans
+                            previous["present"] = False
+                            if missing_scans >= 2:
+                                events.append((time.time_ns(), 3, DESKTOP_STATE_DELETED, None))
+                            else:
+                                result["pending_deletions"] += 1
+                        else:
+                            # Missing account/workspace or an unreadable/corrupt JSON is not a delete event.
+                            previous["scan_blocked"] = True
+
+                    # A new external replica can carry a newer archive/unarchive decision.
+                    for slot, current in current_by_slot.items():
+                        if slot in previous_replicas:
+                            continue
+                        current_state = desktop_record_state(current)
+                        priority = 2 if current_state == DESKTOP_STATE_ARCHIVED else 1
+                        events.append((desktop_record_mtime_ns(current), priority, current_state, current))
+
+                if previous_state == DESKTOP_STATE_DELETED:
+                    canonical_state = DESKTOP_STATE_DELETED
+                    state_event_record = None
+                elif previous_state is None and session_records:
+                    active_candidates = [
                         record
                         for record in session_records
-                        if record.account_uuid == account_uuid
-                        and record.workspace_uuid == workspace_uuid
-                        and record.path.exists()
-                        and desktop_record_visible(record)
+                        if record.account_uuid == active_account_uuid
                     ]
-                    if target_records:
-                        primary = max(target_records, key=desktop_record_timestamp_ms)
-                        for duplicate in target_records:
-                            if duplicate.path == primary.path:
-                                continue
-                            backup = backup_desktop_session_file(paths, duplicate.path)
-                            result["backups"].append(str(backup))
-                            duplicate.path.unlink()
-                            result["deduped"] += 1
+                    state_event_record = max(active_candidates or session_records, key=desktop_record_mtime_ns)
+                    canonical_state = desktop_record_state(state_event_record)
+                elif events:
+                    _, _, canonical_state, state_event_record = max(events, key=lambda event: (event[0], event[1]))
+                elif previous_state is not None:
+                    canonical_state = previous_state
+                    state_event_record = None
+                elif session_records:
+                    state_event_record = max(session_records, key=desktop_record_mtime_ns)
+                    canonical_state = desktop_record_state(state_event_record)
+                else:
+                    canonical_state = DESKTOP_STATE_ACTIVE
+                    state_event_record = None
 
-                        if source_record.path != primary.path and desktop_record_timestamp_ms(source_record) >= desktop_record_timestamp_ms(primary):
-                            data = desktop_session_data_for_path(source_record.data, cli_session_id, primary.path)
+                entry["state"] = canonical_state
+                entry["state_changed_at_ns"] = max(
+                    int(entry.get("state_changed_at_ns") or 0),
+                    max((event[0] for event in events), default=0),
+                )
+                entry["replicas"] = previous_replicas
+                session_state[session_id] = entry
+
+                if canonical_state == DESKTOP_STATE_DELETED:
+                    # Persist the tombstone before touching replicas so a crash cannot resurrect the chat.
+                    save_desktop_sync_state(paths, state)
+                    for record in session_records:
+                        if not record.path.exists():
+                            continue
+                        backup = backup_desktop_session_file(paths, record.path)
+                        result["backups"].append(str(backup))
+                        record.path.unlink()
+                        result["removed"] += 1
+                    if previous_state != DESKTOP_STATE_DELETED:
+                        result["deleted"] += 1
+                    elif session_records:
+                        result["tombstone_skips"] += 1
+                    continue
+
+                if previous_state != canonical_state:
+                    if canonical_state == DESKTOP_STATE_ARCHIVED:
+                        result["archived"] += 1
+                    elif previous_state == DESKTOP_STATE_ARCHIVED:
+                        result["unarchived"] += 1
+
+                chat = transcript_chats.get(session_id)
+                source_record = state_event_record
+                if source_record is None and session_records:
+                    source_record = max(
+                        session_records,
+                        key=lambda record: (desktop_record_timestamp_ms(record), desktop_record_mtime_ns(record)),
+                    )
+                if source_record is None and chat is None:
+                    continue
+                source_data = source_record.data if source_record is not None else synthetic_desktop_session_data(chat)
+
+                for account_uuid in sorted(account_uuids):
+                    for workspace_uuid in workspace_uuids_by_account[account_uuid]:
+                        slot = desktop_replica_slot(account_uuid, workspace_uuid)
+                        previous = previous_replicas.get(slot) if isinstance(previous_replicas.get(slot), dict) else {}
+                        if previous.get("excluded"):
+                            continue
+                        target_records = [
+                            record
+                            for record in session_records
+                            if record.account_uuid == account_uuid
+                            and record.workspace_uuid == workspace_uuid
+                            and record.path.exists()
+                        ]
+                        if not target_records and (
+                            previous.get("scan_blocked")
+                            or int(previous.get("missing_scans") or 0) > 0
+                        ):
+                            continue
+                        if target_records:
+                            primary = max(target_records, key=desktop_record_mtime_ns)
+                            base_data = source_data
+                            if source_record is not None and desktop_record_timestamp_ms(primary) > desktop_record_timestamp_ms(source_record):
+                                base_data = primary.data
+                            data = desktop_session_data_for_path(
+                                base_data,
+                                session_id,
+                                primary.path,
+                                archived=canonical_state == DESKTOP_STATE_ARCHIVED,
+                            )
                             if data != primary.data:
                                 backup = backup_desktop_session_file(paths, primary.path)
                                 result["backups"].append(str(backup))
                                 write_desktop_session_json(primary.path, data)
                                 result["updated"] += 1
-                        continue
+                            continue
 
-                    destination_dir = sessions_root / account_uuid / workspace_uuid
-                    app_session_id = source_record.data.get("sessionId")
-                    destination = unique_desktop_session_path(
-                        destination_dir,
-                        str(app_session_id).removeprefix("local_") if isinstance(app_session_id, str) and app_session_id else None,
-                    )
-                    data = desktop_session_data_for_path(source_record.data, cli_session_id, destination)
-                    write_desktop_session_json(destination, data)
-                    session_records.append(
-                        DesktopSessionRecord(
+                        destination_dir = sessions_root / account_uuid / workspace_uuid
+                        app_session_id = source_data.get("sessionId")
+                        destination = unique_desktop_session_path(
+                            destination_dir,
+                            str(app_session_id).removeprefix("local_")
+                            if isinstance(app_session_id, str) and app_session_id
+                            else None,
+                        )
+                        data = desktop_session_data_for_path(
+                            source_data,
+                            session_id,
+                            destination,
+                            archived=canonical_state == DESKTOP_STATE_ARCHIVED,
+                        )
+                        write_desktop_session_json(destination, data)
+                        created = DesktopSessionRecord(
                             root=root,
                             sessions_root=sessions_root,
                             account_uuid=account_uuid,
@@ -1374,42 +2065,31 @@ def sync_claude_desktop_accounts(paths: Paths) -> dict[str, Any]:
                             data=data,
                             active_account_uuid=active_account_uuid,
                         )
-                    )
-                    result["created"] += 1
+                        session_records.append(created)
+                        result["created"] += 1
+                        if source_record is None:
+                            result["transcripts_created"] += 1
 
-        for chat in transcript_chats:
-            if not chat.session_id or not chat.cwd or not chat.can_queue:
-                continue
-            session_records = records_by_session.setdefault(chat.session_id, [])
-            for account_uuid in sorted(account_uuids):
-                for workspace_uuid in workspace_uuids_by_account[account_uuid]:
-                    if any(
-                        record.account_uuid == account_uuid
-                        and record.workspace_uuid == workspace_uuid
-                        and record.path.exists()
-                        and desktop_record_visible(record)
-                        for record in session_records
-                    ):
-                        continue
-                    destination_dir = sessions_root / account_uuid / workspace_uuid
-                    data = synthetic_desktop_session_data(chat)
-                    destination = unique_desktop_session_path(destination_dir, data["sessionId"].removeprefix("local_"))
-                    data = desktop_session_data_for_path(data, chat.session_id, destination)
-                    write_desktop_session_json(destination, data)
-                    session_records.append(
-                        DesktopSessionRecord(
-                            root=root,
-                            sessions_root=sessions_root,
-                            account_uuid=account_uuid,
-                            workspace_uuid=workspace_uuid,
-                            path=destination,
-                            data=data,
-                            active_account_uuid=active_account_uuid,
-                        )
-                    )
-                    result["created"] += 1
-                    result["transcripts_created"] += 1
+                # Older releases produced account x workspace copies. Keep only the
+                # account's chosen workspace replica, with a backup for every removal.
+                by_account: dict[str, list[DesktopSessionRecord]] = {}
+                for record in session_records:
+                    if record.path.exists():
+                        by_account.setdefault(record.account_uuid, []).append(record)
+                for account_uuid, account_records in by_account.items():
+                    preferred = set(workspace_uuids_by_account.get(account_uuid, []))
+                    preferred_records = [record for record in account_records if record.workspace_uuid in preferred]
+                    primary = max(preferred_records or account_records, key=desktop_record_mtime_ns)
+                    for duplicate in account_records:
+                        if duplicate.path == primary.path or not duplicate.path.exists():
+                            continue
+                        backup = backup_desktop_session_file(paths, duplicate.path)
+                        result["backups"].append(str(backup))
+                        duplicate.path.unlink()
+                        result["deduped"] += 1
 
+        refresh_desktop_sync_snapshots(paths, state)
+        save_desktop_sync_state(paths, state)
     return result
 
 
@@ -1518,6 +2198,7 @@ def transfer_chat_to_active_desktop_account(paths: Paths, chat: Chat, move: bool
                 if record.account_uuid == active_account_uuid:
                     continue
                 backup_path = backup_desktop_session_file(paths, record.path)
+                suppress_desktop_replica(paths, record)
                 record.path.unlink()
                 removed_source = str(record.path)
                 break
@@ -1549,6 +2230,7 @@ def transfer_chat_to_active_desktop_account(paths: Paths, chat: Chat, move: bool
     write_desktop_session_json(destination, data)
     if source_record is not None and move and source_record.account_uuid != active_account_uuid:
         backup_path = backup_desktop_session_file(paths, source_record.path)
+        suppress_desktop_replica(paths, source_record)
         source_record.path.unlink()
         removed_source = str(source_record.path)
 
@@ -1569,36 +2251,145 @@ def transfer_chat_to_active_desktop_account(paths: Paths, chat: Chat, move: bool
 def transfer_codex_chat_to_active_account(paths: Paths, chat: Chat) -> dict[str, Any]:
     if chat.provider != PROVIDER_CODEX:
         raise ValueError("La task selezionata non appartiene a Codex.")
-    if chat.archived:
-        raise ValueError("La task Codex e' archiviata: riaprila nell'app Codex prima di associarla.")
     active = active_codex_account(paths)
     if active is None:
-        raise ValueError("Account Codex attivo non rilevato.")
-    index = load_account_index(paths)
-    register_active_codex_account(paths, index)
-    sessions = index.setdefault("sessions", {})
-    key = chat_account_session_key(chat)
-    previous = sessions.get(key) if isinstance(sessions.get(key), dict) else {}
-    sessions[key] = {
-        **previous,
-        "account_key": active.key,
-        "label": active.label,
-        "provider": PROVIDER_CODEX,
-        "session_id": chat.session_id,
-        "source": chat.source,
-        "title": chat.title,
-        "cwd": chat.cwd,
-        "first_seen_at": previous.get("first_seen_at") or now_utc(),
-        "last_seen_at": now_utc(),
-    }
-    save_account_index(paths, index)
-    return {
-        "status": "associated",
-        "session_id": chat.session_id,
-        "title": chat.title,
-        "active_account": active.label,
-        "destination": str(chat.jsonl_path),
-    }
+        raise ValueError("Account ChatGPT/Codex attivo non rilevato.")
+    if chat.account_key == active.key:
+        return {
+            "status": "already_active",
+            "session_id": chat.session_id,
+            "title": chat.title,
+            "active_account": active.label,
+            "destination": str(chat.jsonl_path),
+        }
+    codex_exe = find_codex_executable(paths)
+    if codex_exe is None:
+        raise ValueError("CLI Codex non trovato: non posso creare una copia supportata della task.")
+
+    with _ACCOUNT_INDEX_LOCK:
+        index = load_account_index(paths)
+        register_active_codex_account(paths, index)
+        links = index.setdefault("codex_links", {})
+        group_id = next(
+            (
+                candidate
+                for candidate, group in links.items()
+                if isinstance(group, dict)
+                and isinstance(group.get("threads"), dict)
+                and chat.session_id in group["threads"]
+            ),
+            None,
+        )
+        group = links.get(group_id) if group_id and isinstance(links.get(group_id), dict) else None
+        if group is not None:
+            threads = group.get("threads") if isinstance(group.get("threads"), dict) else {}
+            local_states = codex_local_thread_states(paths)
+            for linked_id, linked in threads.items():
+                if (
+                    isinstance(linked, dict)
+                    and linked.get("account_key") == active.key
+                    and linked_id in local_states
+                ):
+                    return {
+                        "status": "already_copied",
+                        "session_id": linked_id,
+                        "source_session_id": chat.session_id,
+                        "title": chat.title,
+                        "active_account": active.label,
+                        "destination": str(codex_thread_rows(paths.codex_home).get(linked_id, {}).get("rollout_path") or linked_id),
+                    }
+
+        fork = codex_app_server_request(
+            codex_exe,
+            "thread/fork",
+            {"threadId": chat.session_id, "excludeTurns": True},
+            codex_home=paths.codex_home,
+        )
+        thread = fork.get("thread") if isinstance(fork.get("thread"), dict) else {}
+        destination_session_id = thread.get("id") if isinstance(thread.get("id"), str) else None
+        if not destination_session_id or destination_session_id == chat.session_id:
+            raise ValueError("Codex non ha restituito un nuovo ID per la copia della task.")
+        states: dict[str, str] = {}
+        for _ in range(20):
+            states = codex_local_thread_states(paths)
+            if destination_session_id in states:
+                break
+            time.sleep(0.1)
+        if destination_session_id not in states:
+            raise ValueError("La copia Codex non risulta nello store locale dopo il fork.")
+
+        sessions = index.setdefault("sessions", {})
+        now = now_utc()
+        source_key = chat_account_session_key(chat)
+        source_previous = sessions.get(source_key) if isinstance(sessions.get(source_key), dict) else {}
+        sessions[source_key] = {
+            **source_previous,
+            "account_key": chat.account_key or source_previous.get("account_key"),
+            "label": chat.account_label or source_previous.get("label"),
+            "provider": PROVIDER_CODEX,
+            "session_id": chat.session_id,
+            "source": chat.source,
+            "title": chat.title,
+            "cwd": chat.cwd,
+            "first_seen_at": source_previous.get("first_seen_at") or now,
+            "last_seen_at": now,
+        }
+        destination_chat = dataclasses.replace(
+            chat,
+            session_id=destination_session_id,
+            archived=states[destination_session_id] == DESKTOP_STATE_ARCHIVED,
+        )
+        destination_key = chat_account_session_key(destination_chat)
+        sessions[destination_key] = {
+            "account_key": active.key,
+            "label": active.label,
+            "provider": PROVIDER_CODEX,
+            "session_id": destination_session_id,
+            "source": "Codex App (copia account)",
+            "title": chat.title,
+            "cwd": chat.cwd,
+            "first_seen_at": now,
+            "last_seen_at": now,
+            "forked_from": chat.session_id,
+        }
+
+        if group is None:
+            group_id = str(uuid.uuid4())
+            group = {
+                "provider": PROVIDER_CODEX,
+                "source_session_id": chat.session_id,
+                "created_at": now,
+                "state": states.get(chat.session_id, DESKTOP_STATE_ARCHIVED if chat.archived else DESKTOP_STATE_ACTIVE),
+                "threads": {},
+            }
+        threads = group.setdefault("threads", {})
+        threads[chat.session_id] = {
+            **(threads.get(chat.session_id) if isinstance(threads.get(chat.session_id), dict) else {}),
+            "account_key": chat.account_key or source_previous.get("account_key"),
+            "last_state": states.get(chat.session_id, DESKTOP_STATE_ARCHIVED if chat.archived else DESKTOP_STATE_ACTIVE),
+            "missing_scans": 0,
+        }
+        threads[destination_session_id] = {
+            "account_key": active.key,
+            "last_state": states[destination_session_id],
+            "missing_scans": 0,
+            "forked_from": chat.session_id,
+        }
+        group["threads"] = threads
+        links[str(group_id)] = group
+        index["codex_links"] = links
+        save_account_index(paths, index)
+
+        row = codex_thread_rows(paths.codex_home).get(destination_session_id, {})
+        return {
+            "status": "forked",
+            "session_id": destination_session_id,
+            "source_session_id": chat.session_id,
+            "title": chat.title,
+            "active_account": active.label,
+            "destination": str(row.get("rollout_path") or destination_session_id),
+            "archived": states[destination_session_id] == DESKTOP_STATE_ARCHIVED,
+        }
 
 
 def desktop_account_fields(account_uuid: str | None, active_account_uuid: str | None) -> dict[str, str | None]:
@@ -2028,7 +2819,7 @@ def merge_claude_chat_sources(local_chats: list[Chat], vscode_chats: list[Chat])
     return sorted(by_session.values(), key=chat_sort_key, reverse=True)
 
 
-def annotate_chats_with_accounts(paths: Paths, chats: list[Chat]) -> list[Chat]:
+def _annotate_chats_with_accounts_unlocked(paths: Paths, chats: list[Chat]) -> list[Chat]:
     index = load_account_index(paths)
     active = register_active_account(paths, index)
     sessions = index.setdefault("sessions", {})
@@ -2094,7 +2885,12 @@ def annotate_chats_with_accounts(paths: Paths, chats: list[Chat]) -> list[Chat]:
     return annotated
 
 
-def annotate_codex_chats_with_accounts(paths: Paths, chats: list[Chat]) -> list[Chat]:
+def annotate_chats_with_accounts(paths: Paths, chats: list[Chat]) -> list[Chat]:
+    with _ACCOUNT_INDEX_LOCK:
+        return _annotate_chats_with_accounts_unlocked(paths, chats)
+
+
+def _annotate_codex_chats_with_accounts_unlocked(paths: Paths, chats: list[Chat]) -> list[Chat]:
     index = load_account_index(paths)
     active = register_active_codex_account(paths, index)
     sessions = index.setdefault("sessions", {})
@@ -2158,6 +2954,11 @@ def annotate_codex_chats_with_accounts(paths: Paths, chats: list[Chat]) -> list[
     return annotated
 
 
+def annotate_codex_chats_with_accounts(paths: Paths, chats: list[Chat]) -> list[Chat]:
+    with _ACCOUNT_INDEX_LOCK:
+        return _annotate_codex_chats_with_accounts_unlocked(paths, chats)
+
+
 def discover_claude_chats(
     paths: Paths,
     sync_desktop_accounts: bool = True,
@@ -2183,7 +2984,7 @@ def discover_agent_chats(
     return sorted(claude_chats + codex_chats, key=chat_sort_key, reverse=True)
 
 
-def remember_chat_account(paths: Paths, chat: Chat) -> Chat:
+def _remember_chat_account_unlocked(paths: Paths, chat: Chat) -> Chat:
     if chat.remote_kind is not None or chat.account_key:
         return chat
     active = active_codex_account(paths) if chat.provider == PROVIDER_CODEX else active_claude_account(paths)
@@ -2210,6 +3011,11 @@ def remember_chat_account(paths: Paths, chat: Chat) -> Chat:
     }
     save_account_index(paths, index)
     return dataclasses.replace(chat, account_key=active.key, account_label=active.label, account_status="active")
+
+
+def remember_chat_account(paths: Paths, chat: Chat) -> Chat:
+    with _ACCOUNT_INDEX_LOCK:
+        return _remember_chat_account_unlocked(paths, chat)
 
 
 def account_mismatch_message(
@@ -3305,7 +4111,7 @@ def run_codex(
             cwd=cwd_for_subprocess(cwd),
             capture_output=True,
             timeout=timeout,
-            env=codex_subprocess_env(paths.codex_home),
+            env=codex_subprocess_env(paths.codex_home, windows=False),
         )
 
     combined = f"{proc.stdout}\n{proc.stderr}"

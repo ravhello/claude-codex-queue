@@ -32,8 +32,26 @@ them into a common chat model, and sorts by the timestamp of the latest real
 message. Synthetic markers do not affect ordering.
 
 Large Codex transcripts are not scanned during the normal list operation.
-Discovery uses the task index and state database, then reads a transcript only
-when execution or limit confirmation needs it.
+Discovery uses the union of the task index, state database and rollout paths,
+filters internal subagent threads, and drops append-only index ghosts. It reads
+a transcript only when execution or limit confirmation needs it.
+
+### Multi-account replication
+
+Claude Desktop replication stores lifecycle observations in
+`desktop-sync-state.json`. A logical session has a canonical `active`,
+`archived` or `deleted` state plus per-account replica observations. Delete
+requires two complete scans, writes its tombstone before removing anything and
+never deletes the underlying `.claude/projects` transcript. Every overwritten
+or removed Claude metadata file is backed up under
+`account-transfer-backups/`.
+
+Codex uses one local store per Windows profile, so account copies must have
+different thread IDs. The transfer action calls app-server `thread/fork` while
+the destination ChatGPT-authenticated account is active and records the linked
+IDs in `accounts.json`. Lifecycle propagation is limited to those explicit
+links and delegates to the stable Codex CLI commands. SQLite,
+`session_index.jsonl` and rollout JSONL files remain provider-owned.
 
 ### Queue and recovery
 
@@ -69,5 +87,8 @@ later.
 - Never use an external API key accidentally inherited from the environment.
 - Never expose the web UI beyond localhost by default.
 - Never persist raw authentication material in queue state.
+- Never write Codex SQLite, task indexes or rollout files directly.
+- Never recreate a tombstoned Claude session from a surviving transcript.
+- Never propagate a deletion from an empty or unreadable Codex store.
 
 Changes touching these invariants require focused tests and explicit review.

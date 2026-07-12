@@ -1187,7 +1187,7 @@ HTML = r"""<!doctype html>
 
     function transferAvailable(chat) {
       if (!chat || chat.remote_kind) return false;
-      if (chat.provider === "codex") return !chat.archived && chat.account_status !== "active";
+      if (chat.provider === "codex") return chat.account_status !== "active";
       if (chat.source_key === "claude_windows_app" && chat.account_status === "active") return false;
       return true;
     }
@@ -1203,7 +1203,7 @@ HTML = r"""<!doctype html>
       $("transfer-btn").textContent = state.transferBusy
         ? "Importo..."
         : isCodex
-        ? "Associa all'account Codex attivo"
+        ? "Copia nell'account ChatGPT attivo"
         : chat && chat.account_status === "other"
         ? (moveToggle.checked ? "Sposta da altro account" : "Importa da altro account")
         : "Importa nell'account attivo";
@@ -1474,7 +1474,7 @@ HTML = r"""<!doctype html>
       const action = move ? "Spostare" : "Importare";
       const label = selected.account_status === "other" ? "da un altro account" : "dalla transcript locale";
       const question = isCodex
-        ? "Associare questa task all'account Codex attivo? La transcript locale non viene duplicata."
+        ? "Creare una nuova task nell'account ChatGPT/Codex attivo? Verrà copiato l'intero contesto in un nuovo ID; archiviazione, ripristino ed eliminazione resteranno sincronizzati tra le due copie locali."
         : `${action} questa chat ${label} nell'account Claude attivo?`;
       if (!window.confirm(question)) return;
       state.transferBusy = true;

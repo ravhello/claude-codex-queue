@@ -2,8 +2,14 @@
 
 ## Unreleased
 
+- Added real Codex task copying through app-server `thread/fork` for the active ChatGPT account.
 - Fixed Claude Desktop recovery routing so it omits `--ide`, prefers the app CLI, and preserves UTF-8 output on Windows.
 - Pinned every Codex subprocess to the indexed `CODEX_HOME`, including Windows CLI calls launched from WSL.
+- Synchronized archive, unarchive and delete state across explicitly linked Codex copies using official CLI commands.
+- Added durable Claude lifecycle tombstones, two-scan delete detection and metadata backups.
+- Prevented deleted Claude chats from being resurrected by surviving transcripts.
+- Removed account/workspace cross-product duplicates and made account state writes atomic in-process.
+- Expanded Codex discovery to database- and rollout-only tasks while filtering deleted ghosts and internal subagents.
 
 ## 0.2.3 - 2026-07-12
 
