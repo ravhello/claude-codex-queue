@@ -106,6 +106,19 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-desktop-shortc
 Open **Claude + Codex Queue** from the Desktop. The launcher starts the local
 server and opens [http://127.0.0.1:8765/](http://127.0.0.1:8765/).
 
+The installer also registers the app in the current Windows user's Startup
+folder. At login it starts the server in the background and opens the browser
+after the health check succeeds. The page refreshes every five seconds and
+again whenever its tab regains focus. A server-side supervisor starts the queue
+runner whenever pending messages, recovery work or auto-continue need it, so
+the **Refresh** and **Start runner** buttons are not required for normal use.
+
+To install or repair only the automatic startup entry:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-autostart.ps1
+```
+
 To run it without installing a shortcut:
 
 ```powershell

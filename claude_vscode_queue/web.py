@@ -110,6 +110,11 @@ class WebState:
         self._account_sync_poll_seconds = 10.0
         self._account_sync_last_check_at: str | None = None
         self._account_sync_last_error: str | None = None
+        self._runner_monitor_stop = threading.Event()
+        self._runner_monitor_thread: threading.Thread | None = None
+        self._runner_monitor_poll_seconds = 5.0
+        self._runner_monitor_last_check_at: str | None = None
+        self._runner_monitor_last_error: str | None = None
 
     def base_command(self) -> list[str]:
         command = [
@@ -178,6 +183,11 @@ class WebState:
             exit_code = None if self.runner is None or running else self.runner.returncode
             pid = self.runner.pid if self.runner is not None and running else None
             command = " ".join(self.runner.args) if self.runner is not None and running and isinstance(self.runner.args, list) else None
+            monitor = self._runner_monitor_thread
+            automatic = bool(monitor and monitor.is_alive())
+            automatic_poll_seconds = self._runner_monitor_poll_seconds
+            automatic_last_check_at = self._runner_monitor_last_check_at
+            automatic_last_error = self._runner_monitor_last_error
         source = "managed" if running else None
         if not running:
             pid, command = self.runner_process_from_pid_file()
@@ -206,6 +216,10 @@ class WebState:
             "command": command,
             "log_path": str(self.runner_log),
             "log_tail": tail,
+            "automatic": automatic,
+            "automatic_poll_seconds": automatic_poll_seconds,
+            "automatic_last_check_at": automatic_last_check_at,
+            "automatic_last_error": automatic_last_error,
         }
 
     def quick_chats(self) -> list[app.Chat]:
@@ -390,23 +404,84 @@ class WebState:
         return self.account_sync_status()
 
     def start_runner(self, poll_seconds: int = 60) -> dict[str, Any]:
+        existing = self.runner_status()
+        if existing["running"]:
+            return existing
         with self.lock:
             if self.runner is not None and self.runner.poll() is None:
                 return self.runner_status()
             self.runner_log.parent.mkdir(parents=True, exist_ok=True)
             log_handle = self.runner_log.open("a", encoding="utf-8")
-            log_handle.write(f"\n--- runner start {app.now_utc()} ---\n")
-            log_handle.flush()
-            command = self.base_command() + ["run", "--poll-seconds", str(poll_seconds)]
-            self.runner = subprocess.Popen(
-                command,
-                cwd=PROJECT_ROOT,
-                stdout=log_handle,
-                stderr=subprocess.STDOUT,
-                text=True,
-            )
+            try:
+                log_handle.write(f"\n--- runner start {app.now_utc()} ---\n")
+                log_handle.flush()
+                command = self.base_command() + ["run", "--poll-seconds", str(poll_seconds)]
+                self.runner = subprocess.Popen(
+                    command,
+                    cwd=PROJECT_ROOT,
+                    stdout=log_handle,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                )
+            finally:
+                log_handle.close()
             self.runner_pid_file.write_text(str(self.runner.pid), encoding="utf-8")
         time.sleep(0.2)
+        return self.runner_status()
+
+    def queue_requires_runner(self) -> bool:
+        queue = app.load_queue(self.paths.queue_file)
+        return bool(
+            app.pending_items(queue)
+            or app.active_recovery(queue)
+            or app.active_auto_continue(queue)
+        )
+
+    def ensure_runner_for_pending_work(self) -> dict[str, Any]:
+        requires_runner = False
+        error: str | None = None
+        try:
+            requires_runner = self.queue_requires_runner()
+            status = self.runner_status()
+            if requires_runner and not status["running"]:
+                status = self.start_runner()
+                if not status["running"] and status.get("exit_code") not in {None, 0}:
+                    error = f"Runner terminato con codice {status['exit_code']}"
+        except Exception as exc:
+            status = self.runner_status()
+            error = str(exc)
+        with self.lock:
+            self._runner_monitor_last_check_at = app.now_utc()
+            self._runner_monitor_last_error = error
+        return {"required": requires_runner, "runner": status, "error": error}
+
+    def start_runner_monitor(self, poll_seconds: float = 5.0) -> dict[str, Any]:
+        with self.lock:
+            if self._runner_monitor_thread is not None and self._runner_monitor_thread.is_alive():
+                return self.runner_status()
+            self._runner_monitor_poll_seconds = max(1.0, float(poll_seconds))
+            self._runner_monitor_stop.clear()
+
+            def worker() -> None:
+                while not self._runner_monitor_stop.is_set():
+                    self.ensure_runner_for_pending_work()
+                    if self._runner_monitor_stop.wait(self._runner_monitor_poll_seconds):
+                        break
+
+            self._runner_monitor_thread = threading.Thread(
+                target=worker,
+                name="claude-codex-runner-monitor",
+                daemon=True,
+            )
+            self._runner_monitor_thread.start()
+        return self.runner_status()
+
+    def stop_runner_monitor(self) -> dict[str, Any]:
+        self._runner_monitor_stop.set()
+        with self.lock:
+            thread = self._runner_monitor_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
         return self.runner_status()
 
     def stop_runner(self) -> dict[str, Any]:
@@ -1168,10 +1243,13 @@ HTML = r"""<!doctype html>
     function renderRunner(runner) {
       state.runner = runner || {};
       const running = !!runner.running;
-      $("runner-dot").className = "dot " + (running ? "on" : "off");
-      $("runner-text").textContent = running ? `Runner attivo${runner.pid ? ` #${runner.pid}` : ""}` : "Runner fermo";
-      $("start-btn").disabled = running;
-      $("stop-btn").disabled = !running;
+      const automatic = !!runner.automatic;
+      $("runner-dot").className = "dot " + (running || automatic ? "on" : "off");
+      $("runner-text").textContent = running
+        ? `${automatic ? "Automatico · " : ""}Runner attivo${runner.pid ? ` #${runner.pid}` : ""}`
+        : (automatic ? "Automatico in attesa" : "Runner fermo");
+      $("start-btn").disabled = running || automatic;
+      $("stop-btn").disabled = !running || automatic;
       if (runner.log_tail) log(runner.log_tail);
     }
 
@@ -1421,7 +1499,7 @@ HTML = r"""<!doctype html>
       const autoIsCodex = !!(auto && auto.provider === "codex");
       const autoDetails = auto ? [
         `Stato: ${escapeHtml(auto.status || "spento")}`,
-        `Runner: ${runner.running ? `attivo${runner.pid ? ` #${escapeHtml(runner.pid)}` : ""}` : "fermo"}`,
+        `Runner: ${runner.running ? `attivo${runner.pid ? ` #${escapeHtml(runner.pid)}` : ""}` : (runner.automatic ? "automatico in attesa" : "fermo")}`,
         `Origine: ${escapeHtml(auto.source || (autoIsCodex ? "Codex App" : "Claude Code"))}`,
         !autoIsCodex && auto.source_key === "claude_windows_app" ? "Integrazione IDE: non usata" : "",
         `Modello: ${escapeHtml(auto.model_override || effective.model || "chat")}`,
@@ -1620,6 +1698,10 @@ HTML = r"""<!doctype html>
 
     refreshAll();
     setInterval(refreshAll, 5000);
+    window.addEventListener("focus", refreshAll);
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden) refreshAll();
+    });
   </script>
 </body>
 </html>
@@ -1650,13 +1732,15 @@ def main(argv: list[str] | None = None) -> int:
     Handler.state = state
     server = ThreadingHTTPServer((args.host, args.port), Handler)
     state.start_account_sync_monitor()
+    state.start_runner_monitor()
     print(f"http://{args.host}:{args.port}/", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        state.stop_runner()
         return 0
     finally:
+        state.stop_runner_monitor()
+        state.stop_runner()
         state.stop_account_sync_monitor()
         server.server_close()
 

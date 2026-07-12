@@ -29,3 +29,6 @@ if (Test-Path -LiteralPath $LegacyShortcutPath) {
 }
 
 Write-Output $ShortcutPath
+
+$AutoStartInstaller = Join-Path $Project "install-autostart.ps1"
+& $AutoStartInstaller

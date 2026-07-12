@@ -1044,6 +1044,41 @@ class AccountSyncTests(unittest.TestCase):
             self.assertTrue(started["running"])
             self.assertFalse(stopped["running"])
 
+    def test_web_runner_monitor_starts_pending_work_without_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            queue = app.load_queue(paths.queue_file)
+            queue["items"].append({"id": "pending-1", "status": app.STATUS_PENDING})
+            app.save_queue(paths.queue_file, queue)
+            state = web.WebState(paths, None, None)
+            observed = threading.Event()
+
+            def start_runner(_: int = 60) -> dict[str, object]:
+                observed.set()
+                return {"running": True, "exit_code": None}
+
+            with patch.object(state, "start_runner", side_effect=start_runner):
+                started = state.start_runner_monitor(poll_seconds=60)
+                self.assertTrue(observed.wait(timeout=2))
+                stopped = state.stop_runner_monitor()
+
+            self.assertTrue(started["automatic"])
+            self.assertFalse(stopped["automatic"])
+            self.assertIsNotNone(stopped["automatic_last_check_at"])
+            self.assertIsNone(stopped["automatic_last_error"])
+
+    def test_web_runner_monitor_leaves_empty_queue_idle(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            state = web.WebState(paths, None, None)
+
+            with patch.object(state, "start_runner") as start_runner:
+                result = state.ensure_runner_for_pending_work()
+
+            self.assertFalse(result["required"])
+            self.assertIsNone(result["error"])
+            start_runner.assert_not_called()
+
 
 if __name__ == "__main__":
     unittest.main()
