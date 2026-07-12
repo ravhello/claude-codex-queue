@@ -83,7 +83,7 @@ To run it without installing a shortcut:
 Run this inside WSL:
 
 ```bash
-python3 -m pip install claude-codex-queue
+python3 -m pip install "https://github.com/ravhello/claude-codex-queue/releases/download/v0.2.2/claude_codex_queue-0.2.2-py3-none-any.whl"
 claude-codex-queue doctor
 claude-codex-queue-web --host 127.0.0.1 --port 8765
 ```
