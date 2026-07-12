@@ -235,7 +235,7 @@ class QueueAppTests(unittest.TestCase):
                 "#!/usr/bin/env python3\n"
                 "import json, os, sys\n"
                 "prompt = sys.stdin.read()\n"
-                "print(json.dumps({'args': sys.argv[1:], 'prompt': prompt, 'api_key': os.environ.get('OPENAI_API_KEY')}))\n",
+                "print(json.dumps({'args': sys.argv[1:], 'prompt': prompt, 'api_key': os.environ.get('OPENAI_API_KEY'), 'codex_home': os.environ.get('CODEX_HOME')}))\n",
                 encoding="utf-8",
             )
             fake.chmod(fake.stat().st_mode | 0o111)
@@ -261,12 +261,24 @@ class QueueAppTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0)
             output = json.loads(result.stdout)
             self.assertIsNone(output["api_key"])
+            self.assertEqual(output["codex_home"], str(paths.codex_home))
             self.assertEqual(output["prompt"], "continua")
             self.assertEqual(output["args"][:4], ["exec", "resume", "--json", "--skip-git-repo-check"])
             self.assertIn("model_reasoning_effort='ultra'", output["args"])
             self.assertIn("sandbox_mode='workspace-write'", output["args"])
             self.assertIn("approval_policy='on-request'", output["args"])
             self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", output["args"])
+
+    def test_codex_subprocess_env_converts_home_for_windows_cli(self) -> None:
+        codex_home = Path("/mnt/c/Users/rikyr/.codex")
+        with patch.dict(
+            app.os.environ,
+            {"CODEX_HOME": "/tmp/wrong-account", "OPENAI_API_KEY": "invalid-external-key"},
+        ):
+            env = app.codex_subprocess_env(codex_home, windows=True)
+
+        self.assertEqual(env["CODEX_HOME"], r"C:\Users\rikyr\.codex")
+        self.assertNotIn("OPENAI_API_KEY", env)
 
     def test_codex_transcript_detects_prompt_and_structured_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Pinned every Codex subprocess to the indexed `CODEX_HOME`, including Windows CLI calls launched from WSL.
+
 ## 0.2.3 - 2026-07-12
 
 - Fixed Windows-to-WSL path conversion in the visual launcher.

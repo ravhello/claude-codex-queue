@@ -432,8 +432,19 @@ def find_codex_executable(paths: Paths, override: str | None = None) -> Path | N
     return None
 
 
-def run_codex_cli_command(codex_exe: Path, arguments: list[str], timeout: int = 15) -> subprocess.CompletedProcess[str]:
-    if codex_exe.suffix.lower() in {".cmd", ".bat", ".exe"} or is_windows_path(str(codex_exe)):
+def codex_executable_is_windows(codex_exe: Path) -> bool:
+    return codex_exe.suffix.lower() in {".cmd", ".bat", ".exe"} or is_windows_path(str(codex_exe))
+
+
+def run_codex_cli_command(
+    codex_exe: Path,
+    arguments: list[str],
+    timeout: int = 15,
+    *,
+    codex_home: Path | None = None,
+) -> subprocess.CompletedProcess[str]:
+    runs_on_windows = codex_executable_is_windows(codex_exe)
+    if runs_on_windows:
         executable = local_to_windows_path(codex_exe)
         command = ["cmd.exe", "/d", "/c", "call", executable, *arguments]
     else:
@@ -445,7 +456,7 @@ def run_codex_cli_command(codex_exe: Path, arguments: list[str], timeout: int = 
         errors="replace",
         capture_output=True,
         timeout=timeout,
-        env=codex_subprocess_env(),
+        env=codex_subprocess_env(codex_home, windows=runs_on_windows),
     )
 
 
@@ -2595,10 +2606,16 @@ def claude_subprocess_env() -> dict[str, str]:
     return env
 
 
-def codex_subprocess_env() -> dict[str, str]:
+def codex_subprocess_env(
+    codex_home: Path | None = None,
+    *,
+    windows: bool = False,
+) -> dict[str, str]:
     env = os.environ.copy()
     for name in CODEX_EXTERNAL_AUTH_ENV_VARS:
         env.pop(name, None)
+    if codex_home is not None:
+        env["CODEX_HOME"] = local_to_windows_path(codex_home) if windows else str(codex_home)
     return env
 
 
@@ -3214,7 +3231,8 @@ def run_codex(
     if not cwd:
         raise SystemExit("La task Codex non ha un cwd salvato; non invio per non cambiare contesto.")
 
-    if codex_exe.suffix.lower() in {".cmd", ".bat", ".exe"} or is_windows_path(str(codex_exe)):
+    runs_on_windows = codex_executable_is_windows(codex_exe)
+    if runs_on_windows:
         if not is_windows_path(cwd):
             raise SystemExit(f"Il CLI Codex Windows non puo' riprendere una task con cwd non Windows: {cwd}")
         executable = local_to_windows_path(codex_exe)
@@ -3226,7 +3244,7 @@ def run_codex(
             errors="replace",
             capture_output=True,
             timeout=timeout,
-            env=codex_subprocess_env(),
+            env=codex_subprocess_env(paths.codex_home, windows=True),
         )
     else:
         proc = subprocess.run(
@@ -3236,7 +3254,7 @@ def run_codex(
             cwd=cwd_for_subprocess(cwd),
             capture_output=True,
             timeout=timeout,
-            env=codex_subprocess_env(),
+            env=codex_subprocess_env(paths.codex_home),
         )
 
     combined = f"{proc.stdout}\n{proc.stderr}"
@@ -3749,8 +3767,8 @@ def command_doctor(args: argparse.Namespace) -> int:
             print(f"Versione:     errore: {exc}")
     if codex_exe:
         try:
-            version_result = run_codex_cli_command(codex_exe, ["--version"])
-            login_result = run_codex_cli_command(codex_exe, ["login", "status"])
+            version_result = run_codex_cli_command(codex_exe, ["--version"], codex_home=paths.codex_home)
+            login_result = run_codex_cli_command(codex_exe, ["login", "status"], codex_home=paths.codex_home)
             print(f"Codex ver.:   {(version_result.stdout or version_result.stderr).strip()}")
             print(f"Codex auth:   {(login_result.stdout or login_result.stderr).strip()}")
         except (OSError, subprocess.SubprocessError) as exc:
