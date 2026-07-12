@@ -1927,6 +1927,24 @@ def suppress_desktop_replica(paths: Paths, record: DesktopSessionRecord) -> None
         save_desktop_sync_state(paths, state)
 
 
+def desktop_tombstoned_session_ids(paths: Paths) -> set[str]:
+    state = load_desktop_sync_state(paths)
+    tombstones: set[str] = set()
+    roots = state.get("roots") if isinstance(state.get("roots"), dict) else {}
+    for root_state in roots.values():
+        if not isinstance(root_state, dict):
+            continue
+        sessions = root_state.get("sessions") if isinstance(root_state.get("sessions"), dict) else {}
+        tombstones.update(
+            session_id
+            for session_id, entry in sessions.items()
+            if isinstance(session_id, str)
+            and isinstance(entry, dict)
+            and entry.get("state") == DESKTOP_STATE_DELETED
+        )
+    return tombstones
+
+
 def sync_claude_desktop_accounts(
     paths: Paths,
     *,
@@ -3187,7 +3205,12 @@ def discover_claude_chats(
         active_only=active_desktop_only,
     )
     transcript_chats = discover_chats(paths.claude_home) + discover_remote_ssh_chats(paths, agent_chats)
-    return annotate_chats_with_accounts(paths, merge_claude_chat_sources(transcript_chats, agent_chats + desktop_chats))
+    tombstones = desktop_tombstoned_session_ids(paths)
+    merged = merge_claude_chat_sources(transcript_chats, agent_chats + desktop_chats)
+    return annotate_chats_with_accounts(
+        paths,
+        [chat for chat in merged if chat.session_id not in tombstones],
+    )
 
 
 def discover_agent_chats(

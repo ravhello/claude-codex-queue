@@ -232,6 +232,8 @@ class WebState:
             sync_accounts=False,
             active_only=False,
         )
+        tombstones = app.desktop_tombstoned_session_ids(self.paths)
+        desktop_chats = [chat for chat in desktop_chats if chat.session_id not in tombstones]
         claude_chats = app.annotate_chats_with_accounts(
             self.paths,
             app.merge_claude_chat_sources([], desktop_chats),

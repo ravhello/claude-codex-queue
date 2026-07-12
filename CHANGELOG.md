@@ -13,7 +13,7 @@
 - Preserved all Claude account replica labels on each deduplicated logical chat.
 - Added Windows login startup, focus refresh and a server-side automatic runner supervisor.
 - Split account sync into fixed-cadence metadata checks and periodic full transcript scans with heartbeat status.
-- Kept Claude bridge session IDs account-local and added reactive deletion/account-switch synchronization.
+- Kept Claude bridge session IDs account-local, hid tombstoned transcripts and added reactive deletion/account-switch synchronization.
 - Prevented deleted Claude chats from being resurrected by surviving transcripts.
 - Removed account/workspace cross-product duplicates and made account state writes atomic in-process.
 - Expanded Codex discovery to database- and rollout-only tasks while filtering deleted ghosts and internal subagents.

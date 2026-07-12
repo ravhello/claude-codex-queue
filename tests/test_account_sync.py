@@ -263,6 +263,11 @@ class AccountSyncTests(unittest.TestCase):
             ]
             self.assertEqual(len(session_entries), 1)
             self.assertEqual(session_entries[0]["state"], app.DESKTOP_STATE_DELETED)
+            visible_ids = {
+                chat.session_id
+                for chat in app.discover_claude_chats(paths, sync_desktop_accounts=False)
+            }
+            self.assertNotIn(session_id, visible_ids)
 
     def test_claude_corrupt_journal_blocks_sync_without_recreating_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
