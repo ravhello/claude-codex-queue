@@ -979,6 +979,7 @@ class QueueAppTests(unittest.TestCase):
                         "effort": "xhigh",
                         "permissionMode": "bypassPermissions",
                         "isArchived": False,
+                        "bridgeSessionIds": ["session_source_account"],
                     }
                 ),
                 encoding="utf-8",
@@ -996,7 +997,19 @@ class QueueAppTests(unittest.TestCase):
 
             self.assertEqual(result["created"], 1)
             self.assertFalse(result["transcripts_scanned"])
-            self.assertTrue((app_root / "claude-code-sessions" / active_account / workspace / "local_shared.json").exists())
+            target_path = app_root / "claude-code-sessions" / active_account / workspace / "local_shared.json"
+            source_path = old_dir / "local_shared.json"
+            self.assertTrue(target_path.exists())
+            self.assertEqual(json.loads(source_path.read_text(encoding="utf-8"))["bridgeSessionIds"], ["session_source_account"])
+            self.assertNotIn("bridgeSessionIds", json.loads(target_path.read_text(encoding="utf-8")))
+
+            contaminated = json.loads(target_path.read_text(encoding="utf-8"))
+            contaminated["bridgeSessionIds"] = ["session_source_account"]
+            target_path.write_text(json.dumps(contaminated), encoding="utf-8")
+            source_path.touch()
+            app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+            self.assertEqual(json.loads(source_path.read_text(encoding="utf-8"))["bridgeSessionIds"], ["session_source_account"])
+            self.assertNotIn("bridgeSessionIds", json.loads(target_path.read_text(encoding="utf-8")))
             self.assertEqual(len([chat for chat in chats if chat.session_id == session]), 1)
             synced = next(chat for chat in chats if chat.session_id == session)
             self.assertEqual(synced.account_status, "active")

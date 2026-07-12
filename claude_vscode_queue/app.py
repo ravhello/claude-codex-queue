@@ -1554,6 +1554,28 @@ def claude_windows_app_roots(paths: Paths) -> list[Path]:
     return [path for path in unique_paths(candidates) if path.exists()]
 
 
+def claude_desktop_change_signature(paths: Paths) -> tuple[str, ...]:
+    entries: list[str] = []
+    for root in claude_windows_app_roots(paths):
+        entries.append(f"{str(root).casefold()}|active={active_desktop_account_uuid(root) or ''}")
+        sessions_root = root / "claude-code-sessions"
+        try:
+            workspace_dirs = [path for path in sessions_root.glob("*/*") if path.is_dir()]
+        except OSError:
+            workspace_dirs = []
+        for workspace_dir in workspace_dirs:
+            try:
+                mtime_ns = workspace_dir.stat().st_mtime_ns
+            except OSError:
+                mtime_ns = 0
+            try:
+                relative = workspace_dir.relative_to(sessions_root).as_posix().casefold()
+            except ValueError:
+                relative = str(workspace_dir).casefold()
+            entries.append(f"{str(root).casefold()}|{relative}|{mtime_ns}")
+    return tuple(sorted(entries))
+
+
 def desktop_config(root: Path) -> dict[str, Any]:
     return load_json_file(root / "config.json")
 
@@ -1660,6 +1682,13 @@ def desktop_record_timestamp_ms(record: DesktopSessionRecord) -> int:
 
 def desktop_record_visible(record: DesktopSessionRecord) -> bool:
     return record.data.get("isArchived") is not True
+
+
+def desktop_record_bridge_session_ids(record: DesktopSessionRecord) -> list[str]:
+    values = record.data.get("bridgeSessionIds")
+    if not isinstance(values, list):
+        return []
+    return [value for value in values if isinstance(value, str) and value]
 
 
 def sanitize_desktop_session_data(data: dict[str, Any]) -> dict[str, Any]:
@@ -2011,6 +2040,26 @@ def sync_claude_desktop_accounts(
             for session_id in sorted(all_session_ids):
                 session_records = [record for record in records_by_session.get(session_id, []) if record.path.exists()]
                 entry = session_state.get(session_id) if isinstance(session_state.get(session_id), dict) else {}
+                stored_bridge_owners = entry.get("bridge_owners") if isinstance(entry.get("bridge_owners"), dict) else {}
+                bridge_owners: dict[str, str] = {
+                    bridge_session_id: account_uuid
+                    for bridge_session_id, account_uuid in stored_bridge_owners.items()
+                    if isinstance(bridge_session_id, str)
+                    and bridge_session_id
+                    and isinstance(account_uuid, str)
+                    and account_uuid
+                }
+                stored_bridge_owner_ids = set(bridge_owners)
+                bridge_owner_keys: dict[str, tuple[int, str]] = {}
+                for record in session_records:
+                    owner_key = (desktop_record_mtime_ns(record), record.account_uuid)
+                    for bridge_session_id in desktop_record_bridge_session_ids(record):
+                        if bridge_session_id in stored_bridge_owner_ids:
+                            continue
+                        if bridge_session_id not in bridge_owner_keys or owner_key < bridge_owner_keys[bridge_session_id]:
+                            bridge_owner_keys[bridge_session_id] = owner_key
+                            bridge_owners[bridge_session_id] = record.account_uuid
+                entry["bridge_owners"] = bridge_owners
                 previous_state = entry.get("state") if entry.get("state") in {
                     DESKTOP_STATE_ACTIVE,
                     DESKTOP_STATE_ARCHIVED,
@@ -2160,6 +2209,15 @@ def sync_claude_desktop_accounts(
                                 primary.path,
                                 archived=canonical_state == DESKTOP_STATE_ARCHIVED,
                             )
+                            account_bridge_ids = [
+                                bridge_session_id
+                                for bridge_session_id in desktop_record_bridge_session_ids(primary)
+                                if bridge_owners.get(bridge_session_id) == account_uuid
+                            ]
+                            if account_bridge_ids:
+                                data["bridgeSessionIds"] = account_bridge_ids
+                            else:
+                                data.pop("bridgeSessionIds", None)
                             if data != primary.data:
                                 backup = backup_desktop_session_file(paths, primary.path)
                                 result["backups"].append(str(backup))
@@ -2181,6 +2239,7 @@ def sync_claude_desktop_accounts(
                             destination,
                             archived=canonical_state == DESKTOP_STATE_ARCHIVED,
                         )
+                        data.pop("bridgeSessionIds", None)
                         write_desktop_session_json(destination, data)
                         created = DesktopSessionRecord(
                             root=root,

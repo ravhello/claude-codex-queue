@@ -64,7 +64,11 @@ Claude Desktop Code sessions are replicated once per known account. Archive and
 unarchive changes propagate in either direction. A missing known replica is
 observed twice before it is treated as a deletion; the app then writes a durable
 tombstone, backs up the remaining metadata and removes the other replicas. A
-surviving Claude transcript cannot recreate a tombstoned chat.
+surviving Claude transcript cannot recreate a tombstoned chat. Remote bridge
+identifiers remain owned by their original Claude account and are never copied
+to another account, preventing failed remote deletes from restoring a local
+replica. Account switches and session-directory changes wake the sync monitor
+immediately instead of waiting for the normal polling deadline.
 
 The chat list keeps one row per logical Claude session and shows every account
 that currently owns a replica. Account identifiers are searchable, so switching

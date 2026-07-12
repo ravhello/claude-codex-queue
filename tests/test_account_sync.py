@@ -1106,6 +1106,58 @@ class AccountSyncTests(unittest.TestCase):
 
             self.assertEqual(scans[:2], [True, False])
 
+    def test_web_account_sync_monitor_wakes_when_desktop_sessions_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            state = web.WebState(paths, None, None)
+            observed = threading.Event()
+            scans = 0
+            signatures = iter([("initial",), ("initial",), ("changed",)])
+
+            def signature(_: app.Paths) -> tuple[str, ...]:
+                return next(signatures, ("changed",))
+
+            def sync_once(*, include_claude_transcripts: bool = True) -> dict[str, object]:
+                nonlocal scans
+                scans += 1
+                if scans >= 2:
+                    observed.set()
+                return {"claude": {"pending_deletions": 0}}
+
+            with (
+                patch.object(app, "claude_desktop_change_signature", side_effect=signature),
+                patch.object(state, "sync_linked_accounts_once", side_effect=sync_once),
+            ):
+                state.start_account_sync_monitor(poll_seconds=60, full_poll_seconds=60)
+                self.assertTrue(observed.wait(timeout=3))
+                state.stop_account_sync_monitor()
+
+            self.assertGreaterEqual(scans, 2)
+
+    def test_web_account_sync_monitor_confirms_deletion_without_full_poll_delay(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            state = web.WebState(paths, None, None)
+            observed = threading.Event()
+            scans = 0
+
+            def sync_once(*, include_claude_transcripts: bool = True) -> dict[str, object]:
+                nonlocal scans
+                scans += 1
+                if scans >= 2:
+                    observed.set()
+                return {"claude": {"pending_deletions": 1 if scans == 1 else 0}}
+
+            with (
+                patch.object(app, "claude_desktop_change_signature", return_value=("stable",)),
+                patch.object(state, "sync_linked_accounts_once", side_effect=sync_once),
+            ):
+                state.start_account_sync_monitor(poll_seconds=60, full_poll_seconds=60)
+                self.assertTrue(observed.wait(timeout=3))
+                state.stop_account_sync_monitor()
+
+            self.assertGreaterEqual(scans, 2)
+
     def test_web_runner_monitor_starts_pending_work_without_browser(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = self._paths(Path(tmp))

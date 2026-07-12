@@ -398,6 +398,23 @@ class WebState:
                 "last_error": self._account_sync_last_error,
             }
 
+    def wait_for_account_sync_trigger(
+        self,
+        wait_seconds: float,
+        signature: tuple[str, ...],
+    ) -> tuple[bool, tuple[str, ...]]:
+        deadline = time.monotonic() + max(0.0, wait_seconds)
+        while not self._account_sync_stop.is_set():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return False, signature
+            if self._account_sync_stop.wait(min(1.0, remaining)):
+                return True, signature
+            current = app.claude_desktop_change_signature(self.paths)
+            if current != signature:
+                return False, current
+        return True, signature
+
     def start_account_sync_monitor(
         self,
         poll_seconds: float = 10.0,
@@ -415,15 +432,20 @@ class WebState:
 
             def worker() -> None:
                 next_full_at = 0.0
+                signature = app.claude_desktop_change_signature(self.paths)
                 while not self._account_sync_stop.is_set():
                     cycle_started = time.monotonic()
                     full_scan = cycle_started >= next_full_at
-                    self.sync_linked_accounts_once(include_claude_transcripts=full_scan)
+                    result = self.sync_linked_accounts_once(include_claude_transcripts=full_scan)
                     if full_scan:
                         next_full_at = cycle_started + self._account_sync_full_poll_seconds
+                    signature = app.claude_desktop_change_signature(self.paths)
                     elapsed = time.monotonic() - cycle_started
-                    wait_seconds = max(0.05, self._account_sync_poll_seconds - elapsed)
-                    if self._account_sync_stop.wait(wait_seconds):
+                    claude_result = result.get("claude") if isinstance(result.get("claude"), dict) else {}
+                    confirmation_due = int(claude_result.get("pending_deletions") or 0) > 0
+                    wait_seconds = 1.0 if confirmation_due else max(0.05, self._account_sync_poll_seconds - elapsed)
+                    stopped, signature = self.wait_for_account_sync_trigger(wait_seconds, signature)
+                    if stopped:
                         break
 
             self._account_sync_thread = threading.Thread(
