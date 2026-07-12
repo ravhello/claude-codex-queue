@@ -5,12 +5,14 @@ import json
 import os
 import sqlite3
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
 
 from claude_vscode_queue import app
+from claude_vscode_queue import web
 
 
 class AccountSyncTests(unittest.TestCase):
@@ -261,6 +263,61 @@ class AccountSyncTests(unittest.TestCase):
             ]
             self.assertEqual(len(session_entries), 1)
             self.assertEqual(session_entries[0]["state"], app.DESKTOP_STATE_DELETED)
+
+    def test_claude_corrupt_journal_blocks_sync_without_recreating_metadata(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, _, account_a, account_b = self._claude_fixture(root)
+            session_id = "32323232-3333-4333-8333-323232323232"
+            self._write_transcript(paths, session_id, root)
+            journal = app.desktop_sync_state_path(paths)
+            journal.parent.mkdir(parents=True, exist_ok=True)
+            corrupt = '{"version": 1, "roots": '
+            journal.write_text(corrupt, encoding="utf-8")
+
+            with self.assertRaises(app.StateFileError):
+                app.sync_claude_desktop_accounts(paths)
+
+            self.assertEqual(journal.read_text(encoding="utf-8"), corrupt)
+            self.assertFalse(list(account_a.glob("*.json")))
+            self.assertFalse(list(account_b.glob("*.json")))
+
+    def test_claude_uncertain_scan_resets_missing_confirmation_counter(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, _, account_a, account_b = self._claude_fixture(root)
+            session_id = "33333333-3434-4343-8343-333333333333"
+            source = self._write_claude_session(account_a / "local_shared.json", session_id, root)
+            app.sync_claude_desktop_accounts(paths)
+            replica = account_b / "local_shared.json"
+
+            source.unlink()
+            first_missing = app.sync_claude_desktop_accounts(paths)
+            self.assertEqual(first_missing["pending_deletions"], 1)
+
+            source.write_text("{corrupt", encoding="utf-8")
+            uncertain = app.sync_claude_desktop_accounts(paths)
+            self.assertEqual(uncertain["deleted"], 0)
+            self.assertTrue(replica.exists())
+            state = app.load_desktop_sync_state(paths)
+            entry = next(
+                root_state["sessions"][session_id]
+                for root_state in state["roots"].values()
+                if session_id in root_state.get("sessions", {})
+            )
+            source_snapshot = entry["replicas"]["account-a/workspace"]
+            self.assertEqual(source_snapshot["missing_scans"], 0)
+            self.assertTrue(source_snapshot["scan_blocked"])
+
+            source.unlink()
+            restarted = app.sync_claude_desktop_accounts(paths)
+            self.assertEqual(restarted["pending_deletions"], 1)
+            self.assertEqual(restarted["deleted"], 0)
+            self.assertTrue(replica.exists())
+
+            confirmed = app.sync_claude_desktop_accounts(paths)
+            self.assertEqual(confirmed["deleted"], 1)
+            self.assertFalse(replica.exists())
 
     def test_claude_delete_from_non_active_account_still_propagates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -628,6 +685,11 @@ class AccountSyncTests(unittest.TestCase):
                 patch.object(app, "find_codex_executable", return_value=root / "codex"),
                 patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
                 patch.object(app, "run_codex_cli_command", side_effect=fake_cli),
+                patch.object(
+                    app,
+                    "active_codex_account",
+                    return_value=app.AccountInfo("codex:destination", "destination", None, None, None, None),
+                ),
             ):
                 result = app.sync_codex_linked_threads(paths)
 
@@ -674,6 +736,35 @@ class AccountSyncTests(unittest.TestCase):
             self.assertEqual(applied["updated"], 1)
             self.assertEqual(commands, [["archive", destination_id]])
 
+    def test_codex_linked_lifecycle_waits_when_active_account_is_unknown(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            source_id = "46464646-aaaa-4aaa-8aaa-464646464646"
+            destination_id = "68686868-bbbb-4bbb-8bbb-686868686868"
+            app.save_account_index(paths, self._linked_index(source_id, destination_id))
+            states = {
+                source_id: app.DESKTOP_STATE_ARCHIVED,
+                destination_id: app.DESKTOP_STATE_ACTIVE,
+            }
+
+            with (
+                patch.object(app, "find_codex_executable", return_value=root / "codex"),
+                patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
+                patch.object(app, "active_codex_account", return_value=None),
+                patch.object(app, "run_codex_cli_command") as cli,
+            ):
+                waiting = app.sync_codex_linked_threads(paths)
+
+            self.assertGreaterEqual(waiting["pending"], 1)
+            cli.assert_not_called()
+            group = app.load_account_index(paths)["codex_links"]["group-1"]
+            self.assertEqual(group["state"], app.DESKTOP_STATE_ARCHIVED)
+            self.assertEqual(
+                group["threads"][destination_id]["pending_state"],
+                app.DESKTOP_STATE_ARCHIVED,
+            )
+
     def test_codex_linked_archive_propagates_from_destination_to_source(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -703,6 +794,11 @@ class AccountSyncTests(unittest.TestCase):
                 patch.object(app, "find_codex_executable", return_value=root / "codex"),
                 patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
                 patch.object(app, "run_codex_cli_command", side_effect=fake_cli),
+                patch.object(
+                    app,
+                    "active_codex_account",
+                    return_value=app.AccountInfo("codex:source", "source", None, None, None, None),
+                ),
             ):
                 result = app.sync_codex_linked_threads(paths)
 
@@ -748,6 +844,11 @@ class AccountSyncTests(unittest.TestCase):
                 patch.object(app, "find_codex_executable", return_value=root / "codex"),
                 patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
                 patch.object(app, "run_codex_cli_command", side_effect=fake_cli),
+                patch.object(
+                    app,
+                    "active_codex_account",
+                    return_value=app.AccountInfo("codex:source", "source", None, None, None, None),
+                ),
             ):
                 result = app.sync_codex_linked_threads(paths)
 
@@ -786,6 +887,11 @@ class AccountSyncTests(unittest.TestCase):
                 patch.object(app, "find_codex_executable", return_value=root / "codex"),
                 patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
                 patch.object(app, "run_codex_cli_command", side_effect=fake_cli),
+                patch.object(
+                    app,
+                    "active_codex_account",
+                    return_value=app.AccountInfo("codex:destination", "destination", None, None, None, None),
+                ),
             ):
                 first = app.sync_codex_linked_threads(paths)
                 commands_after_first = list(commands)
@@ -832,6 +938,11 @@ class AccountSyncTests(unittest.TestCase):
                 patch.object(app, "find_codex_executable", return_value=root / "codex"),
                 patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
                 patch.object(app, "run_codex_cli_command", side_effect=fake_cli),
+                patch.object(
+                    app,
+                    "active_codex_account",
+                    return_value=app.AccountInfo("codex:source", "source", None, None, None, None),
+                ),
             ):
                 first = app.sync_codex_linked_threads(paths)
                 second = app.sync_codex_linked_threads(paths)
@@ -870,6 +981,68 @@ class AccountSyncTests(unittest.TestCase):
             self.assertEqual(group["state"], app.DESKTOP_STATE_ACTIVE)
             self.assertEqual(group["threads"][source_id]["missing_scans"], 0)
             self.assertEqual(group["threads"][destination_id]["missing_scans"], 0)
+
+    def test_corrupt_account_index_blocks_mutation_and_preserves_link_data(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            index_path = app.account_index_path(paths)
+            index_path.parent.mkdir(parents=True, exist_ok=True)
+            corrupt = '{"version": 1, "codex_links": {"group-keep": {}}'
+            index_path.write_text(corrupt, encoding="utf-8")
+            active = app.AccountInfo("codex:active", "active", None, None, None, None)
+
+            with (
+                patch.object(app, "active_codex_account", return_value=active),
+                self.assertRaises(app.StateFileError),
+            ):
+                app.register_active_codex_account(paths)
+
+            self.assertEqual(index_path.read_text(encoding="utf-8"), corrupt)
+
+    def test_web_account_sync_runs_without_browser_refresh_and_invalidates_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            state = web.WebState(paths, None, None)
+            state._chats_cache_at = 123.0
+
+            with (
+                patch.object(app, "sync_claude_desktop_accounts", return_value={"created": 1}),
+                patch.object(
+                    app,
+                    "sync_codex_linked_threads",
+                    return_value={"updated": 0, "deleted": 0, "errors": []},
+                ),
+            ):
+                result = state.sync_linked_accounts_once()
+
+            self.assertTrue(result["changed"])
+            self.assertFalse(result["errors"])
+            self.assertEqual(state._chats_cache_at, 0.0)
+            status = state.account_sync_status()
+            self.assertIsNotNone(status["last_check_at"])
+            self.assertIsNone(status["last_error"])
+
+    def test_web_account_sync_monitor_starts_immediately_and_stops_cleanly(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            state = web.WebState(paths, None, None)
+            observed = threading.Event()
+
+            def codex_sync(_: app.Paths) -> dict[str, object]:
+                observed.set()
+                return {"updated": 0, "deleted": 0, "errors": []}
+
+            with (
+                patch.object(app, "sync_claude_desktop_accounts", return_value={}),
+                patch.object(app, "sync_codex_linked_threads", side_effect=codex_sync),
+            ):
+                started = state.start_account_sync_monitor(poll_seconds=60)
+                self.assertTrue(observed.wait(timeout=2))
+                stopped = state.stop_account_sync_monitor()
+
+            self.assertTrue(started["running"])
+            self.assertFalse(stopped["running"])
 
 
 if __name__ == "__main__":

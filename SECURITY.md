@@ -52,3 +52,9 @@ thread ID. The web UI requires an explicit confirmation. Archive, unarchive and
 delete propagation is performed only for copies linked by this action and only
 through official Codex commands. Deletion is destructive; use disposable tasks
 when testing it.
+
+Lifecycle state files are updated under local process and OS file locks. If an
+account index or Claude sync journal is malformed or unreadable, the app pauses
+that synchronization path rather than overwriting the file or inferring a mass
+deletion. Codex changes targeting another account wait until that account is
+active.

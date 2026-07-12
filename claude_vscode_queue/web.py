@@ -104,6 +104,11 @@ class WebState:
         self._version_cache_at = 0.0
         self._codex_version_cache: str | None = None
         self._codex_version_cache_at = 0.0
+        self._account_sync_stop = threading.Event()
+        self._account_sync_thread: threading.Thread | None = None
+        self._account_sync_poll_seconds = 10.0
+        self._account_sync_last_check_at: str | None = None
+        self._account_sync_last_error: str | None = None
 
     def base_command(self) -> list[str]:
         command = [
@@ -316,6 +321,73 @@ class WebState:
             self._codex_version_cache_at = now
         return version
 
+    def sync_linked_accounts_once(self) -> dict[str, Any]:
+        results: dict[str, Any] = {}
+        errors: list[str] = []
+        changed = False
+        try:
+            claude = app.sync_claude_desktop_accounts(self.paths)
+            results["claude"] = claude
+            changed = any(
+                int(claude.get(key) or 0) > 0
+                for key in ["created", "transcripts_created", "updated", "repaired", "deduped", "archived", "unarchived", "deleted", "removed"]
+            )
+        except Exception as exc:
+            errors.append(f"Claude: {exc}")
+        try:
+            codex = app.sync_codex_linked_threads(self.paths)
+            results["codex"] = codex
+            changed = changed or int(codex.get("updated") or 0) > 0 or int(codex.get("deleted") or 0) > 0
+            errors.extend(str(error) for error in codex.get("errors", []) if error)
+        except Exception as exc:
+            errors.append(f"Codex: {exc}")
+
+        with self.lock:
+            self._account_sync_last_check_at = app.now_utc()
+            self._account_sync_last_error = " | ".join(errors) if errors else None
+            if changed:
+                self._chats_cache_at = 0.0
+        return {**results, "changed": changed, "errors": errors}
+
+    def account_sync_status(self) -> dict[str, Any]:
+        with self.lock:
+            thread = self._account_sync_thread
+            return {
+                "running": bool(thread and thread.is_alive()),
+                "poll_seconds": self._account_sync_poll_seconds,
+                "last_check_at": self._account_sync_last_check_at,
+                "last_error": self._account_sync_last_error,
+            }
+
+    def start_account_sync_monitor(self, poll_seconds: float = 10.0) -> dict[str, Any]:
+        with self.lock:
+            if self._account_sync_thread is not None and self._account_sync_thread.is_alive():
+                return self.account_sync_status()
+            self._account_sync_poll_seconds = max(1.0, float(poll_seconds))
+            self._account_sync_stop.clear()
+
+            def worker() -> None:
+                while not self._account_sync_stop.is_set():
+                    self.sync_linked_accounts_once()
+                    if self._account_sync_stop.wait(self._account_sync_poll_seconds):
+                        break
+
+            self._account_sync_thread = threading.Thread(
+                target=worker,
+                name="claude-codex-account-sync",
+                daemon=True,
+            )
+            self._account_sync_thread.start()
+        return self.account_sync_status()
+
+    def stop_account_sync_monitor(self) -> dict[str, Any]:
+        self._account_sync_stop.set()
+        with self.lock:
+            thread = self._account_sync_thread
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=5)
+        return self.account_sync_status()
+
     def start_runner(self, poll_seconds: int = 60) -> dict[str, Any]:
         with self.lock:
             if self.runner is not None and self.runner.poll() is None:
@@ -497,6 +569,7 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             "active_account": app.account_public_dict(app.active_claude_account(self.state.paths)),
             "active_codex_account": app.account_public_dict(app.active_codex_account(self.state.paths)),
             "account_index": app.account_index_public(self.state.paths),
+            "account_sync": self.state.account_sync_status(),
             "runner": self.state.runner_status(),
         }
 
@@ -1068,6 +1141,10 @@ HTML = r"""<!doctype html>
       const account = data.active_account;
       const codexAccount = data.active_codex_account;
       const accounts = data.account_index && Array.isArray(data.account_index.accounts) ? data.account_index.accounts : [];
+      const accountSync = data.account_sync || {};
+      const syncStatus = accountSync.running
+        ? (accountSync.last_error ? `attiva, errore: ${accountSync.last_error}` : "attiva")
+        : "ferma";
       $("doctor").innerHTML = [
         `<b>Ora PC</b>: ${escapeHtml(formatDateTime(data.local_time || new Date().toISOString()))}`,
         `<b>Versione app</b>: ${escapeHtml(data.app_version || "")}`,
@@ -1076,6 +1153,7 @@ HTML = r"""<!doctype html>
         `<b>Codex</b>: ${escapeHtml(data.codex_version || "non trovato")}`,
         `<b>Account Codex</b>: ${escapeHtml(codexAccount ? codexAccount.label : "non rilevato")}`,
         `<b>Account registrati</b>: ${escapeHtml(String(accounts.length))}`,
+        `<b>Sync account</b>: ${escapeHtml(syncStatus)}${accountSync.last_check_at ? ` · ${escapeHtml(formatDateTime(accountSync.last_check_at))}` : ""}`,
         `<b>Chat Claude</b>: ${data.claude_chat_count || 0}`,
         `<b>Task Codex</b>: ${data.codex_chat_count || 0}`,
         `<b>Accodabili</b>: ${data.queueable_chat_count}`,
@@ -1568,12 +1646,16 @@ def main(argv: list[str] | None = None) -> int:
 
     Handler.state = state
     server = ThreadingHTTPServer((args.host, args.port), Handler)
+    state.start_account_sync_monitor()
     print(f"http://{args.host}:{args.port}/", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         state.stop_runner()
         return 0
+    finally:
+        state.stop_account_sync_monitor()
+        server.server_close()
 
 
 if __name__ == "__main__":

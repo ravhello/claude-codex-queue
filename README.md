@@ -73,6 +73,15 @@ operations use the official `codex archive`, `codex unarchive` and
 `codex delete --force` commands; the project never edits Codex SQLite or rollout
 files directly.
 
+The local web process checks linked Claude and Codex copies every ten seconds,
+so lifecycle synchronization does not depend on an open or foreground browser
+tab. The program itself must still be running.
+
+Codex changes for a copy owned by another ChatGPT account remain pending until
+that account becomes active, then the monitor applies them automatically. State
+updates are locked across local processes; a corrupt or unreadable state file
+stops synchronization instead of being replaced with an empty one.
+
 Here, “ChatGPT account” means the account authenticating Codex. This feature
 does not copy ordinary conversations from chatgpt.com, and the Claude feature
 does not copy ordinary claude.ai chats.

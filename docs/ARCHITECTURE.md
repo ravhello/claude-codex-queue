@@ -53,6 +53,15 @@ IDs in `accounts.json`. Lifecycle propagation is limited to those explicit
 links and delegates to the stable Codex CLI commands. SQLite,
 `session_index.jsonl` and rollout JSONL files remain provider-owned.
 
+The web process owns a ten-second account lifecycle monitor. It invokes both
+provider synchronizers independently of browser polling and invalidates the
+chat cache whenever a replica changes.
+
+Account and Claude sync transactions use a process-local reentrant lock plus an
+OS file lock. Malformed durable state is an error, never an empty-state signal.
+Codex lifecycle work is recorded as pending when the linked copy belongs to an
+inactive account and is retried after that account becomes active.
+
 ### Queue and recovery
 
 Queue state is JSON stored under the detected Windows user profile. Items carry

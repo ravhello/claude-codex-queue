@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import contextlib
 import dataclasses
 import datetime as dt
 import functools
@@ -92,6 +93,87 @@ DESKTOP_STATE_DELETED = "deleted"
 DESKTOP_SYNC_STATE_VERSION = 1
 _DESKTOP_SYNC_LOCK = threading.RLock()
 _ACCOUNT_INDEX_LOCK = threading.RLock()
+_STATE_FILE_LOCKS = threading.local()
+
+
+class StateFileError(ValueError):
+    """A durable state file exists but cannot be trusted."""
+
+
+def _acquire_os_file_lock(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0, os.SEEK_END)
+        if handle.tell() == 0:
+            handle.write(b"\0")
+            handle.flush()
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_LOCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_EX)
+
+
+def _release_os_file_lock(handle: Any) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        handle.seek(0)
+        msvcrt.locking(handle.fileno(), msvcrt.LK_UNLCK, 1)
+        return
+
+    import fcntl
+
+    fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+
+
+@contextlib.contextmanager
+def _state_file_lock(thread_lock: threading.RLock, state_path: Path) -> Any:
+    """Serialize a state transaction across threads and local processes."""
+
+    lock_path = state_path.with_name(f"{state_path.name}.lock")
+    try:
+        key = str(lock_path.resolve())
+    except OSError:
+        key = str(lock_path.absolute())
+
+    with thread_lock:
+        active = getattr(_STATE_FILE_LOCKS, "active", None)
+        if active is None:
+            active = {}
+            _STATE_FILE_LOCKS.active = active
+        entry = active.get(key)
+        if entry is not None:
+            entry["depth"] += 1
+            try:
+                yield
+            finally:
+                entry["depth"] -= 1
+            return
+
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        handle = lock_path.open("a+b")
+        try:
+            _acquire_os_file_lock(handle)
+            active[key] = {"depth": 1, "handle": handle}
+            try:
+                yield
+            finally:
+                del active[key]
+                _release_os_file_lock(handle)
+        finally:
+            handle.close()
+
+
+def account_index_lock(paths: Paths) -> Any:
+    return _state_file_lock(_ACCOUNT_INDEX_LOCK, account_index_path(paths))
+
+
+def desktop_sync_lock(paths: Paths) -> Any:
+    return _state_file_lock(_DESKTOP_SYNC_LOCK, desktop_sync_state_path(paths))
 
 RATE_LIMIT_PATTERNS = [
     r"\brate[- ]?limit(?:ed)?\b",
@@ -554,6 +636,24 @@ def account_index_path(paths: Paths) -> Path:
     return paths.state_dir / ACCOUNT_INDEX_FILE_NAME
 
 
+def load_durable_json_object(path: Path, label: str) -> dict[str, Any] | None:
+    """Read protected state, distinguishing absence from corruption."""
+
+    try:
+        raw = path.read_text(encoding="utf-8-sig")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeError) as exc:
+        raise StateFileError(f"{label} non leggibile ({path}): {exc}") from exc
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise StateFileError(f"{label} corrotto ({path}): {exc}") from exc
+    if not isinstance(data, dict):
+        raise StateFileError(f"{label} corrotto ({path}): la radice JSON deve essere un oggetto.")
+    return data
+
+
 def file_mtime_iso(path: Path) -> str | None:
     try:
         return dt.datetime.fromtimestamp(path.stat().st_mtime, tz=UTC).astimezone().replace(microsecond=0).isoformat()
@@ -645,21 +745,23 @@ def active_codex_account(paths: Paths) -> AccountInfo | None:
 
 
 def load_account_index(paths: Paths) -> dict[str, Any]:
-    data = load_json_file(account_index_path(paths))
-    if not data:
-        return {"version": 1, "accounts": {}, "sessions": {}}
-    data.setdefault("version", 1)
-    data.setdefault("accounts", {})
-    data.setdefault("sessions", {})
-    if not isinstance(data["accounts"], dict):
-        data["accounts"] = {}
-    if not isinstance(data["sessions"], dict):
-        data["sessions"] = {}
-    return data
+    with account_index_lock(paths):
+        data = load_durable_json_object(account_index_path(paths), "Indice account")
+        if data is None:
+            return {"version": 1, "accounts": {}, "sessions": {}}
+        for key in ("accounts", "sessions", "codex_links"):
+            if key in data and not isinstance(data[key], dict):
+                raise StateFileError(
+                    f"Indice account corrotto ({account_index_path(paths)}): '{key}' deve essere un oggetto."
+                )
+        data.setdefault("version", 1)
+        data.setdefault("accounts", {})
+        data.setdefault("sessions", {})
+        return data
 
 
 def save_account_index(paths: Paths, index: dict[str, Any]) -> None:
-    with _ACCOUNT_INDEX_LOCK:
+    with account_index_lock(paths):
         path = account_index_path(paths)
         path.parent.mkdir(parents=True, exist_ok=True)
         payload = json.dumps(index, indent=2, ensure_ascii=False) + "\n"
@@ -719,7 +821,7 @@ def _register_active_account_unlocked(paths: Paths, index: dict[str, Any] | None
 
 
 def register_active_account(paths: Paths, index: dict[str, Any] | None = None) -> AccountInfo | None:
-    with _ACCOUNT_INDEX_LOCK:
+    with account_index_lock(paths):
         return _register_active_account_unlocked(paths, index)
 
 
@@ -748,7 +850,7 @@ def _register_active_codex_account_unlocked(paths: Paths, index: dict[str, Any] 
 
 
 def register_active_codex_account(paths: Paths, index: dict[str, Any] | None = None) -> AccountInfo | None:
-    with _ACCOUNT_INDEX_LOCK:
+    with account_index_lock(paths):
         return _register_active_codex_account_unlocked(paths, index)
 
 
@@ -1228,7 +1330,7 @@ def run_codex_lifecycle(
 
 def sync_codex_linked_threads(paths: Paths) -> dict[str, Any]:
     result: dict[str, Any] = {"groups": 0, "updated": 0, "deleted": 0, "pending": 0, "errors": []}
-    with _ACCOUNT_INDEX_LOCK:
+    with account_index_lock(paths):
         index = load_account_index(paths)
         links = index.get("codex_links") if isinstance(index.get("codex_links"), dict) else {}
         if not links:
@@ -1309,7 +1411,9 @@ def sync_codex_linked_threads(paths: Paths) -> dict[str, Any]:
                         if isinstance(thread_record, dict) and isinstance(thread_record.get("account_key"), str)
                         else None
                     )
-                    if active_account is not None and linked_account_key and linked_account_key != active_account.key:
+                    if linked_account_key and (
+                        active_account is None or linked_account_key != active_account.key
+                    ):
                         thread_record["pending_state"] = canonical
                         result["pending"] += 1
                         changed = True
@@ -1645,23 +1749,29 @@ def desktop_sync_state_path(paths: Paths) -> Path:
 
 
 def load_desktop_sync_state(paths: Paths) -> dict[str, Any]:
-    state = load_json_file(desktop_sync_state_path(paths))
-    if not state:
-        return {"version": DESKTOP_SYNC_STATE_VERSION, "roots": {}}
-    if not isinstance(state.get("roots"), dict):
-        state["roots"] = {}
-    state["version"] = DESKTOP_SYNC_STATE_VERSION
-    return state
+    with desktop_sync_lock(paths):
+        state = load_durable_json_object(desktop_sync_state_path(paths), "Journal sync Claude Desktop")
+        if state is None:
+            return {"version": DESKTOP_SYNC_STATE_VERSION, "roots": {}}
+        if "roots" in state and not isinstance(state["roots"], dict):
+            raise StateFileError(
+                f"Journal sync Claude Desktop corrotto ({desktop_sync_state_path(paths)}): "
+                "'roots' deve essere un oggetto."
+            )
+        state.setdefault("roots", {})
+        state["version"] = DESKTOP_SYNC_STATE_VERSION
+        return state
 
 
 def save_desktop_sync_state(paths: Paths, state: dict[str, Any]) -> None:
-    path = desktop_sync_state_path(paths)
-    path.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
-        handle.write(payload)
-        temp_path = Path(handle.name)
-    temp_path.replace(path)
+    with desktop_sync_lock(paths):
+        path = desktop_sync_state_path(paths)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        payload = json.dumps(state, ensure_ascii=False, indent=2) + "\n"
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+            handle.write(payload)
+            temp_path = Path(handle.name)
+        temp_path.replace(path)
 
 
 def desktop_sync_root_key(root: Path) -> str:
@@ -1764,7 +1874,7 @@ def refresh_desktop_sync_snapshots(paths: Paths, state: dict[str, Any]) -> None:
 
 
 def suppress_desktop_replica(paths: Paths, record: DesktopSessionRecord) -> None:
-    with _DESKTOP_SYNC_LOCK:
+    with desktop_sync_lock(paths):
         state = load_desktop_sync_state(paths)
         root_state = desktop_sync_root_state(state, record.root)
         sessions = root_state["sessions"]
@@ -1803,7 +1913,7 @@ def sync_claude_desktop_accounts(paths: Paths) -> dict[str, Any]:
         "backups": [],
     }
 
-    with _DESKTOP_SYNC_LOCK:
+    with desktop_sync_lock(paths):
         state = load_desktop_sync_state(paths)
         transcript_chats = {
             chat.session_id: chat
@@ -1925,12 +2035,15 @@ def sync_claude_desktop_accounts(paths: Paths) -> dict[str, Any]:
                             missing_scans = int(previous.get("missing_scans") or 0) + 1
                             previous["missing_scans"] = missing_scans
                             previous["present"] = False
+                            previous["scan_blocked"] = False
                             if missing_scans >= 2:
                                 events.append((time.time_ns(), 3, DESKTOP_STATE_DELETED, None))
                             else:
                                 result["pending_deletions"] += 1
                         else:
                             # Missing account/workspace or an unreadable/corrupt JSON is not a delete event.
+                            previous["missing_scans"] = 0
+                            previous["present"] = False
                             previous["scan_blocked"] = True
 
                     # A new external replica can carry a newer archive/unarchive decision.
@@ -2266,7 +2379,7 @@ def transfer_codex_chat_to_active_account(paths: Paths, chat: Chat) -> dict[str,
     if codex_exe is None:
         raise ValueError("CLI Codex non trovato: non posso creare una copia supportata della task.")
 
-    with _ACCOUNT_INDEX_LOCK:
+    with account_index_lock(paths):
         index = load_account_index(paths)
         register_active_codex_account(paths, index)
         links = index.setdefault("codex_links", {})
@@ -2886,7 +2999,7 @@ def _annotate_chats_with_accounts_unlocked(paths: Paths, chats: list[Chat]) -> l
 
 
 def annotate_chats_with_accounts(paths: Paths, chats: list[Chat]) -> list[Chat]:
-    with _ACCOUNT_INDEX_LOCK:
+    with account_index_lock(paths):
         return _annotate_chats_with_accounts_unlocked(paths, chats)
 
 
@@ -2955,7 +3068,7 @@ def _annotate_codex_chats_with_accounts_unlocked(paths: Paths, chats: list[Chat]
 
 
 def annotate_codex_chats_with_accounts(paths: Paths, chats: list[Chat]) -> list[Chat]:
-    with _ACCOUNT_INDEX_LOCK:
+    with account_index_lock(paths):
         return _annotate_codex_chats_with_accounts_unlocked(paths, chats)
 
 
@@ -3014,7 +3127,7 @@ def _remember_chat_account_unlocked(paths: Paths, chat: Chat) -> Chat:
 
 
 def remember_chat_account(paths: Paths, chat: Chat) -> Chat:
-    with _ACCOUNT_INDEX_LOCK:
+    with account_index_lock(paths):
         return _remember_chat_account_unlocked(paths, chat)
 
 
