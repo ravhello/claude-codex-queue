@@ -407,6 +407,44 @@ def find_claude_executable(paths: Paths, override: str | None = None) -> Path | 
     return candidates[-1]
 
 
+def claude_item_is_desktop(item: dict[str, Any]) -> bool:
+    return item.get("source_key") == "claude_windows_app" or item.get("source") == "Claude Windows App"
+
+
+def claude_desktop_session_version(paths: Paths, session_id: str) -> str | None:
+    try:
+        session_files = list((paths.claude_home / "sessions").glob("*.json"))
+    except OSError:
+        return None
+    for session_file in session_files:
+        data = load_json_file(session_file)
+        if data.get("sessionId") != session_id:
+            continue
+        version = data.get("version")
+        return version if isinstance(version, str) and version else None
+    return None
+
+
+def find_claude_desktop_executable(paths: Paths, item: dict[str, Any]) -> Path | None:
+    if not claude_item_is_desktop(item):
+        return None
+    root = paths.windows_home / "AppData" / "Roaming" / "Claude" / "claude-code"
+    session_id = item.get("session_id")
+    version = claude_desktop_session_version(paths, session_id) if isinstance(session_id, str) else None
+    if version:
+        exact = root / version / "claude.exe"
+        if exact.exists():
+            return exact
+    try:
+        candidates = [candidate for candidate in root.glob("*/claude.exe") if candidate.is_file()]
+    except OSError:
+        return None
+    if not candidates:
+        return None
+    candidates.sort(key=lambda candidate: candidate.stat().st_mtime_ns, reverse=True)
+    return candidates[0]
+
+
 def find_codex_executable(paths: Paths, override: str | None = None) -> Path | None:
     env_override = override or os.environ.get("CODEX_EXE")
     if env_override:
@@ -2892,6 +2930,12 @@ def parse_reset_time(text: str, now: dt.datetime | None = None) -> dt.datetime |
     return None
 
 
+def claude_item_uses_ide(item: dict[str, Any], use_ide: bool) -> bool:
+    if not use_ide:
+        return False
+    return not claude_item_is_desktop(item)
+
+
 def build_claude_arguments(item: dict[str, Any], use_ide: bool) -> list[str]:
     command = ["-p", "--output-format", "text"]
     effective = item.get("fingerprint", {}).get("effective", {})
@@ -2914,7 +2958,7 @@ def build_claude_arguments(item: dict[str, Any], use_ide: bool) -> list[str]:
             command.extend(["--effort", effort])
         if isinstance(permission_mode, str) and permission_mode in VALID_PERMISSION_MODES:
             command.extend(["--permission-mode", permission_mode])
-    if use_ide:
+    if claude_item_uses_ide(item, use_ide):
         command.append("--ide")
     command.extend(["--resume", item["session_id"]])
     return command
@@ -3100,6 +3144,18 @@ import os
 import subprocess
 import sys
 
+
+def write_output(stream, value):
+    if not value:
+        return
+    raw = value.encode("utf-8", "replace") if isinstance(value, str) else value
+    buffer = getattr(stream, "buffer", None)
+    if buffer is not None:
+        buffer.write(raw)
+        buffer.flush()
+    else:
+        stream.write(raw.decode("utf-8", "replace"))
+
 payload_path = sys.argv[1]
 with open(payload_path, "r", encoding="utf-8") as handle:
     payload = json.load(handle)
@@ -3111,21 +3167,16 @@ try:
     proc = subprocess.run(
         [payload["exe"], *payload["args"], payload["prompt"]],
         cwd=payload["cwd"],
-        text=True,
-        encoding="utf-8",
-        errors="replace",
         capture_output=True,
         timeout=payload["timeout"],
     )
 except subprocess.TimeoutExpired as exc:
-    if exc.stdout:
-        sys.stdout.write(exc.stdout if isinstance(exc.stdout, str) else exc.stdout.decode("utf-8", "replace"))
-    if exc.stderr:
-        sys.stderr.write(exc.stderr if isinstance(exc.stderr, str) else exc.stderr.decode("utf-8", "replace"))
+    write_output(sys.stdout, exc.stdout)
+    write_output(sys.stderr, exc.stderr)
     raise SystemExit(124)
 
-sys.stdout.write(proc.stdout or "")
-sys.stderr.write(proc.stderr or "")
+write_output(sys.stdout, proc.stdout)
+write_output(sys.stderr, proc.stderr)
 raise SystemExit(proc.returncode)
 """
 
@@ -3290,7 +3341,8 @@ def run_agent(
         return run_codex(paths, codex_exe, item, timeout)
     if claude_exe is None:
         raise SystemExit("Claude Code executable non trovato. Esegui `doctor` per dettagli.")
-    return run_claude(paths, claude_exe, item, timeout, use_ide)
+    source_executable = find_claude_desktop_executable(paths, item) or claude_exe
+    return run_claude(paths, source_executable, item, timeout, use_ide)
 
 
 def print_agent_dry_run_details(
@@ -3311,7 +3363,8 @@ def print_agent_dry_run_details(
         return
     if claude_exe is None:
         raise SystemExit("Claude Code executable non trovato.")
-    print_dry_run_details(paths, claude_exe, item, use_ide, prompt)
+    source_executable = find_claude_desktop_executable(paths, item) or claude_exe
+    print_dry_run_details(paths, source_executable, item, use_ide, prompt)
 
 
 def write_run_log(paths: Paths, item: dict[str, Any], result: ClaudeRunResult) -> str:
@@ -3585,6 +3638,8 @@ def recovery_as_item(recovery: dict[str, Any]) -> dict[str, Any]:
         "last_log": recovery.get("last_log"),
         "fingerprint": recovery.get("fingerprint", {}),
         "provider": recovery.get("provider", PROVIDER_CLAUDE),
+        "source": recovery.get("source"),
+        "source_key": recovery.get("source_key"),
         "jsonl_path": recovery.get("jsonl_path"),
         "remote_kind": recovery.get("remote_kind"),
         "remote_host": recovery.get("remote_host"),
@@ -3610,6 +3665,8 @@ def auto_continue_as_item(auto_continue: dict[str, Any]) -> dict[str, Any]:
         "last_log": auto_continue.get("last_log"),
         "fingerprint": auto_continue.get("fingerprint", {}),
         "provider": auto_continue.get("provider", PROVIDER_CLAUDE),
+        "source": auto_continue.get("source"),
+        "source_key": auto_continue.get("source_key"),
         "jsonl_path": auto_continue.get("jsonl_path"),
         "allow_cwd_fallback": bool(auto_continue.get("allow_cwd_fallback")),
         "cwd_fallback": auto_continue.get("cwd_fallback"),
@@ -3656,6 +3713,8 @@ def set_recovery_after_limit(
         "cwd": item.get("cwd"),
         "fingerprint": item.get("fingerprint", {}),
         "provider": item.get("provider", PROVIDER_CLAUDE),
+        "source": item.get("source"),
+        "source_key": item.get("source_key"),
         "jsonl_path": item.get("jsonl_path"),
         "attempts": 0,
         "not_before": not_before,
@@ -3735,6 +3794,8 @@ def find_chat_for_item(chats: list[Chat], item: dict[str, Any]) -> Chat | None:
 def chat_execution_fields(chat: Chat) -> dict[str, Any]:
     return {
         "provider": chat.provider,
+        "source": chat.source,
+        "source_key": chat.source_key,
         "jsonl_path": str(chat.jsonl_path),
         "remote_kind": chat.remote_kind,
         "remote_host": chat.remote_host,

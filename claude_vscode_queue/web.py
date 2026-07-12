@@ -1341,6 +1341,8 @@ HTML = r"""<!doctype html>
       const autoDetails = auto ? [
         `Stato: ${escapeHtml(auto.status || "spento")}`,
         `Runner: ${runner.running ? `attivo${runner.pid ? ` #${escapeHtml(runner.pid)}` : ""}` : "fermo"}`,
+        `Origine: ${escapeHtml(auto.source || (autoIsCodex ? "Codex App" : "Claude Code"))}`,
+        !autoIsCodex && auto.source_key === "claude_windows_app" ? "Integrazione IDE: non usata" : "",
         `Modello: ${escapeHtml(auto.model_override || effective.model || "chat")}`,
         `Effort: ${escapeHtml(auto.effort_level_override || effective.effortLevel || "chat")}`,
         autoIsCodex

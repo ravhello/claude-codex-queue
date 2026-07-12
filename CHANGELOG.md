@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Fixed Claude Desktop recovery routing so it omits `--ide`, prefers the app CLI, and preserves UTF-8 output on Windows.
 - Pinned every Codex subprocess to the indexed `CODEX_HOME`, including Windows CLI calls launched from WSL.
 
 ## 0.2.3 - 2026-07-12

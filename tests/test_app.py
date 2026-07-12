@@ -1489,6 +1489,7 @@ class QueueAppTests(unittest.TestCase):
     def test_build_command_preserves_effective_settings(self) -> None:
         item = {
             "session_id": "abc",
+            "source_key": "claude_code_vscode",
             "fingerprint": {
                 "effective": {
                     "model": "opus",
@@ -1508,6 +1509,60 @@ class QueueAppTests(unittest.TestCase):
         self.assertIn("--permission-mode", command)
         self.assertIn("bypassPermissions", command)
         self.assertIn("--ide", command)
+
+    def test_build_command_does_not_attach_ide_to_claude_desktop(self) -> None:
+        item = {
+            "session_id": "abc",
+            "source": "Claude Windows App",
+            "source_key": "claude_windows_app",
+            "fingerprint": {"effective": {"model": "opus", "effortLevel": "xhigh"}},
+        }
+
+        command = app.build_claude_command(Path("/bin/claude"), item, use_ide=True)
+
+        self.assertNotIn("--ide", command)
+        self.assertEqual(command[-2:], ["--resume", "abc"])
+
+    def test_auto_continue_item_preserves_claude_desktop_source(self) -> None:
+        item = app.auto_continue_as_item(
+            {
+                "session_id": "desktop-session",
+                "source": "Claude Windows App",
+                "source_key": "claude_windows_app",
+            }
+        )
+
+        self.assertEqual(item["source_key"], "claude_windows_app")
+        self.assertFalse(app.claude_item_uses_ide(item, True))
+
+    def test_claude_desktop_uses_its_versioned_app_executable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = app.Paths(
+                windows_home=root,
+                claude_home=root / ".claude",
+                state_dir=root / ".state",
+                queue_file=root / ".state" / "queue.json",
+                log_dir=root / ".state" / "logs",
+            )
+            sessions = paths.claude_home / "sessions"
+            sessions.mkdir(parents=True)
+            (sessions / "9308.json").write_text(
+                json.dumps({"sessionId": "desktop-session", "version": "2.1.205", "entrypoint": "claude-desktop"}),
+                encoding="utf-8",
+            )
+            executable = root / "AppData" / "Roaming" / "Claude" / "claude-code" / "2.1.205" / "claude.exe"
+            executable.parent.mkdir(parents=True)
+            executable.write_bytes(b"")
+            item = {
+                "session_id": "desktop-session",
+                "source": "Claude Windows App",
+                "source_key": "claude_windows_app",
+            }
+
+            selected = app.find_claude_desktop_executable(paths, item)
+
+            self.assertEqual(selected, executable)
 
     def test_build_command_uses_permission_override(self) -> None:
         item = {
@@ -1589,6 +1644,46 @@ class QueueAppTests(unittest.TestCase):
         self.assertEqual(captured_payload["prompt"], "continua")
         self.assertIn("--resume", captured_payload["args"])
         self.assertIn("--ide", captured_payload["args"])
+
+    def test_windows_claude_launcher_preserves_utf8_output_under_cp1252(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            launcher = root / "launch_claude.py"
+            child = root / "unicode_child.py"
+            payload = root / "payload.json"
+            launcher.write_text(app.WINDOWS_CLAUDE_LAUNCHER, encoding="utf-8")
+            child.write_text(
+                "import sys\n"
+                "sys.stdout.buffer.write('done ✅'.encode('utf-8'))\n"
+                "sys.stderr.buffer.write('warning ⚠'.encode('utf-8'))\n",
+                encoding="utf-8",
+            )
+            payload.write_text(
+                json.dumps(
+                    {
+                        "exe": app.sys.executable,
+                        "args": [str(child)],
+                        "prompt": "continua",
+                        "cwd": str(root),
+                        "timeout": 10,
+                        "clear_env": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            env = app.os.environ.copy()
+            env["PYTHONIOENCODING"] = "cp1252"
+
+            result = app.subprocess.run(
+                [app.sys.executable, str(launcher), str(payload)],
+                capture_output=True,
+                timeout=15,
+                env=env,
+            )
+
+            self.assertEqual(result.returncode, 0)
+            self.assertEqual(result.stdout.decode("utf-8"), "done ✅")
+            self.assertEqual(result.stderr.decode("utf-8"), "warning ⚠")
 
     def test_remote_settings_fingerprint_reads_remote_effective_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
