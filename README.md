@@ -12,6 +12,7 @@
 <p align="center">
   <a href="https://github.com/ravhello/claude-codex-queue/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/ravhello/claude-codex-queue/actions/workflows/ci.yml/badge.svg"></a>
   <a href="https://github.com/ravhello/claude-codex-queue/releases/latest"><img alt="Latest release" src="https://img.shields.io/github/v/release/ravhello/claude-codex-queue"></a>
+  <a href="https://pypi.org/project/claude-codex-queue/"><img alt="PyPI" src="https://img.shields.io/pypi/v/claude-codex-queue"></a>
   <img alt="Python 3.10+" src="https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white">
   <a href="https://github.com/ravhello/claude-codex-queue/blob/main/LICENSE"><img alt="MIT license" src="https://img.shields.io/github/license/ravhello/claude-codex-queue"></a>
   <a href="https://github.com/ravhello/claude-codex-queue/stargazers"><img alt="GitHub stars" src="https://img.shields.io/github/stars/ravhello/claude-codex-queue?style=social"></a>
@@ -83,7 +84,7 @@ To run it without installing a shortcut:
 Run this inside WSL:
 
 ```bash
-python3 -m pip install "https://github.com/ravhello/claude-codex-queue/releases/download/v0.2.2/claude_codex_queue-0.2.2-py3-none-any.whl"
+python3 -m pip install claude-codex-queue
 claude-codex-queue doctor
 claude-codex-queue-web --host 127.0.0.1 --port 8765
 ```
@@ -170,7 +171,7 @@ reproducible defects belong in
 
 ## Project status
 
-Current release: **v0.2.2**. The project is alpha software tested on Windows/WSL
+Current release: **v0.2.3**. The project is alpha software tested on Windows/WSL
 with local Claude Code and Codex App workflows. Upstream desktop metadata is not
 a public compatibility contract and may change between provider releases.
 

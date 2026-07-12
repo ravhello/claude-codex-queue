@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+## 0.2.3 - 2026-07-12
+
+- Fixed Windows-to-WSL path conversion in the visual launcher.
+- Published the package through PyPI Trusted Publishing.
+
 ## 0.2.2 - 2026-07-12
 
 - Added CI across supported Python versions plus Windows packaging smoke tests.
