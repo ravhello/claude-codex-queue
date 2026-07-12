@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## 0.2.2 - 2026-07-12
+
 - Added CI across supported Python versions plus Windows packaging smoke tests.
 - Added automated GitHub release assets and a manual PyPI Trusted Publishing workflow.
 - Added an anonymized dashboard screenshot, social preview, and faster Quick Start documentation.

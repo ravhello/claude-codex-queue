@@ -22,7 +22,7 @@ ICON_OUT = ROOT / "assets" / "claude-codex-queue-128.png"
 RUNNER = {
     "running": True,
     "pid": 4242,
-    "app_version": "0.2.1",
+    "app_version": "0.2.2",
     "log_tail": (
         "20:14:03  Runner ready\n"
         "20:14:04  Usage limit detected for Claude session\n"
@@ -31,7 +31,7 @@ RUNNER = {
 }
 
 DOCTOR = {
-    "app_version": "0.2.1",
+    "app_version": "0.2.2",
     "local_time": "2026-07-11T20:14:04+02:00",
     "claude_version": "2.1.206 (Claude Code)",
     "codex_version": "codex-cli 0.144.1",

@@ -83,7 +83,7 @@ To run it without installing a shortcut:
 Run this inside WSL:
 
 ```bash
-python3 -m pip install "https://github.com/ravhello/claude-codex-queue/releases/download/v0.2.1/claude_codex_queue-0.2.1-py3-none-any.whl"
+python3 -m pip install claude-codex-queue
 claude-codex-queue doctor
 claude-codex-queue-web --host 127.0.0.1 --port 8765
 ```
@@ -170,7 +170,7 @@ reproducible defects belong in
 
 ## Project status
 
-Current release: **v0.2.1**. The project is alpha software tested on Windows/WSL
+Current release: **v0.2.2**. The project is alpha software tested on Windows/WSL
 with local Claude Code and Codex App workflows. Upstream desktop metadata is not
 a public compatibility contract and may change between provider releases.
 
