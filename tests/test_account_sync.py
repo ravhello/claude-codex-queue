@@ -1021,7 +1021,49 @@ class AccountSyncTests(unittest.TestCase):
             self.assertEqual(state._chats_cache_at, 0.0)
             status = state.account_sync_status()
             self.assertIsNotNone(status["last_check_at"])
+            self.assertIsNotNone(status["last_full_check_at"])
+            self.assertIsNotNone(status["last_duration_seconds"])
+            self.assertFalse(status["in_progress"])
             self.assertIsNone(status["last_error"])
+
+    def test_web_fast_account_sync_skips_transcript_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            state = web.WebState(paths, None, None)
+
+            with (
+                patch.object(app, "sync_claude_desktop_accounts", return_value={}) as claude_sync,
+                patch.object(
+                    app,
+                    "sync_codex_linked_threads",
+                    return_value={"updated": 0, "deleted": 0, "errors": []},
+                ),
+            ):
+                result = state.sync_linked_accounts_once(include_claude_transcripts=False)
+
+            claude_sync.assert_called_once_with(paths, include_transcripts=False)
+            self.assertFalse(result["full_scan"])
+            self.assertIsNone(state.account_sync_status()["last_full_check_at"])
+
+    def test_web_chat_refresh_does_not_start_a_second_account_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            state = web.WebState(paths, None, None)
+            observed = threading.Event()
+
+            def discover(*_: object, **__: object) -> list[app.Chat]:
+                observed.set()
+                return []
+
+            with patch.object(app, "discover_agent_chats", side_effect=discover) as discovery:
+                state.refresh_chats_background()
+                self.assertTrue(observed.wait(timeout=2))
+
+            discovery.assert_called_once_with(
+                paths,
+                sync_desktop_accounts=False,
+                active_desktop_only=False,
+            )
 
     def test_web_account_sync_monitor_starts_immediately_and_stops_cleanly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1043,6 +1085,26 @@ class AccountSyncTests(unittest.TestCase):
 
             self.assertTrue(started["running"])
             self.assertFalse(stopped["running"])
+
+    def test_web_account_sync_monitor_alternates_full_and_fast_cycles(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            state = web.WebState(paths, None, None)
+            observed = threading.Event()
+            scans: list[bool] = []
+
+            def sync_once(*, include_claude_transcripts: bool = True) -> dict[str, object]:
+                scans.append(include_claude_transcripts)
+                if len(scans) >= 2:
+                    observed.set()
+                return {"full_scan": include_claude_transcripts}
+
+            with patch.object(state, "sync_linked_accounts_once", side_effect=sync_once):
+                state.start_account_sync_monitor(poll_seconds=1, full_poll_seconds=60)
+                self.assertTrue(observed.wait(timeout=3))
+                state.stop_account_sync_monitor()
+
+            self.assertEqual(scans[:2], [True, False])
 
     def test_web_runner_monitor_starts_pending_work_without_browser(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

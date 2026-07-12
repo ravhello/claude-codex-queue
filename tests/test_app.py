@@ -991,10 +991,11 @@ class QueueAppTests(unittest.TestCase):
                 log_dir=root / ".state" / "logs",
             )
 
-            result = app.sync_claude_desktop_accounts(paths)
+            result = app.sync_claude_desktop_accounts(paths, include_transcripts=False)
             chats = app.discover_claude_chats(paths)
 
             self.assertEqual(result["created"], 1)
+            self.assertFalse(result["transcripts_scanned"])
             self.assertTrue((app_root / "claude-code-sessions" / active_account / workspace / "local_shared.json").exists())
             self.assertEqual(len([chat for chat in chats if chat.session_id == session]), 1)
             synced = next(chat for chat in chats if chat.session_id == session)

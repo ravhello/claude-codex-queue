@@ -270,6 +270,7 @@ class DesktopSessionRecord:
     workspace_uuid: str
     path: Path
     data: dict[str, Any]
+    mtime_ns: int
     active_account_uuid: str | None
 
 
@@ -1614,6 +1615,10 @@ def desktop_session_records(paths: Paths, active_only: bool = False) -> list[Des
             data = load_json_file(json_path)
             if not data:
                 continue
+            try:
+                mtime_ns = json_path.stat().st_mtime_ns
+            except OSError:
+                mtime_ns = 0
             records.append(
                 DesktopSessionRecord(
                     root=root,
@@ -1622,6 +1627,7 @@ def desktop_session_records(paths: Paths, active_only: bool = False) -> list[Des
                     workspace_uuid=rel.parts[1],
                     path=json_path,
                     data=data,
+                    mtime_ns=mtime_ns,
                     active_account_uuid=active_account_uuid,
                 )
             )
@@ -1796,10 +1802,7 @@ def desktop_record_state(record: DesktopSessionRecord) -> str:
 
 
 def desktop_record_mtime_ns(record: DesktopSessionRecord) -> int:
-    try:
-        return record.path.stat().st_mtime_ns
-    except OSError:
-        return 0
+    return record.mtime_ns
 
 
 def desktop_record_snapshot(record: DesktopSessionRecord) -> dict[str, Any]:
@@ -1895,7 +1898,11 @@ def suppress_desktop_replica(paths: Paths, record: DesktopSessionRecord) -> None
         save_desktop_sync_state(paths, state)
 
 
-def sync_claude_desktop_accounts(paths: Paths) -> dict[str, Any]:
+def sync_claude_desktop_accounts(
+    paths: Paths,
+    *,
+    include_transcripts: bool = True,
+) -> dict[str, Any]:
     result: dict[str, Any] = {
         "roots": 0,
         "accounts": 0,
@@ -1912,15 +1919,20 @@ def sync_claude_desktop_accounts(paths: Paths) -> dict[str, Any]:
         "pending_deletions": 0,
         "tombstone_skips": 0,
         "backups": [],
+        "transcripts_scanned": include_transcripts,
     }
 
     with desktop_sync_lock(paths):
         state = load_desktop_sync_state(paths)
-        transcript_chats = {
-            chat.session_id: chat
-            for chat in discover_chats(paths.claude_home)
-            if chat.session_id and chat.cwd and chat.can_queue
-        }
+        transcript_chats = (
+            {
+                chat.session_id: chat
+                for chat in discover_chats(paths.claude_home)
+                if chat.session_id and chat.cwd and chat.can_queue
+            }
+            if include_transcripts
+            else {}
+        )
         records = desktop_session_records(paths)
         for record in records:
             sanitized = sanitize_desktop_session_data(record.data)
@@ -2177,6 +2189,7 @@ def sync_claude_desktop_accounts(paths: Paths) -> dict[str, Any]:
                             workspace_uuid=workspace_uuid,
                             path=destination,
                             data=data,
+                            mtime_ns=time.time_ns(),
                             active_account_uuid=active_account_uuid,
                         )
                         session_records.append(created)

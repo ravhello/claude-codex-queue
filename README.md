@@ -77,9 +77,11 @@ operations use the official `codex archive`, `codex unarchive` and
 `codex delete --force` commands; the project never edits Codex SQLite or rollout
 files directly.
 
-The local web process checks linked Claude and Codex copies every ten seconds,
-so lifecycle synchronization does not depend on an open or foreground browser
-tab. The program itself must still be running.
+The local web process runs a fast linked-account check on a ten-second cadence
+and a full Claude transcript discovery every minute. Slow transcript discovery
+does not add another fixed delay before the next metadata check, so lifecycle
+synchronization does not depend on an open or foreground browser tab. The
+Windows Startup entry keeps the program running after login.
 
 Codex changes for a copy owned by another ChatGPT account remain pending until
 that account becomes active, then the monitor applies them automatically. State

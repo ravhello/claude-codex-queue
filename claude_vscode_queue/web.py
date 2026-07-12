@@ -108,7 +108,11 @@ class WebState:
         self._account_sync_stop = threading.Event()
         self._account_sync_thread: threading.Thread | None = None
         self._account_sync_poll_seconds = 10.0
+        self._account_sync_full_poll_seconds = 60.0
         self._account_sync_last_check_at: str | None = None
+        self._account_sync_last_full_check_at: str | None = None
+        self._account_sync_cycle_started_at: str | None = None
+        self._account_sync_last_duration_seconds: float | None = None
         self._account_sync_last_error: str | None = None
         self._runner_monitor_stop = threading.Event()
         self._runner_monitor_thread: threading.Thread | None = None
@@ -250,7 +254,7 @@ class WebState:
             try:
                 chats = app.discover_agent_chats(
                     self.paths,
-                    sync_desktop_accounts=True,
+                    sync_desktop_accounts=False,
                     active_desktop_only=False,
                 )
             except Exception:
@@ -336,12 +340,18 @@ class WebState:
             self._codex_version_cache_at = now
         return version
 
-    def sync_linked_accounts_once(self) -> dict[str, Any]:
+    def sync_linked_accounts_once(self, *, include_claude_transcripts: bool = True) -> dict[str, Any]:
+        started = time.monotonic()
+        with self.lock:
+            self._account_sync_cycle_started_at = app.now_utc()
         results: dict[str, Any] = {}
         errors: list[str] = []
         changed = False
         try:
-            claude = app.sync_claude_desktop_accounts(self.paths)
+            claude = app.sync_claude_desktop_accounts(
+                self.paths,
+                include_transcripts=include_claude_transcripts,
+            )
             results["claude"] = claude
             changed = any(
                 int(claude.get(key) or 0) > 0
@@ -359,10 +369,19 @@ class WebState:
 
         with self.lock:
             self._account_sync_last_check_at = app.now_utc()
+            if include_claude_transcripts:
+                self._account_sync_last_full_check_at = self._account_sync_last_check_at
+            self._account_sync_cycle_started_at = None
+            self._account_sync_last_duration_seconds = round(time.monotonic() - started, 3)
             self._account_sync_last_error = " | ".join(errors) if errors else None
             if changed:
                 self._chats_cache_at = 0.0
-        return {**results, "changed": changed, "errors": errors}
+        return {
+            **results,
+            "changed": changed,
+            "errors": errors,
+            "full_scan": include_claude_transcripts,
+        }
 
     def account_sync_status(self) -> dict[str, Any]:
         with self.lock:
@@ -370,21 +389,41 @@ class WebState:
             return {
                 "running": bool(thread and thread.is_alive()),
                 "poll_seconds": self._account_sync_poll_seconds,
+                "full_poll_seconds": self._account_sync_full_poll_seconds,
                 "last_check_at": self._account_sync_last_check_at,
+                "last_full_check_at": self._account_sync_last_full_check_at,
+                "cycle_started_at": self._account_sync_cycle_started_at,
+                "in_progress": self._account_sync_cycle_started_at is not None,
+                "last_duration_seconds": self._account_sync_last_duration_seconds,
                 "last_error": self._account_sync_last_error,
             }
 
-    def start_account_sync_monitor(self, poll_seconds: float = 10.0) -> dict[str, Any]:
+    def start_account_sync_monitor(
+        self,
+        poll_seconds: float = 10.0,
+        full_poll_seconds: float = 60.0,
+    ) -> dict[str, Any]:
         with self.lock:
             if self._account_sync_thread is not None and self._account_sync_thread.is_alive():
                 return self.account_sync_status()
             self._account_sync_poll_seconds = max(1.0, float(poll_seconds))
+            self._account_sync_full_poll_seconds = max(
+                self._account_sync_poll_seconds,
+                float(full_poll_seconds),
+            )
             self._account_sync_stop.clear()
 
             def worker() -> None:
+                next_full_at = 0.0
                 while not self._account_sync_stop.is_set():
-                    self.sync_linked_accounts_once()
-                    if self._account_sync_stop.wait(self._account_sync_poll_seconds):
+                    cycle_started = time.monotonic()
+                    full_scan = cycle_started >= next_full_at
+                    self.sync_linked_accounts_once(include_claude_transcripts=full_scan)
+                    if full_scan:
+                        next_full_at = cycle_started + self._account_sync_full_poll_seconds
+                    elapsed = time.monotonic() - cycle_started
+                    wait_seconds = max(0.05, self._account_sync_poll_seconds - elapsed)
+                    if self._account_sync_stop.wait(wait_seconds):
                         break
 
             self._account_sync_thread = threading.Thread(
@@ -1219,7 +1258,9 @@ HTML = r"""<!doctype html>
       const accounts = data.account_index && Array.isArray(data.account_index.accounts) ? data.account_index.accounts : [];
       const accountSync = data.account_sync || {};
       const syncStatus = accountSync.running
-        ? (accountSync.last_error ? `attiva, errore: ${accountSync.last_error}` : "attiva")
+        ? (accountSync.last_error
+          ? `attiva, errore: ${accountSync.last_error}`
+          : (accountSync.in_progress ? "attiva · controllo in corso" : "attiva"))
         : "ferma";
       $("doctor").innerHTML = [
         `<b>Ora PC</b>: ${escapeHtml(formatDateTime(data.local_time || new Date().toISOString()))}`,
@@ -1230,13 +1271,14 @@ HTML = r"""<!doctype html>
         `<b>Account Codex</b>: ${escapeHtml(codexAccount ? codexAccount.label : "non rilevato")}`,
         `<b>Account registrati</b>: ${escapeHtml(String(accounts.length))}`,
         `<b>Sync account</b>: ${escapeHtml(syncStatus)}${accountSync.last_check_at ? ` · ${escapeHtml(formatDateTime(accountSync.last_check_at))}` : ""}`,
+        accountSync.last_full_check_at ? `<b>Scansione completa</b>: ${escapeHtml(formatDateTime(accountSync.last_full_check_at))}` : "",
         `<b>Chat Claude</b>: ${data.claude_chat_count || 0}`,
         `<b>Task Codex</b>: ${data.codex_chat_count || 0}`,
         `<b>Accodabili</b>: ${data.queueable_chat_count}`,
         `<b>Coda</b>: ${escapeHtml(data.queue_file || "")}`,
         `<b>CLI Claude</b>: ${escapeHtml(data.claude_exe || "non trovato")}`,
         `<b>CLI Codex</b>: ${escapeHtml(data.codex_exe || "non trovato")}`,
-      ].join("<br>");
+      ].filter(Boolean).join("<br>");
       renderRunner(data.runner || {});
     }
 

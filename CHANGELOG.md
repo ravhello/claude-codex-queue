@@ -12,6 +12,7 @@
 - Added durable Claude lifecycle tombstones, two-scan delete detection and metadata backups.
 - Preserved all Claude account replica labels on each deduplicated logical chat.
 - Added Windows login startup, focus refresh and a server-side automatic runner supervisor.
+- Split account sync into fixed-cadence metadata checks and periodic full transcript scans with heartbeat status.
 - Prevented deleted Claude chats from being resurrected by surviving transcripts.
 - Removed account/workspace cross-product duplicates and made account state writes atomic in-process.
 - Expanded Codex discovery to database- and rollout-only tasks while filtering deleted ghosts and internal subagents.
