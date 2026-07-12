@@ -222,6 +222,7 @@ class Chat:
     account_key: str | None = None
     account_label: str | None = None
     account_status: str = "unknown"
+    account_copies: tuple[str, ...] = ()
     provider: str = PROVIDER_CLAUDE
     sandbox_mode: str | None = None
     approval_policy: str | None = None
@@ -2564,6 +2565,7 @@ def discover_claude_windows_app_sessions(
                 account_key=account["account_key"],
                 account_label=account["account_label"],
                 account_status=str(account["account_status"] or "unknown"),
+                account_copies=(str(account["account_label"]),) if account["account_label"] else (),
             )
         )
     return sorted(discovered, key=chat_sort_key, reverse=True)
@@ -2890,6 +2892,17 @@ def discover_remote_ssh_chats(paths: Paths, context_chats: list[Chat]) -> list[C
     return sorted(discovered, key=chat_sort_key, reverse=True)
 
 
+def merged_chat_account_copies(*chats: Chat) -> tuple[str, ...]:
+    labels: list[str] = []
+    ordered = [chat for chat in chats if chat.account_status == "active"] + list(chats)
+    for chat in ordered:
+        candidates = ([chat.account_label] if chat.account_label else []) + list(chat.account_copies)
+        for label in candidates:
+            if label and label not in labels:
+                labels.append(label)
+    return tuple(labels)
+
+
 def merge_claude_chat_sources(local_chats: list[Chat], vscode_chats: list[Chat]) -> list[Chat]:
     by_session = {chat.session_id: chat for chat in local_chats}
     for chat in vscode_chats:
@@ -2897,8 +2910,17 @@ def merge_claude_chat_sources(local_chats: list[Chat], vscode_chats: list[Chat])
         if existing is None:
             by_session[chat.session_id] = chat
             continue
+        account_copies = merged_chat_account_copies(existing, chat)
         if existing.account_status == "active" and chat.account_status == "other":
+            by_session[chat.session_id] = dataclasses.replace(existing, account_copies=account_copies)
             continue
+        account_chat = existing
+        if chat.account_key and (
+            chat.account_status == "active"
+            or not existing.account_key
+            or existing.account_status != "active"
+        ):
+            account_chat = chat
         existing_key = chat_sort_key(existing)
         cache_key = chat_sort_key(chat)
         prefer_metadata = chat.source_key != "claude_code" or bool(chat.remote_kind)
@@ -2907,27 +2929,36 @@ def merge_claude_chat_sources(local_chats: list[Chat], vscode_chats: list[Chat])
         ) or not chat_cwd_runnable(existing.cwd)
         cwd = chat.cwd if prefer_cache_context and chat.cwd else existing.cwd
         use_newer_timestamp = cache_key >= existing_key
+        jsonl_path = existing.jsonl_path
+        if (
+            existing.source_key == "claude_windows_app"
+            and chat.source_key == "claude_windows_app"
+            and account_chat is chat
+        ):
+            jsonl_path = chat.jsonl_path
         by_session[chat.session_id] = Chat(
             session_id=existing.session_id,
             title=chat.title if prefer_metadata and chat.title else existing.title,
             cwd=cwd,
             permission_mode=chat.permission_mode or existing.permission_mode,
             model=chat.model or existing.model,
-            jsonl_path=existing.jsonl_path,
+            jsonl_path=jsonl_path,
             last_timestamp=chat.last_timestamp if use_newer_timestamp else existing.last_timestamp,
             message_count=max(existing.message_count, chat.message_count),
             last_prompt=existing.last_prompt,
             effort_level=chat.effort_level or existing.effort_level,
             source=chat.source if prefer_metadata else existing.source,
             source_key=chat.source_key if prefer_metadata else existing.source_key,
-            can_queue=(chat.can_queue or chat_cwd_runnable(cwd) or bool(chat.remote_kind)) and chat.account_status != "other",
+            can_queue=(chat.can_queue or existing.can_queue or chat_cwd_runnable(cwd) or bool(chat.remote_kind))
+            and account_chat.account_status != "other",
             remote_kind=chat.remote_kind,
             remote_host=chat.remote_host,
             remote_cwd=chat.remote_cwd,
             remote_uri=chat.remote_uri,
-            account_key=chat.account_key or existing.account_key,
-            account_label=chat.account_label or existing.account_label,
-            account_status=chat.account_status if chat.account_key else existing.account_status,
+            account_key=account_chat.account_key,
+            account_label=account_chat.account_label,
+            account_status=account_chat.account_status,
+            account_copies=account_copies,
         )
     return sorted(by_session.values(), key=chat_sort_key, reverse=True)
 

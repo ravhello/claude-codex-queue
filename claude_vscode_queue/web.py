@@ -70,6 +70,7 @@ def chat_to_dict(chat: app.Chat) -> dict[str, Any]:
         "account_short_key": chat.account_key[:8] if chat.account_key else None,
         "account_label": chat.account_label,
         "account_status": chat.account_status,
+        "account_copies": list(chat.account_copies),
     }
 
 
@@ -211,7 +212,7 @@ class WebState:
         desktop_chats = app.discover_claude_windows_app_sessions(
             self.paths,
             sync_accounts=False,
-            active_only=True,
+            active_only=False,
         )
         claude_chats = app.annotate_chats_with_accounts(
             self.paths,
@@ -236,7 +237,7 @@ class WebState:
                 chats = app.discover_agent_chats(
                     self.paths,
                     sync_desktop_accounts=True,
-                    active_desktop_only=True,
+                    active_desktop_only=False,
                 )
             except Exception:
                 chats = []
@@ -1181,6 +1182,8 @@ HTML = r"""<!doctype html>
     function accountText(chat) {
       if (!chat) return "";
       const provider = chat.provider === "codex" ? "Codex" : "Claude";
+      const copies = Array.isArray(chat.account_copies) ? chat.account_copies.filter(Boolean) : [];
+      if (copies.length > 1) return `sincronizzata su ${copies.length} account: ${copies.join(", ")}`;
       if (chat.account_status === "active") return `${provider} attivo: ${chat.account_label || chat.account_short_key || ""}`;
       if (chat.account_status === "other") return `altro account: ${chat.account_label || chat.account_short_key || ""}`;
       if (chat.account_status === "known") return `account: ${chat.account_label || chat.account_short_key || ""}`;
@@ -1351,7 +1354,7 @@ HTML = r"""<!doctype html>
       const provider = $("provider-filter").value;
       const list = $("chat-list");
       const chats = state.chats.filter((chat) => {
-        const hay = [chat.title, chat.cwd, chat.session_id, chat.last_prompt, chat.source, chat.provider].join(" ").toLowerCase();
+        const hay = [chat.title, chat.cwd, chat.session_id, chat.last_prompt, chat.source, chat.provider, ...(chat.account_copies || [])].join(" ").toLowerCase();
         return (!provider || chat.provider === provider) && hay.includes(filter);
       }).sort((a, b) => Date.parse(b.last_timestamp || 0) - Date.parse(a.last_timestamp || 0));
       list.innerHTML = "";

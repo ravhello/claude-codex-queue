@@ -933,11 +933,19 @@ class QueueAppTests(unittest.TestCase):
             self.assertEqual(active.permission_mode, "bypassPermissions")
             self.assertEqual(active.account_status, "active")
             self.assertTrue(active.can_queue)
+            self.assertEqual(
+                set(active.account_copies),
+                {f"Claude app {active_account[:8]}", f"Claude app {other_account[:8]}"},
+            )
             self.assertIsNone(app.account_mismatch_for_chat(paths, active))
             self.assertEqual(app.remember_chat_account(paths, active).account_key, f"claude-app:{active_account}")
 
             self.assertEqual(other.account_status, "active")
             self.assertTrue(other.can_queue)
+            self.assertEqual(
+                set(other.account_copies),
+                {f"Claude app {active_account[:8]}", f"Claude app {other_account[:8]}"},
+            )
             self.assertIsNone(app.account_mismatch_for_chat(paths, other))
             active_profile_records = [
                 json.loads(path.read_text(encoding="utf-8"))
@@ -992,6 +1000,10 @@ class QueueAppTests(unittest.TestCase):
             synced = next(chat for chat in chats if chat.session_id == session)
             self.assertEqual(synced.account_status, "active")
             self.assertTrue(synced.can_queue)
+            self.assertEqual(
+                set(synced.account_copies),
+                {f"Claude app {active_account[:8]}", f"Claude app {old_account[:8]}"},
+            )
 
     def test_sync_claude_desktop_accounts_dedupes_same_chat_inside_account(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

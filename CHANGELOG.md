@@ -10,6 +10,7 @@
 - Added cross-process locks and corruption checks for account and Claude sync state files.
 - Deferred Codex lifecycle changes until the linked copy's ChatGPT account is active.
 - Added durable Claude lifecycle tombstones, two-scan delete detection and metadata backups.
+- Preserved all Claude account replica labels on each deduplicated logical chat.
 - Prevented deleted Claude chats from being resurrected by surviving transcripts.
 - Removed account/workspace cross-product duplicates and made account state writes atomic in-process.
 - Expanded Codex discovery to database- and rollout-only tasks while filtering deleted ghosts and internal subagents.

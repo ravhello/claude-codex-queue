@@ -66,6 +66,10 @@ observed twice before it is treated as a deletion; the app then writes a durable
 tombstone, backs up the remaining metadata and removes the other replicas. A
 surviving Claude transcript cannot recreate a tombstoned chat.
 
+The chat list keeps one row per logical Claude session and shows every account
+that currently owns a replica. Account identifiers are searchable, so switching
+accounts never makes the previous account's sessions appear to vanish.
+
 For Codex, **Copy to active ChatGPT account** uses Codex app-server
 `thread/fork` and creates a new thread ID instead of relabelling the old task.
 Only copies linked by this app share archive, unarchive and delete state. Those
