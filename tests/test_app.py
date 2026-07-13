@@ -214,12 +214,34 @@ class QueueAppTests(unittest.TestCase):
             session = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa"
             rollout = sessions / f"rollout-2026-01-02T10-00-00-{session}.jsonl"
             rollout.write_text(
-                json.dumps(
-                    {
-                        "timestamp": "2026-01-02T10:00:00Z",
-                        "type": "session_meta",
-                        "payload": {"id": session, "cwd": str(root)},
-                    }
+                "\n".join(
+                    json.dumps(row)
+                    for row in [
+                        {
+                            "timestamp": "2026-01-02T10:00:00Z",
+                            "type": "session_meta",
+                            "payload": {"id": session, "cwd": str(root)},
+                        },
+                        {
+                            "timestamp": "2026-01-02T10:01:00Z",
+                            "type": "event_msg",
+                            "payload": {"type": "user_message", "message": "first prompt"},
+                        },
+                        {
+                            "timestamp": "2026-01-02T10:02:00Z",
+                            "type": "response_item",
+                            "payload": {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "latest user request"}],
+                            },
+                        },
+                        {
+                            "timestamp": "2026-01-02T10:03:00Z",
+                            "type": "response_item",
+                            "payload": {"type": "message", "role": "assistant", "content": []},
+                        },
+                    ]
                 )
                 + "\n",
                 encoding="utf-8",
@@ -275,6 +297,10 @@ class QueueAppTests(unittest.TestCase):
             self.assertEqual(chat.effort_level, "ultra")
             self.assertEqual(chat.sandbox_mode, "danger-full-access")
             self.assertEqual(chat.approval_policy, "never")
+            self.assertIsNone(chat.last_user_message)
+            self.assertEqual(app.latest_user_message_for_chat(chat), "latest user request")
+            rollout.unlink()
+            self.assertIsNone(app.latest_user_message_for_chat(chat))
             self.assertTrue(chat.can_queue)
 
     def test_run_codex_preserves_settings_and_clears_external_api_key(self) -> None:
@@ -905,7 +931,14 @@ class QueueAppTests(unittest.TestCase):
             session = "11111111-1111-4111-8111-111111111111"
             transcript = project / f"{session}.jsonl"
             rows = [
-                {"type": "user", "sessionId": session, "timestamp": "2026-01-01T10:00:00Z", "cwd": "C:\\work", "permissionMode": "default"},
+                {
+                    "type": "user",
+                    "sessionId": session,
+                    "timestamp": "2026-01-01T10:00:00Z",
+                    "cwd": "C:\\work",
+                    "permissionMode": "default",
+                    "message": {"role": "user", "content": "an older request"},
+                },
                 {"type": "assistant", "sessionId": session, "timestamp": "2026-01-01T10:01:00Z", "message": {"role": "assistant", "model": "opus"}},
                 {"type": "ai-title", "sessionId": session, "aiTitle": "Fix tests"},
                 {"type": "last-prompt", "sessionId": session, "lastPrompt": "please fix tests"},
@@ -920,6 +953,7 @@ class QueueAppTests(unittest.TestCase):
             self.assertEqual(chats[0].cwd, "C:\\work")
             self.assertEqual(chats[0].permission_mode, "default")
             self.assertEqual(chats[0].model, "opus")
+            self.assertEqual(chats[0].last_user_message, "please fix tests")
 
     def test_discover_chats_ignores_synthetic_model_marker(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1245,6 +1279,15 @@ class QueueAppTests(unittest.TestCase):
                     [
                         json.dumps(
                             {
+                                "type": "user",
+                                "sessionId": session,
+                                "timestamp": "2026-01-02T10:00:00Z",
+                                "cwd": "C:\\work",
+                                "message": {"role": "user", "content": "newest request"},
+                            }
+                        ),
+                        json.dumps(
+                            {
                                 "type": "assistant",
                                 "sessionId": session,
                                 "timestamp": "2026-01-03T10:00:00Z",
@@ -1269,6 +1312,7 @@ class QueueAppTests(unittest.TestCase):
             chats = app.discover_chats(claude_home)
 
             self.assertEqual(chats[0].last_timestamp, "2026-01-03T10:00:00Z")
+            self.assertEqual(chats[0].last_user_message, "newest request")
 
     def test_discover_chats_dedupes_session_by_latest_real_message(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2020,6 +2064,7 @@ class QueueAppTests(unittest.TestCase):
                 "last_timestamp": "2026-07-07T02:00:00Z",
                 "message_count": 42,
                 "last_prompt": "continua",
+                "last_user_message": "ultimo prompt remoto",
             }
             encoded = base64.b64encode(json.dumps(summary).encode("utf-8")).decode("ascii")
 
@@ -2037,6 +2082,7 @@ class QueueAppTests(unittest.TestCase):
             self.assertEqual(chats[0].model, "opus")
             self.assertEqual(chats[0].permission_mode, "bypassPermissions")
             self.assertEqual(chats[0].last_timestamp, "2026-07-07T02:00:00Z")
+            self.assertEqual(chats[0].last_user_message, "ultimo prompt remoto")
             self.assertEqual(chats[0].cwd, "C:\\Users\\serveradmin\\sample-project")
             self.assertTrue(chats[0].can_queue)
 

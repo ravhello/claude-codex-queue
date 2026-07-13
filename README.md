@@ -72,7 +72,9 @@ immediately instead of waiting for the normal polling deadline.
 
 The chat list keeps one row per logical Claude session and shows every account
 that currently owns a replica. Account identifiers are searchable, so switching
-accounts never makes the previous account's sessions appear to vanish.
+accounts never makes the previous account's sessions appear to vanish. Each row
+also shows the beginning of the latest real user message from the transcript,
+excluding assistant output and tool results.
 
 For Codex, **Copy to active ChatGPT account** uses Codex app-server
 `thread/fork` and creates a new thread ID instead of relabelling the old task.

@@ -13,7 +13,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import urlparse
+from urllib.parse import parse_qs, urlparse
 
 from . import __version__, app
 
@@ -59,6 +59,8 @@ def chat_to_dict(chat: app.Chat) -> dict[str, Any]:
         "last_timestamp": chat.last_timestamp,
         "message_count": chat.message_count,
         "last_prompt": chat.last_prompt,
+        "last_user_message": chat.last_user_message,
+        "last_user_message_loaded": chat.last_user_message is not None,
         "jsonl_path": str(chat.jsonl_path),
         "source": chat.source,
         "source_key": chat.source_key,
@@ -620,6 +622,22 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             elif parsed.path == "/api/chats":
                 chats = self.state.chats()
                 self.send_json({"chats": [chat_to_dict(chat) for chat in chats]})
+            elif parsed.path == "/api/chat-preview":
+                session_id = (parse_qs(parsed.query).get("session_id") or [""])[0]
+                chat = app.find_chat_by_session(self.state.cached_chats(), session_id)
+                if chat is None:
+                    self.state.refresh_chats_background()
+                    self.send_json(
+                        {"error": "Elenco chat ancora in aggiornamento."},
+                        HTTPStatus.SERVICE_UNAVAILABLE,
+                    )
+                else:
+                    self.send_json(
+                        {
+                            "session_id": chat.session_id,
+                            "last_user_message": app.latest_user_message_for_chat(chat),
+                        }
+                    )
             elif parsed.path == "/api/queue":
                 queue = app.load_queue(self.state.paths.queue_file)
                 self.send_json(
@@ -1187,6 +1205,19 @@ HTML = r"""<!doctype html>
     .chat.active { border-color: var(--accent); outline: 2px solid rgba(15, 118, 110, .15); }
     .chat.view-only { opacity: .84; }
     .chat-title { font-weight: 650; display: block; overflow-wrap: anywhere; }
+    .chat-last-message {
+      color: var(--ink);
+      display: -webkit-box;
+      font-size: 12px;
+      line-height: 1.4;
+      margin-top: 5px;
+      overflow: hidden;
+      overflow-wrap: anywhere;
+      -webkit-box-orient: vertical;
+      -webkit-line-clamp: 2;
+    }
+    .chat-last-message b { color: var(--muted); font-weight: 650; }
+    .chat-last-message.unavailable { color: var(--muted); }
     .chat-sub { color: var(--muted); display: block; font-size: 12px; overflow-wrap: anywhere; margin-top: 3px; }
     .badge {
       display: inline-flex;
@@ -1330,7 +1361,8 @@ HTML = r"""<!doctype html>
     </div>
   </main>
   <script>
-    const state = { chats: [], selected: null, queue: [], autoContinues: [], runner: {}, autoBusy: false, autoBusyAction: null, settingsSession: null, transferBusy: false, refreshBusy: false };
+    const state = { chats: [], selected: null, queue: [], autoContinues: [], runner: {}, autoBusy: false, autoBusyAction: null, settingsSession: null, transferBusy: false, refreshBusy: false, messagePreviews: {}, previewRequests: {} };
+    let chatPreviewObserver = null;
     const $ = (id) => document.getElementById(id);
     const CLAUDE_MODEL_OPTIONS = ["opus", "sonnet", "haiku", "claude-opus-4-8", "claude-sonnet-4-5"];
     const CODEX_MODEL_OPTIONS = ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.1-codex-max"];
@@ -1426,6 +1458,46 @@ HTML = r"""<!doctype html>
 
     function activeAutoContinues() {
       return state.autoContinues.filter((auto) => auto.enabled);
+    }
+
+    function chatPreviewKey(chat) {
+      return `${chat.jsonl_path || ""}|${chat.last_timestamp || ""}`;
+    }
+
+    function hydrateChatPreviews(chats) {
+      for (const chat of chats) {
+        const cached = state.messagePreviews[chat.session_id];
+        if (cached && cached.key === chatPreviewKey(chat)) {
+          chat.last_user_message = cached.text;
+          chat.last_user_message_loaded = true;
+        }
+      }
+      return chats;
+    }
+
+    async function loadChatPreview(sessionId) {
+      if (!sessionId || state.previewRequests[sessionId]) return;
+      const chat = state.chats.find((item) => item.session_id === sessionId);
+      if (!chat || chat.last_user_message_loaded) return;
+      const key = chatPreviewKey(chat);
+      state.previewRequests[sessionId] = true;
+      try {
+        const result = await api(`/api/chat-preview?session_id=${encodeURIComponent(sessionId)}`);
+        const current = state.chats.find((item) => item.session_id === sessionId);
+        if (!current || chatPreviewKey(current) !== key) return;
+        const text = result.last_user_message || "";
+        current.last_user_message = text;
+        current.last_user_message_loaded = true;
+        state.messagePreviews[sessionId] = { key, text };
+        renderChats();
+      } catch (err) {
+        const current = state.chats.find((item) => item.session_id === sessionId);
+        if (current && chatPreviewKey(current) === key) {
+          current.last_user_message_loaded = false;
+        }
+      } finally {
+        delete state.previewRequests[sessionId];
+      }
     }
 
     function accountText(chat) {
@@ -1614,8 +1686,19 @@ HTML = r"""<!doctype html>
       const filter = $("chat-filter").value.trim().toLowerCase();
       const provider = $("provider-filter").value;
       const list = $("chat-list");
+      if (chatPreviewObserver) chatPreviewObserver.disconnect();
+      chatPreviewObserver = typeof IntersectionObserver === "undefined"
+        ? null
+        : new IntersectionObserver((entries, observer) => {
+            for (const entry of entries) {
+              if (!entry.isIntersecting) continue;
+              observer.unobserve(entry.target);
+              loadChatPreview(entry.target.dataset.sessionId);
+            }
+          }, { root: list, rootMargin: "160px 0px" });
+      let previewFallbackCount = 0;
       const chats = state.chats.filter((chat) => {
-        const hay = [chat.title, chat.cwd, chat.session_id, chat.last_prompt, chat.source, chat.provider, ...(chat.account_copies || [])].join(" ").toLowerCase();
+        const hay = [chat.title, chat.cwd, chat.session_id, chat.last_prompt, chat.last_user_message, chat.source, chat.provider, ...(chat.account_copies || [])].join(" ").toLowerCase();
         return (!provider || chat.provider === provider) && hay.includes(filter);
       }).sort((a, b) => Date.parse(b.last_timestamp || 0) - Date.parse(a.last_timestamp || 0));
       list.innerHTML = "";
@@ -1632,8 +1715,12 @@ HTML = r"""<!doctype html>
         btn.className = "chat" + (state.selected === chat.session_id ? " active" : "") + (!chat.can_queue ? " view-only" : "");
         const location = chat.remote_cwd ? `${chat.remote_host || "ssh"}:${chat.remote_cwd}` : (chat.cwd || "");
         const accountBadge = accountText(chat);
+        const lastMessage = chat.last_user_message || "";
+        const lastMessageLoaded = !!(chat.last_user_message_loaded || lastMessage);
+        const lastMessageText = lastMessage || (lastMessageLoaded ? "non disponibile" : "caricamento...");
         btn.innerHTML = `
           <span class="chat-title">${escapeHtml(chat.short_id)} · ${escapeHtml(chat.title || "Senza titolo")}</span>
+          <span class="chat-last-message${lastMessage ? "" : " unavailable"}" title="${escapeAttr(`Ultimo messaggio: ${lastMessageText}`)}"><b>Ultimo messaggio:</b> ${escapeHtml(lastMessageText)}</span>
           <span class="chat-sub">
             <span class="badge">${escapeHtml(chat.source || "")}</span>
             <span class="badge">${chat.provider === "codex" ? "Codex" : "Claude"}</span>
@@ -1657,6 +1744,15 @@ HTML = r"""<!doctype html>
           renderChats();
         };
         list.appendChild(btn);
+        if (!lastMessageLoaded) {
+          btn.dataset.sessionId = chat.session_id;
+          if (chatPreviewObserver) {
+            chatPreviewObserver.observe(btn);
+          } else if (previewFallbackCount < 6) {
+            previewFallbackCount += 1;
+            loadChatPreview(chat.session_id);
+          }
+        }
       }
       renderSettingsControls();
       renderAutoButton();
@@ -1751,7 +1847,7 @@ HTML = r"""<!doctype html>
           appendLog("Errore ambiente: " + doctorResult.reason.message);
         }
         if (chatsResult.status === "fulfilled") {
-          state.chats = chatsResult.value.chats || [];
+          state.chats = hydrateChatPreviews(chatsResult.value.chats || []);
           renderChats();
         } else {
           appendLog("Errore chat: " + chatsResult.reason.message);
@@ -1839,7 +1935,7 @@ HTML = r"""<!doctype html>
           method: "POST",
           body: JSON.stringify({ session_id: state.selected, move }),
         });
-        state.chats = result.chats || state.chats;
+        state.chats = hydrateChatPreviews(result.chats || state.chats);
         const transfer = result.transfer || {};
         appendLog(`Import completato: ${transfer.status || "ok"} · ${transfer.title || selected.title || state.selected}`);
         renderChats();

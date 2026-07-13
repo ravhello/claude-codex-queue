@@ -8,6 +8,7 @@ import datetime as dt
 import functools
 import hashlib
 import json
+import mmap
 import os
 import queue as queue_module
 import re
@@ -214,6 +215,7 @@ class Chat:
     last_timestamp: str | None
     message_count: int
     last_prompt: str | None
+    last_user_message: str | None = None
     effort_level: str | None = None
     source: str = "Claude Code"
     source_key: str = "claude_code"
@@ -1021,6 +1023,11 @@ def truncate(value: str | None, length: int = 90) -> str:
     return compact[: length - 1] + "..."
 
 
+def message_preview(value: str | None, length: int = 240) -> str | None:
+    preview = truncate(value, length)
+    return preview or None
+
+
 def hash_text(value: str | None) -> str | None:
     if not value:
         return None
@@ -1348,6 +1355,8 @@ def discover_chats(claude_home: Path) -> list[Chat]:
         last_message_timestamp: str | None = None
         last_message_dt: dt.datetime | None = None
         last_prompt: str | None = None
+        last_user_message: str | None = None
+        last_user_message_dt: dt.datetime | None = None
         message_count = 0
 
         try:
@@ -1381,6 +1390,15 @@ def discover_chats(claude_home: Path) -> list[Chat]:
                     message = obj.get("message")
                     if isinstance(message, dict):
                         message_count += 1
+                        if obj_type == "user":
+                            text = message_text(message)
+                            newer_user_message = (
+                                timestamp_dt is not None
+                                and (last_user_message_dt is None or timestamp_dt >= last_user_message_dt)
+                            ) or (timestamp_dt is None and last_user_message_dt is None)
+                            if text and newer_user_message:
+                                last_user_message = message_preview(text)
+                                last_user_message_dt = timestamp_dt
                         parsed_model = real_model_value(message.get("model"))
                         if parsed_model:
                             model = parsed_model
@@ -1390,6 +1408,7 @@ def discover_chats(claude_home: Path) -> list[Chat]:
         if not session_id:
             continue
         display_title = title or truncate(last_prompt, 60) or (Path(cwd).name if cwd else "Claude chat")
+        last_user_message = message_preview(last_prompt) or last_user_message
         chat = Chat(
             session_id=session_id,
             title=display_title,
@@ -1400,6 +1419,7 @@ def discover_chats(claude_home: Path) -> list[Chat]:
             last_timestamp=last_message_timestamp or last_event_timestamp,
             message_count=message_count,
             last_prompt=last_prompt,
+            last_user_message=last_user_message,
             effort_level=effort_level,
             can_queue=chat_cwd_runnable(cwd),
         )
@@ -2086,6 +2106,91 @@ def sync_codex_linked_threads(paths: Paths) -> dict[str, Any]:
     return result
 
 
+CODEX_COMPACT_USER_MESSAGE_MARKERS = (
+    b'"type":"event_msg","payload":{"type":"user_message"',
+    b'"type":"response_item","payload":{"type":"message","role":"user"',
+)
+CODEX_SPACED_USER_MESSAGE_MARKERS = (
+    b'"type": "event_msg", "payload": {"type": "user_message"',
+    b'"type": "response_item", "payload": {"type": "message", "role": "user"',
+)
+MAX_CODEX_PREVIEW_LINE_BYTES = 4 * 1024 * 1024
+
+
+def codex_user_message_from_object(obj: dict[str, Any]) -> str | None:
+    payload = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+    if obj.get("type") == "event_msg" and payload.get("type") == "user_message":
+        message = payload.get("message") if isinstance(payload.get("message"), str) else None
+        preview = message_preview(message)
+        if preview:
+            return preview
+        if payload.get("images") or payload.get("local_images"):
+            return "[Immagine allegata]"
+        return None
+
+    if obj.get("type") != "response_item" or payload.get("type") != "message" or payload.get("role") != "user":
+        return None
+    content = payload.get("content") if isinstance(payload.get("content"), list) else []
+    parts = [
+        str(entry["text"])
+        for entry in content
+        if isinstance(entry, dict)
+        and entry.get("type") in {"input_text", "text"}
+        and isinstance(entry.get("text"), str)
+    ]
+    preview = message_preview("\n".join(parts))
+    if preview:
+        return preview
+    if any(isinstance(entry, dict) and entry.get("type") in {"input_image", "image"} for entry in content):
+        return "[Immagine allegata]"
+    return None
+
+
+@functools.lru_cache(maxsize=2048)
+def _latest_codex_user_message_cached(path_text: str, size: int, modified_ns: int) -> str | None:
+    del size, modified_ns
+    path = Path(path_text)
+    try:
+        with path.open("rb") as handle, mmap.mmap(handle.fileno(), 0, access=mmap.ACCESS_READ) as mapped:
+            sample = mapped[: min(len(mapped), 64 * 1024)]
+            markers = (
+                CODEX_COMPACT_USER_MESSAGE_MARKERS
+                if b'"type":"' in sample
+                else CODEX_SPACED_USER_MESSAGE_MARKERS
+            )
+            cursor = len(mapped)
+            while cursor > 0:
+                marker_position = max(mapped.rfind(marker, 0, cursor) for marker in markers)
+                if marker_position < 0:
+                    return None
+                line_start = mapped.rfind(b"\n", 0, marker_position) + 1
+                line_end = mapped.find(b"\n", marker_position)
+                if line_end < 0:
+                    line_end = len(mapped)
+                if line_end - line_start <= MAX_CODEX_PREVIEW_LINE_BYTES:
+                    obj = safe_json_loads(mapped[line_start:line_end].decode("utf-8", errors="replace"))
+                    if obj:
+                        preview = codex_user_message_from_object(obj)
+                        if preview:
+                            return preview
+                cursor = line_start
+    except (OSError, ValueError):
+        return None
+    return None
+
+
+def latest_codex_user_message(path: Path | None) -> str | None:
+    if path is None:
+        return None
+    try:
+        stat = path.stat()
+    except OSError:
+        return None
+    if stat.st_size <= 0:
+        return None
+    return _latest_codex_user_message_cached(str(path), stat.st_size, stat.st_mtime_ns)
+
+
 def discover_codex_app_sessions(paths: Paths) -> list[Chat]:
     try:
         sync_codex_linked_threads(paths)
@@ -2150,6 +2255,7 @@ def discover_codex_app_sessions(paths: Paths) -> list[Chat]:
                 last_timestamp=codex_timestamp(index_entry, row),
                 message_count=-1,
                 last_prompt=first_prompt,
+                last_user_message=None,
                 effort_level=row.get("reasoning_effort") if isinstance(row.get("reasoning_effort"), str) else None,
                 source="Codex App" if not archived else "Codex App (archiviata)",
                 source_key="codex_app" if not archived else "codex_app_archived",
@@ -2161,6 +2267,14 @@ def discover_codex_app_sessions(paths: Paths) -> list[Chat]:
             )
         )
     return sorted(chats, key=chat_sort_key, reverse=True)
+
+
+def latest_user_message_for_chat(chat: Chat) -> str | None:
+    if chat.last_user_message:
+        return chat.last_user_message
+    if chat.provider == PROVIDER_CODEX:
+        return latest_codex_user_message(chat.jsonl_path)
+    return message_preview(chat.last_prompt)
 
 
 def workspace_storage_root(paths: Paths) -> Path:
@@ -3276,6 +3390,7 @@ def discover_claude_windows_app_sessions(
                 last_timestamp=timestamp or file_mtime_iso(record.path),
                 message_count=int(data.get("completedTurns") or 0) if isinstance(data.get("completedTurns"), int) else 0,
                 last_prompt=None,
+                last_user_message=message_preview(data.get("lastPrompt") if isinstance(data.get("lastPrompt"), str) else None),
                 effort_level=data.get("effort") if isinstance(data.get("effort"), str) else None,
                 source="Claude Windows App",
                 source_key="claude_windows_app",
@@ -3412,6 +3527,9 @@ def discover_claude_agent_sessions(paths: Paths) -> list[Chat]:
                 last_timestamp=timestamp,
                 message_count=0,
                 last_prompt=None,
+                last_user_message=message_preview(
+                    metadata.get("lastPrompt") if isinstance(metadata.get("lastPrompt"), str) else None
+                ),
                 source=source,
                 source_key=source_key,
                 can_queue=can_queue,
@@ -3448,6 +3566,7 @@ if (Test-Path -LiteralPath $root) {
     $model = $null
     $effortLevel = $null
     $lastPrompt = $null
+    $lastUserMessage = $null
     $lastEventTimestamp = $null
     $lastEventTime = $null
     $lastMessageTimestamp = $null
@@ -3487,6 +3606,7 @@ if (Test-Path -LiteralPath $root) {
       }
       if ($objType -eq "last-prompt" -and $null -ne $obj.lastPrompt) {
         $lastPrompt = [string]$obj.lastPrompt
+        $lastUserMessage = $lastPrompt
       }
       if ($null -ne $obj.cwd) {
         $cwd = [string]$obj.cwd
@@ -3499,6 +3619,19 @@ if (Test-Path -LiteralPath $root) {
       }
       if ($null -ne $obj.message) {
         $messageCount += 1
+        if ($objType -eq "user") {
+          $content = $obj.message.content
+          if ($content -is [string] -and -not [string]::IsNullOrWhiteSpace($content)) {
+            $lastUserMessage = [string]$content
+          } elseif ($content -is [System.Array]) {
+            $textParts = @(
+              $content | Where-Object { $_.type -eq "text" -and $null -ne $_.text } | ForEach-Object { [string]$_.text }
+            )
+            if ($textParts.Count -gt 0) {
+              $lastUserMessage = [string]::Join("`n", $textParts)
+            }
+          }
+        }
         if ($null -ne $obj.message.model -and [string]$obj.message.model -ne "<synthetic>") {
           $model = [string]$obj.message.model
         }
@@ -3526,6 +3659,7 @@ if (Test-Path -LiteralPath $root) {
       last_timestamp = $lastTimestamp
       message_count = $messageCount
       last_prompt = $lastPrompt
+      last_user_message = $lastUserMessage
       cwd_exists = $cwdExists
     }
     $json = $summary | ConvertTo-Json -Compress -Depth 4
@@ -3579,6 +3713,9 @@ def discover_remote_ssh_chats(paths: Paths, context_chats: list[Chat]) -> list[C
             summary_cwd = summary.get("cwd") if isinstance(summary.get("cwd"), str) else None
             summary_cwd_exists = bool(summary.get("cwd_exists"))
             last_prompt = summary.get("last_prompt") if isinstance(summary.get("last_prompt"), str) else None
+            last_user_message = (
+                summary.get("last_user_message") if isinstance(summary.get("last_user_message"), str) else last_prompt
+            )
             cwd = context.cwd if context and context.cwd else summary_cwd
             display_title = (
                 context.title
@@ -3597,6 +3734,7 @@ def discover_remote_ssh_chats(paths: Paths, context_chats: list[Chat]) -> list[C
                     last_timestamp=summary.get("last_timestamp") if isinstance(summary.get("last_timestamp"), str) else None,
                     message_count=int(summary.get("message_count") or 0),
                     last_prompt=last_prompt,
+                    last_user_message=message_preview(last_user_message),
                     effort_level=summary.get("effort_level") if isinstance(summary.get("effort_level"), str) else None,
                     source="Claude Code Remote SSH",
                     source_key="claude_code_remote_ssh",
@@ -3647,6 +3785,11 @@ def merge_claude_chat_sources(local_chats: list[Chat], vscode_chats: list[Chat])
         ) or not chat_cwd_runnable(existing.cwd)
         cwd = chat.cwd if prefer_cache_context and chat.cwd else existing.cwd
         use_newer_timestamp = cache_key >= existing_key
+        latest_user_message = (
+            (chat.last_user_message or existing.last_user_message)
+            if use_newer_timestamp
+            else (existing.last_user_message or chat.last_user_message)
+        )
         jsonl_path = existing.jsonl_path
         if (
             existing.source_key == "claude_windows_app"
@@ -3664,6 +3807,7 @@ def merge_claude_chat_sources(local_chats: list[Chat], vscode_chats: list[Chat])
             last_timestamp=chat.last_timestamp if use_newer_timestamp else existing.last_timestamp,
             message_count=max(existing.message_count, chat.message_count),
             last_prompt=existing.last_prompt,
+            last_user_message=latest_user_message,
             effort_level=chat.effort_level or existing.effort_level,
             source=chat.source if prefer_metadata else existing.source,
             source_key=chat.source_key if prefer_metadata else existing.source_key,

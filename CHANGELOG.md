@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Added the latest real user-message preview to every Claude and Codex chat row.
 - Made the complete Windows launch chain consoleless, including Desktop/Startup shortcuts and periodic WSL-to-Windows CLI checks.
 - Replaced Claude Desktop auto-continue messages with the native `Try again` action on the exact local Code session.
 - Kept Claude Desktop auto-continue armed when `Try again` is temporarily absent and prevented PowerShell `CLIXML` diagnostics from leaking into the UI.
