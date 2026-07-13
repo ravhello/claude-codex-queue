@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Made the complete Windows launch chain consoleless, including Desktop/Startup shortcuts and periodic WSL-to-Windows CLI checks.
 - Replaced Claude Desktop auto-continue messages with the native `Try again` action on the exact local Code session.
 - Added Codex turn-aware recovery: rollback and replay untouched failed prompts, continue interrupted work, and queue additional failed messages in order.
 - Prevented a stale runner write from re-enabling auto-continue after the user disables it.

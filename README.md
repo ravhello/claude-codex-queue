@@ -110,7 +110,10 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-desktop-shortc
 ```
 
 Open **Claude + Codex Queue** from the Desktop. The launcher starts the local
-server and opens [http://127.0.0.1:8765/](http://127.0.0.1:8765/).
+server and opens [http://127.0.0.1:8765/](http://127.0.0.1:8765/). Both the
+Desktop and Startup shortcuts use the windowless Windows Script Host; WSL,
+PowerShell, Claude and Codex child processes are launched with hidden/no-window
+settings, so the app does not create terminal windows in normal operation.
 
 The installer also registers the app in the current Windows user's Startup
 folder. At login it starts the server in the background and opens the browser

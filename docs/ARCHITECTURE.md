@@ -101,7 +101,11 @@ The web server uses Python's standard-library HTTP server and binds to
 `127.0.0.1` by default. It serves one dependency-free HTML application and a
 small JSON API. Controls are derived from the server's actual resumability and
 account checks; view-only actions are disabled rather than allowed to fail
-later.
+later. Windows shortcuts enter through a windowless `wscript.exe` launcher;
+local PowerShell and Windows CLI calls use hidden windows under WSL and
+`CREATE_NO_WINDOW` under native Windows Python. The WSL proxy forwards standard
+input/output and owns each Windows child in a kill-on-close Job Object, so
+timeouts and shutdowns cannot leave detached console processes behind.
 
 ## Safety invariants
 

@@ -10,7 +10,7 @@ if [ -n "${CLAUDE_CODEX_QUEUE_STATE:-}" ]; then
 elif [ -n "${CLAUDE_VSCODE_QUEUE_STATE:-}" ]; then
   STATE="$CLAUDE_VSCODE_QUEUE_STATE"
 elif command -v powershell.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 2>&1; then
-  WIN_HOME_RAW="$(powershell.exe -NoProfile -Command '[Environment]::GetFolderPath("UserProfile")' 2>/dev/null | tr -d '\r' || true)"
+  WIN_HOME_RAW="$(powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command '[Environment]::GetFolderPath("UserProfile")' 2>/dev/null | tr -d '\r' || true)"
   if [ -n "$WIN_HOME_RAW" ]; then
     WIN_HOME="$(wslpath -u "$WIN_HOME_RAW")"
     if [ -d "$WIN_HOME/.claude-codex-queue" ] || [ ! -d "$WIN_HOME/.claude-vscode-queue" ]; then

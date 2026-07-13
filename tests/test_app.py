@@ -44,6 +44,26 @@ class QueueAppTests(unittest.TestCase):
 
             self.assertEqual(found, command)
 
+    def test_windows_cli_commands_use_hidden_powershell_inside_wsl(self) -> None:
+        with patch.object(app, "is_wsl", return_value=True), patch.object(
+            app.shutil, "which", return_value="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
+        ):
+            command = app.codex_cli_command(
+                Path("/mnt/c/Users/test/AppData/Local/npm/codex.cmd"),
+                ["--version"],
+            )
+
+        self.assertIn("-WindowStyle", command)
+        self.assertIn("Hidden", command)
+        encoded = command[command.index("-EncodedCommand") + 1]
+        script = base64.b64decode(encoded).decode("utf-16-le")
+        self.assertIn("C:\\Users\\test\\AppData\\Local\\npm\\codex.cmd", script)
+        self.assertIn("--version", script)
+        self.assertIn("HiddenProcessProxy", script)
+        self.assertIn("Add-Type", script)
+        self.assertIn("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE", app.WINDOWS_HIDDEN_PROXY_CSHARP)
+        self.assertIn("destination.Flush()", app.WINDOWS_HIDDEN_PROXY_CSHARP)
+
     def test_auto_continue_monitor_does_not_send_without_active_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1922,23 +1942,30 @@ class QueueAppTests(unittest.TestCase):
         }
         captured_payload = {}
 
-        def fake_run(command, **kwargs):
+        def fake_hidden(command, cwd=None):
             payload_path = Path(command[3].split()[-1].strip('"'))
             captured_payload.update(json.loads(payload_path.read_text(encoding="utf-8")))
+            return ["hidden-proxy", command[3]]
+
+        def fake_run(command, **kwargs):
             return app.subprocess.CompletedProcess(args=[], returncode=0, stdout="ok", stderr="")
 
         with (
             patch.object(app, "cwd_accessible", return_value=False),
             patch.object(app, "windows_path_accessible", return_value=True),
+            patch.object(app, "is_wsl", return_value=True),
+            patch.object(app, "local_windows_hidden_command", side_effect=fake_hidden) as hidden,
             patch.object(app.subprocess, "run", side_effect=fake_run) as run,
         ):
             result = app.run_claude(app.Paths(Path("/tmp"), Path("/tmp/.claude"), Path("/tmp/s"), Path("/tmp/q"), Path("/tmp/l")), Path("/mnt/c/claude.exe"), item, 10, True)
 
         self.assertEqual(result.returncode, 0)
         command = run.call_args.args[0]
-        self.assertEqual(command[:3], ["cmd.exe", "/d", "/c"])
-        self.assertIn('set "ANTHROPIC_API_KEY="', command[3])
-        self.assertIn("py -3", command[3])
+        self.assertEqual(command[0], "hidden-proxy")
+        wrapped = hidden.call_args.args[0]
+        self.assertEqual(wrapped[:3], ["cmd.exe", "/d", "/c"])
+        self.assertIn('set "ANTHROPIC_API_KEY="', wrapped[3])
+        self.assertIn("py -3", wrapped[3])
         self.assertEqual(captured_payload["prompt"], "continua")
         self.assertIn("--resume", captured_payload["args"])
         self.assertIn("--ide", captured_payload["args"])

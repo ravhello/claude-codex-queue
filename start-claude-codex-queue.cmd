@@ -1,2 +1,2 @@
 @echo off
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File "%~dp0start-claude-codex-queue.ps1"
+start "" /b wscript.exe //B //Nologo "%~dp0start-claude-codex-queue-hidden.vbs"

@@ -390,9 +390,10 @@ def windows_path_accessible(value: str | None) -> bool:
     command = f"if (Test-Path -LiteralPath {powershell_single_quote(str(value))}) {{ exit 0 }} else {{ exit 1 }}"
     try:
         result = subprocess.run(
-            ["powershell.exe", "-NoProfile", "-Command", command],
+            local_powershell_hidden_command(command),
             capture_output=True,
             timeout=8,
+            **background_process_kwargs(),
         )
     except (OSError, subprocess.SubprocessError):
         return False
@@ -411,6 +412,245 @@ def local_to_windows_path(path: Path) -> str:
         rest = match.group(2).replace("/", "\\")
         return f"{drive}:\\{rest}"
     return raw
+
+
+def background_process_kwargs() -> dict[str, int]:
+    if os.name != "nt":
+        return {}
+    creation_flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    return {"creationflags": creation_flags} if creation_flags else {}
+
+
+def local_powershell_hidden_command(script: str, powershell: str | None = None) -> list[str]:
+    executable = powershell or shutil.which("powershell.exe") or "powershell.exe"
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    return [
+        executable,
+        "-NoLogo",
+        "-NoProfile",
+        "-NonInteractive",
+        "-WindowStyle",
+        "Hidden",
+        "-ExecutionPolicy",
+        "Bypass",
+        "-EncodedCommand",
+        encoded,
+    ]
+
+
+WINDOWS_HIDDEN_PROXY_CSHARP = r'''
+using System;
+using System.Diagnostics;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using Microsoft.Win32.SafeHandles;
+
+public static class HiddenProcessProxy
+{
+    private const uint JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000;
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_BASIC_LIMIT_INFORMATION
+    {
+        public long PerProcessUserTimeLimit;
+        public long PerJobUserTimeLimit;
+        public uint LimitFlags;
+        public UIntPtr MinimumWorkingSetSize;
+        public UIntPtr MaximumWorkingSetSize;
+        public uint ActiveProcessLimit;
+        public UIntPtr Affinity;
+        public uint PriorityClass;
+        public uint SchedulingClass;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct IO_COUNTERS
+    {
+        public ulong ReadOperationCount;
+        public ulong WriteOperationCount;
+        public ulong OtherOperationCount;
+        public ulong ReadTransferCount;
+        public ulong WriteTransferCount;
+        public ulong OtherTransferCount;
+    }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+    {
+        public JOBOBJECT_BASIC_LIMIT_INFORMATION BasicLimitInformation;
+        public IO_COUNTERS IoInfo;
+        public UIntPtr ProcessMemoryLimit;
+        public UIntPtr JobMemoryLimit;
+        public UIntPtr PeakProcessMemoryUsed;
+        public UIntPtr PeakJobMemoryUsed;
+    }
+
+    [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
+    private static extern IntPtr CreateJobObject(IntPtr securityAttributes, string name);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool SetInformationJobObject(
+        IntPtr job,
+        int infoClass,
+        ref JOBOBJECT_EXTENDED_LIMIT_INFORMATION info,
+        uint infoLength);
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    private static extern bool AssignProcessToJobObject(IntPtr job, IntPtr process);
+
+    private static string Quote(string value)
+    {
+        if (value.Length > 0 && value.IndexOfAny(new[] { ' ', '\t', '\n', '\v', '"' }) < 0)
+            return value;
+        var result = new StringBuilder("\"");
+        var backslashes = 0;
+        foreach (var character in value)
+        {
+            if (character == '\\')
+            {
+                backslashes++;
+                continue;
+            }
+            if (character == '"')
+                result.Append('\\', backslashes * 2 + 1);
+            else
+                result.Append('\\', backslashes);
+            backslashes = 0;
+            result.Append(character);
+        }
+        result.Append('\\', backslashes * 2);
+        result.Append('"');
+        return result.ToString();
+    }
+
+    private static void Copy(Stream source, Stream destination, bool closeDestination)
+    {
+        try
+        {
+            var buffer = new byte[8192];
+            int count;
+            while ((count = source.Read(buffer, 0, buffer.Length)) > 0)
+            {
+                destination.Write(buffer, 0, count);
+                destination.Flush();
+            }
+        }
+        catch (IOException) { }
+        catch (ObjectDisposedException) { }
+        finally
+        {
+            if (closeDestination)
+            {
+                try { destination.Close(); } catch { }
+            }
+        }
+    }
+
+    public static int Run(string fileName, string[] arguments, string workingDirectory)
+    {
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = fileName,
+            Arguments = String.Join(" ", Array.ConvertAll(arguments, Quote)),
+            UseShellExecute = false,
+            CreateNoWindow = true,
+            WindowStyle = ProcessWindowStyle.Hidden,
+            RedirectStandardInput = true,
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            StandardOutputEncoding = new UTF8Encoding(false),
+            StandardErrorEncoding = new UTF8Encoding(false)
+        };
+        if (!String.IsNullOrEmpty(workingDirectory))
+            startInfo.WorkingDirectory = workingDirectory;
+
+        using (var process = new Process { StartInfo = startInfo })
+        using (var job = new SafeFileHandle(CreateJobObject(IntPtr.Zero, null), true))
+        {
+            if (job.IsInvalid)
+                throw new InvalidOperationException("CreateJobObject failed: " + Marshal.GetLastWin32Error());
+            var limits = new JOBOBJECT_EXTENDED_LIMIT_INFORMATION();
+            limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            if (!SetInformationJobObject(job.DangerousGetHandle(), 9, ref limits, (uint)Marshal.SizeOf(limits)))
+                throw new InvalidOperationException("SetInformationJobObject failed: " + Marshal.GetLastWin32Error());
+            if (!process.Start())
+                throw new InvalidOperationException("Unable to start hidden child process.");
+            if (!AssignProcessToJobObject(job.DangerousGetHandle(), process.Handle))
+            {
+                try { process.Kill(); } catch { }
+                throw new InvalidOperationException("AssignProcessToJobObject failed: " + Marshal.GetLastWin32Error());
+            }
+
+            var input = new Thread(() => Copy(Console.OpenStandardInput(), process.StandardInput.BaseStream, true));
+            var output = new Thread(() => Copy(process.StandardOutput.BaseStream, Console.OpenStandardOutput(), false));
+            var error = new Thread(() => Copy(process.StandardError.BaseStream, Console.OpenStandardError(), false));
+            input.IsBackground = true;
+            output.IsBackground = true;
+            error.IsBackground = true;
+            input.Start();
+            output.Start();
+            error.Start();
+            process.WaitForExit();
+            output.Join(3000);
+            error.Join(3000);
+            return process.ExitCode;
+        }
+    }
+}
+'''
+
+
+def local_windows_hidden_command(command: list[str], cwd: str | None = None) -> list[str]:
+    if not command:
+        raise ValueError("Comando Windows vuoto.")
+    arguments = ", ".join(powershell_single_quote(value) for value in command[1:])
+    source = base64.b64encode(WINDOWS_HIDDEN_PROXY_CSHARP.encode("utf-8")).decode("ascii")
+    source_hash = hashlib.sha256(WINDOWS_HIDDEN_PROXY_CSHARP.encode("utf-8")).hexdigest()[:16]
+    lines = [
+        "$ErrorActionPreference = 'Stop'",
+        "$ProgressPreference = 'SilentlyContinue'",
+        "$InformationPreference = 'SilentlyContinue'",
+        "$utf8 = [System.Text.UTF8Encoding]::new($false)",
+        "[Console]::InputEncoding = $utf8",
+        "[Console]::OutputEncoding = $utf8",
+        "$OutputEncoding = $utf8",
+        f"$source = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('{source}'))",
+        "$cache = Join-Path $env:LOCALAPPDATA 'ClaudeCodexQueue'",
+        f"$assembly = Join-Path $cache 'HiddenProcessProxy-{source_hash}.dll'",
+        f"$mutex = [Threading.Mutex]::new($false, 'Local\\ClaudeCodexQueueHiddenProxy-{source_hash}')",
+        "$locked = $mutex.WaitOne(30000)",
+        "if (-not $locked) { throw 'Timeout preparando il proxy Windows nascosto.' }",
+        "try {",
+        "  if (-not (Test-Path -LiteralPath $assembly)) {",
+        "    New-Item -ItemType Directory -Path $cache -Force | Out-Null",
+        "    $temporary = $assembly + '.' + $PID + '.tmp.dll'",
+        "    try {",
+        "      Add-Type -TypeDefinition $source -Language CSharp -OutputAssembly $temporary -OutputType Library | Out-Null",
+        "      Move-Item -LiteralPath $temporary -Destination $assembly -Force",
+        "    } finally {",
+        "      Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue",
+        "    }",
+        "  }",
+        "} finally {",
+        "  $mutex.ReleaseMutex()",
+        "  $mutex.Dispose()",
+        "}",
+        "Add-Type -Path $assembly | Out-Null",
+    ]
+    lines.extend(
+        [
+            (
+                f"$code = [HiddenProcessProxy]::Run("
+                f"{powershell_single_quote(command[0])}, "
+                f"[string[]]@({arguments}), "
+                f"{powershell_single_quote(cwd or '')})"
+            ),
+            "exit $code",
+        ]
+    )
+    return local_powershell_hidden_command("\n".join(lines))
 
 
 def current_windows_user_home_from_cwd() -> Path | None:
@@ -655,23 +895,15 @@ do {
 Write-Error "CLAUDE_TRY_AGAIN_NOT_FOUND"
 exit 4
 '''.replace("__SESSION_ID__", local_session_id)
-    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
     try:
         process = subprocess.run(
-            [
-                powershell,
-                "-NoProfile",
-                "-NonInteractive",
-                "-ExecutionPolicy",
-                "Bypass",
-                "-EncodedCommand",
-                encoded,
-            ],
+            local_powershell_hidden_command(script, powershell),
             text=True,
             encoding="utf-8",
             errors="replace",
             capture_output=True,
             timeout=timeout,
+            **background_process_kwargs(),
         )
     except subprocess.TimeoutExpired:
         return ClaudeRunResult(
@@ -722,6 +954,8 @@ def codex_executable_is_windows(codex_exe: Path) -> bool:
 def codex_cli_command(codex_exe: Path, arguments: list[str]) -> list[str]:
     if codex_executable_is_windows(codex_exe):
         executable = local_to_windows_path(codex_exe)
+        if is_wsl():
+            return local_windows_hidden_command([executable, *arguments])
         return ["cmd.exe", "/d", "/c", "call", executable, *arguments]
     return [str(codex_exe), *arguments]
 
@@ -744,6 +978,7 @@ def run_codex_cli_command(
             codex_home,
             windows=codex_executable_is_windows(codex_exe),
         ),
+        **background_process_kwargs(),
     )
 
 
@@ -1242,20 +1477,22 @@ rows = connection.execute("SELECT " + ", ".join(selected) + " FROM threads").fet
 print(json.dumps([dict(row) for row in rows], ensure_ascii=True))
 """
     try:
+        command = [
+            "py.exe",
+            "-3",
+            "-c",
+            script,
+            local_to_windows_path(database),
+            json.dumps(columns),
+        ]
         result = subprocess.run(
-            [
-                "py.exe",
-                "-3",
-                "-c",
-                script,
-                local_to_windows_path(database),
-                json.dumps(columns),
-            ],
+            local_windows_hidden_command(command),
             text=True,
             encoding="utf-8",
             errors="replace",
             capture_output=True,
             timeout=15,
+            **background_process_kwargs(),
         )
         values = json.loads(result.stdout) if result.returncode == 0 else []
     except (OSError, subprocess.SubprocessError, json.JSONDecodeError):
@@ -1354,6 +1591,7 @@ def codex_app_server_request(
             codex_home,
             windows=codex_executable_is_windows(codex_exe),
         ),
+        **background_process_kwargs(),
     )
     responses: queue_module.Queue[dict[str, Any]] = queue_module.Queue()
     stderr_lines: list[str] = []
@@ -4719,14 +4957,16 @@ def run_claude_local_windows(
             f"py -3 {local_to_windows_path(launcher_path)} "
             f"{local_to_windows_path(payload_path)}"
         )
+        windows_command = ["cmd.exe", "/d", "/c", command]
         return subprocess.run(
-            ["cmd.exe", "/d", "/c", command],
+            local_windows_hidden_command(windows_command) if is_wsl() else windows_command,
             text=True,
             encoding="utf-8",
             errors="replace",
             capture_output=True,
             timeout=timeout + 30,
             env=claude_subprocess_env(),
+            **background_process_kwargs(),
         )
 
 
@@ -4785,8 +5025,9 @@ def run_codex(
         if not is_windows_path(cwd):
             raise SystemExit(f"Il CLI Codex Windows non puo' riprendere una task con cwd non Windows: {cwd}")
         executable = local_to_windows_path(codex_exe)
+        windows_command = ["cmd.exe", "/d", "/c", "cd", "/d", cwd, "&&", "call", executable, *arguments]
         proc = subprocess.run(
-            ["cmd.exe", "/d", "/c", "cd", "/d", cwd, "&&", "call", executable, *arguments],
+            local_windows_hidden_command(windows_command) if is_wsl() else windows_command,
             input=prompt,
             text=True,
             encoding="utf-8",
@@ -4794,6 +5035,7 @@ def run_codex(
             capture_output=True,
             timeout=timeout,
             env=codex_subprocess_env(paths.codex_home, windows=True),
+            **background_process_kwargs(),
         )
     else:
         proc = subprocess.run(
@@ -5479,7 +5721,16 @@ def command_doctor(args: argparse.Namespace) -> int:
     print(f"Codex CLI:    {codex_exe or 'NON TROVATO'}")
     if claude_exe:
         try:
-            result = subprocess.run([str(claude_exe), "--version"], text=True, capture_output=True, timeout=15)
+            version_command = [local_to_windows_path(claude_exe), "--version"]
+            if is_wsl():
+                version_command = local_windows_hidden_command(version_command)
+            result = subprocess.run(
+                version_command,
+                text=True,
+                capture_output=True,
+                timeout=15,
+                **background_process_kwargs(),
+            )
             print(f"Versione:     {result.stdout.strip() or result.stderr.strip()}")
         except (OSError, subprocess.SubprocessError) as exc:
             print(f"Versione:     errore: {exc}")

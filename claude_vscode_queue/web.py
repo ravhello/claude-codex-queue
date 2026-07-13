@@ -311,12 +311,18 @@ class WebState:
             if self._version_cache is not None and now - self._version_cache_at < max_age_seconds:
                 return self._version_cache
         try:
+            command = [str(self.claude_exe), "--version"]
+            if app.is_wsl() and app.codex_executable_is_windows(self.claude_exe):
+                command = app.local_windows_hidden_command(
+                    [app.local_to_windows_path(self.claude_exe), "--version"]
+                )
             result = subprocess.run(
-                [str(self.claude_exe), "--version"],
+                command,
                 cwd=PROJECT_ROOT,
                 text=True,
                 capture_output=True,
                 timeout=5,
+                **app.background_process_kwargs(),
             )
             version = (result.stdout or result.stderr).strip()
         except subprocess.SubprocessError as exc:
@@ -486,6 +492,7 @@ class WebState:
                     stdout=log_handle,
                     stderr=subprocess.STDOUT,
                     text=True,
+                    **app.background_process_kwargs(),
                 )
             finally:
                 log_handle.close()
@@ -827,7 +834,14 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
         command = self.state.base_command() + ["run", "--once"]
         if dry_run:
             command.append("--dry-run")
-        result = subprocess.run(command, cwd=PROJECT_ROOT, text=True, capture_output=True, timeout=120)
+        result = subprocess.run(
+            command,
+            cwd=PROJECT_ROOT,
+            text=True,
+            capture_output=True,
+            timeout=120,
+            **app.background_process_kwargs(),
+        )
         queue = app.load_queue(self.state.paths.queue_file)
         return {
             "returncode": result.returncode,

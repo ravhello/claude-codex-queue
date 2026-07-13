@@ -1,2 +1,2 @@
 @echo off
-call "%~dp0start-claude-codex-queue.cmd"
+start "" /b wscript.exe //B //Nologo "%~dp0start-claude-codex-queue-hidden.vbs"

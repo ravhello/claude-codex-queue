@@ -3,9 +3,9 @@ $ErrorActionPreference = "Stop"
 $Project = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Startup = [Environment]::GetFolderPath("Startup")
 $ShortcutPath = Join-Path $Startup "Claude + Codex Queue.lnk"
-$Launcher = Join-Path $Project "start-claude-codex-queue.ps1"
+$Launcher = Join-Path $Project "start-claude-codex-queue-hidden.vbs"
 $Icon = Join-Path $Project "assets\claude-codex-queue.ico"
-$PowerShell = Join-Path $PSHOME "powershell.exe"
+$WScript = Join-Path $env:WINDIR "System32\wscript.exe"
 
 if (-not (Test-Path -LiteralPath $Launcher)) {
     throw "Launcher non trovato: $Launcher"
@@ -16,11 +16,11 @@ if (-not (Test-Path -LiteralPath $Startup)) {
 
 $Shell = New-Object -ComObject WScript.Shell
 $Shortcut = $Shell.CreateShortcut($ShortcutPath)
-$Shortcut.TargetPath = $PowerShell
-$Shortcut.Arguments = "-NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$Launcher`""
+$Shortcut.TargetPath = $WScript
+$Shortcut.Arguments = "//B //Nologo `"$Launcher`""
 $Shortcut.WorkingDirectory = $Project
 $Shortcut.IconLocation = $Icon
-$Shortcut.Description = "Avvia automaticamente Claude + Codex Queue e apre il browser"
+$Shortcut.Description = "Avvia Claude + Codex Queue interamente in background e apre il browser"
 $Shortcut.WindowStyle = 7
 $Shortcut.Save()
 
