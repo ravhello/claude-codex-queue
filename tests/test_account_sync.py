@@ -1186,6 +1186,22 @@ class AccountSyncTests(unittest.TestCase):
             self.assertIsNotNone(stopped["automatic_last_check_at"])
             self.assertIsNone(stopped["automatic_last_error"])
 
+    def test_web_runner_discovery_requires_matching_state_directory(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            state = web.WebState(paths, None, None)
+            matching = (
+                f"/usr/bin/python3 -m claude_codex_queue --state-dir {paths.state_dir} "
+                "run --poll-seconds 60"
+            )
+            unrelated = (
+                "/usr/bin/python3 -m claude_codex_queue --state-dir /tmp/other-state "
+                "run --poll-seconds 60"
+            )
+
+            self.assertTrue(state.command_is_runner_for_state(matching))
+            self.assertFalse(state.command_is_runner_for_state(unrelated))
+
     def test_web_runner_monitor_leaves_empty_queue_idle(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = self._paths(Path(tmp))

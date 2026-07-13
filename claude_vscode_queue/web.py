@@ -155,14 +155,28 @@ class WebState:
             return False
         return True
 
+    def command_is_runner_for_state(self, command: str | None) -> bool:
+        if not command:
+            return False
+        padded = f" {command} "
+        state_dir = str(self.paths.state_dir)
+        state_matches = (
+            f" --state-dir {state_dir} " in padded
+            or f" --state-dir={state_dir} " in padded
+        )
+        return bool(
+            state_matches
+            and any(f" -m {module} " in padded for module in RUNNER_MODULES)
+            and " run " in padded
+        )
+
     def runner_process_from_pid_file(self) -> tuple[int | None, str | None]:
         try:
             pid = int(self.runner_pid_file.read_text(encoding="utf-8").strip())
         except (OSError, ValueError):
             return None, None
         command = self.process_command(pid)
-        padded = f" {command or ''} "
-        if not command or not any(f" -m {module} " in padded for module in RUNNER_MODULES) or " run " not in padded:
+        if not self.command_is_runner_for_state(command):
             return None, None
         return (pid, command) if self.process_running(pid) else (None, None)
 
@@ -175,10 +189,7 @@ class WebState:
                 continue
             pid = int(entry.name)
             command = self.process_command(pid)
-            if not command:
-                continue
-            padded = f" {command} "
-            if any(f" -m {module} " in padded for module in RUNNER_MODULES) and " run " in padded and ".web" not in padded:
+            if self.command_is_runner_for_state(command) and ".web" not in command:
                 return pid, command
         return None, None
 

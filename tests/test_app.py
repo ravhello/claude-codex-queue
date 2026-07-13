@@ -614,6 +614,42 @@ class QueueAppTests(unittest.TestCase):
             self.assertEqual(waiting["status"], "waiting_retry")
             self.assertIn("Non ho inviato alcun messaggio", waiting["last_error"])
 
+    def test_claude_desktop_try_again_normalizes_clixml_not_found_as_retryable(self) -> None:
+        paths = app.Paths(
+            Path("C:/Users/test"),
+            Path("C:/Users/test/.claude"),
+            Path("C:/Users/test/.state"),
+            Path("C:/Users/test/.state/queue.json"),
+            Path("C:/Users/test/.state/logs"),
+        )
+        item = {
+            "session_id": "72346b12-a331-42dc-83d1-a7a36e7bdb6d",
+            "source": "Claude Windows App",
+            "source_key": "claude_windows_app",
+        }
+        clixml = '#< CLIXML\n<Objs><S S="Error">CLAUDE_TRY_AGAIN_NOT_FOUND</S></Objs>'
+        completed = app.subprocess.CompletedProcess([], 1, "", clixml)
+
+        with patch.object(
+            app,
+            "claude_desktop_local_session_id",
+            return_value="local_5aa69d88-defb-4fe6-934b-ece6692d1480",
+        ), patch.object(app.shutil, "which", return_value="powershell.exe"), patch.object(
+            app.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            result = app.run_claude_desktop_try_again(paths, item)
+
+        self.assertEqual(result.returncode, app.CLAUDE_DESKTOP_TRY_AGAIN_EXIT)
+        self.assertEqual(result.stderr, "CLAUDE_TRY_AGAIN_NOT_FOUND")
+        command = run.call_args.args[0]
+        encoded = command[command.index("-EncodedCommand") + 1]
+        script = base64.b64decode(encoded).decode("utf-16-le")
+        self.assertIn('$ProgressPreference = "SilentlyContinue"', script)
+        self.assertIn('[Console]::Error.WriteLine("CLAUDE_TRY_AGAIN_NOT_FOUND")', script)
+        self.assertNotIn('Write-Error "CLAUDE_TRY_AGAIN_NOT_FOUND"', script)
+
     def test_run_codex_uses_structured_transcript_reset_when_output_has_no_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

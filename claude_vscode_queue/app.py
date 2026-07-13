@@ -827,6 +827,14 @@ def claude_desktop_local_session_id(paths: Paths, item: dict[str, Any]) -> str |
     return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]+", value) else None
 
 
+def normalize_powershell_automation_error(text: str) -> str:
+    if "CLAUDE_TRY_AGAIN_NOT_FOUND" in text:
+        return "CLAUDE_TRY_AGAIN_NOT_FOUND"
+    if "#< CLIXML" not in text:
+        return text
+    return "Automazione Windows PowerShell non riuscita."
+
+
 def run_claude_desktop_try_again(paths: Paths, item: dict[str, Any], timeout: int = 50) -> ClaudeRunResult:
     local_session_id = claude_desktop_local_session_id(paths, item)
     if not local_session_id:
@@ -848,10 +856,12 @@ def run_claude_desktop_try_again(paths: Paths, item: dict[str, Any], timeout: in
         )
     script = r'''
 $ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+$InformationPreference = "SilentlyContinue"
 $sessionId = "__SESSION_ID__"
-Start-Process ("claude://code/" + $sessionId)
-Add-Type -AssemblyName UIAutomationClient
-Add-Type -AssemblyName UIAutomationTypes
+Start-Process ("claude://code/" + $sessionId) | Out-Null
+Add-Type -AssemblyName UIAutomationClient | Out-Null
+Add-Type -AssemblyName UIAutomationTypes | Out-Null
 $names = @("Try again", "Retry", "Riprova", "Prova di nuovo", "Ritenta")
 $deadline = [DateTime]::UtcNow.AddSeconds(40)
 do {
@@ -892,7 +902,7 @@ do {
     exit 0
   }
 } while ([DateTime]::UtcNow -lt $deadline)
-Write-Error "CLAUDE_TRY_AGAIN_NOT_FOUND"
+[Console]::Error.WriteLine("CLAUDE_TRY_AGAIN_NOT_FOUND")
 exit 4
 '''.replace("__SESSION_ID__", local_session_id)
     try:
@@ -913,10 +923,13 @@ exit 4
             rate_limited=False,
             reset_at=None,
         )
+    stdout = process.stdout or ""
+    stderr = process.stderr or ""
+    not_found = "CLAUDE_TRY_AGAIN_NOT_FOUND" in f"{stdout}\n{stderr}"
     return ClaudeRunResult(
-        returncode=process.returncode,
-        stdout=process.stdout,
-        stderr=process.stderr,
+        returncode=CLAUDE_DESKTOP_TRY_AGAIN_EXIT if not_found else process.returncode,
+        stdout=stdout,
+        stderr=normalize_powershell_automation_error(stderr),
         rate_limited=False,
         reset_at=None,
     )
