@@ -31,7 +31,7 @@ ACCOUNT_INDEX_FILE_NAME = "accounts.json"
 DESKTOP_SYNC_STATE_FILE_NAME = "desktop-sync-state.json"
 LOG_DIR_NAME = "logs"
 AUTO_CONTINUE_CANCEL_DIR_NAME = "auto-continue-cancellations"
-QUEUE_VERSION = 1
+QUEUE_VERSION = 2
 
 STATUS_PENDING = "pending"
 STATUS_DONE = "done"
@@ -835,7 +835,12 @@ def normalize_powershell_automation_error(text: str) -> str:
     return "Automazione Windows PowerShell non riuscita."
 
 
-def run_claude_desktop_try_again(paths: Paths, item: dict[str, Any], timeout: int = 50) -> ClaudeRunResult:
+def run_claude_desktop_try_again(
+    paths: Paths,
+    item: dict[str, Any],
+    timeout: int = 20,
+    scan_seconds: int = 12,
+) -> ClaudeRunResult:
     local_session_id = claude_desktop_local_session_id(paths, item)
     if not local_session_id:
         return ClaudeRunResult(
@@ -860,10 +865,11 @@ $ProgressPreference = "SilentlyContinue"
 $InformationPreference = "SilentlyContinue"
 $sessionId = "__SESSION_ID__"
 Start-Process ("claude://code/" + $sessionId) | Out-Null
+Start-Sleep -Milliseconds 1200
 Add-Type -AssemblyName UIAutomationClient | Out-Null
 Add-Type -AssemblyName UIAutomationTypes | Out-Null
 $names = @("Try again", "Retry", "Riprova", "Prova di nuovo", "Ritenta")
-$deadline = [DateTime]::UtcNow.AddSeconds(40)
+$deadline = [DateTime]::UtcNow.AddSeconds(__SCAN_SECONDS__)
 do {
   Start-Sleep -Milliseconds 750
   $root = [System.Windows.Automation.AutomationElement]::RootElement
@@ -904,7 +910,10 @@ do {
 } while ([DateTime]::UtcNow -lt $deadline)
 [Console]::Error.WriteLine("CLAUDE_TRY_AGAIN_NOT_FOUND")
 exit 4
-'''.replace("__SESSION_ID__", local_session_id)
+'''.replace("__SESSION_ID__", local_session_id).replace(
+        "__SCAN_SECONDS__",
+        str(max(3, min(int(scan_seconds), max(3, int(timeout) - 3)))),
+    )
     try:
         process = subprocess.run(
             local_powershell_hidden_command(script, powershell),
@@ -4478,15 +4487,142 @@ def mark_auto_continue_cancelled(queue_file: Path, auto_continue: dict[str, Any]
         pass
 
 
+def auto_continue_revision(auto_continue: dict[str, Any]) -> float:
+    for key in ("updated_at", "created_at"):
+        value = auto_continue.get(key)
+        parsed = parse_iso(value if isinstance(value, str) else None)
+        if parsed is not None:
+            return parsed.timestamp()
+    return 0.0
+
+
+def compare_auto_continue_states(left: dict[str, Any], right: dict[str, Any]) -> int:
+    left_activation = ensure_auto_continue_activation_id(left)
+    right_activation = ensure_auto_continue_activation_id(right)
+    if left_activation != right_activation:
+        left_created = parse_iso(left.get("created_at"))
+        right_created = parse_iso(right.get("created_at"))
+        if left_created is not None and right_created is not None and left_created != right_created:
+            return 1 if left_created > right_created else -1
+        if left_created is not None and right_created is None:
+            return 1
+        if left_created is None and right_created is not None:
+            return -1
+
+    left_revision = auto_continue_revision(left)
+    right_revision = auto_continue_revision(right)
+    if left_revision == right_revision:
+        return 0
+    return 1 if left_revision > right_revision else -1
+
+
+def auto_continue_state_key(auto_continue: dict[str, Any]) -> str:
+    session_id = str(auto_continue.get("session_id") or "")
+    if session_id:
+        return f"session:{session_id}"
+    return f"activation:{ensure_auto_continue_activation_id(auto_continue)}"
+
+
+def auto_continue_states(data: dict[str, Any]) -> list[dict[str, Any]]:
+    raw_states = data.get("auto_continues")
+    candidates = [state for state in raw_states if isinstance(state, dict)] if isinstance(raw_states, list) else []
+    legacy = data.get("auto_continue")
+    if isinstance(legacy, dict):
+        candidates.append(legacy)
+
+    states: list[dict[str, Any]] = []
+    positions: dict[str, int] = {}
+    for state in candidates:
+        ensure_auto_continue_activation_id(state)
+        key = auto_continue_state_key(state)
+        position = positions.get(key)
+        if position is None:
+            positions[key] = len(states)
+            states.append(state)
+            continue
+        if compare_auto_continue_states(state, states[position]) > 0:
+            states[position] = state
+
+    data["auto_continues"] = states
+    sync_auto_continue_legacy(data)
+    return states
+
+
+def auto_continue_schedule_key(auto_continue: dict[str, Any]) -> tuple[int, float, float, str]:
+    now = dt.datetime.now(UTC)
+    not_before = parse_iso(auto_continue.get("not_before"))
+    ready = not_before is None or not_before <= now
+    last_check = parse_iso(auto_continue.get("last_check_at"))
+    created = parse_iso(auto_continue.get("created_at"))
+    return (
+        0 if ready else 1,
+        (last_check or created).timestamp() if ready and (last_check or created) else (not_before.timestamp() if not_before else 0.0),
+        created.timestamp() if created else 0.0,
+        str(auto_continue.get("session_id") or ""),
+    )
+
+
+def sync_auto_continue_legacy(data: dict[str, Any]) -> dict[str, Any] | None:
+    raw_states = data.get("auto_continues")
+    states = [state for state in raw_states if isinstance(state, dict)] if isinstance(raw_states, list) else []
+    active = [state for state in states if state.get("enabled")]
+    if active:
+        primary = min(active, key=auto_continue_schedule_key)
+    elif states:
+        primary = max(states, key=auto_continue_revision)
+    else:
+        primary = None
+    data["auto_continue"] = primary
+    return primary
+
+
+def find_auto_continue_state(data: dict[str, Any], session_id: str) -> dict[str, Any] | None:
+    return next(
+        (state for state in auto_continue_states(data) if state.get("session_id") == session_id),
+        None,
+    )
+
+
+def set_auto_continue_state(data: dict[str, Any], state: dict[str, Any]) -> None:
+    states = auto_continue_states(data)
+    key = auto_continue_state_key(state)
+    for index, current in enumerate(states):
+        if auto_continue_state_key(current) == key:
+            states[index] = state
+            break
+    else:
+        states.append(state)
+    data["auto_continues"] = states
+    sync_auto_continue_legacy(data)
+
+
 def apply_auto_continue_cancellation(queue_file: Path, data: dict[str, Any]) -> None:
-    auto_continue = data.get("auto_continue")
-    if not isinstance(auto_continue, dict) or not auto_continue_is_cancelled(queue_file, auto_continue):
-        return
-    auto_continue["enabled"] = False
-    auto_continue["status"] = "disabled"
-    auto_continue.setdefault("disabled_at", now_utc())
-    auto_continue["sending_started_at"] = None
-    auto_continue["next_check_in_seconds"] = None
+    for auto_continue in auto_continue_states(data):
+        if not auto_continue_is_cancelled(queue_file, auto_continue):
+            continue
+        auto_continue["enabled"] = False
+        auto_continue["status"] = "disabled"
+        auto_continue.setdefault("disabled_at", now_utc())
+        auto_continue["sending_started_at"] = None
+        auto_continue["next_check_in_seconds"] = None
+    sync_auto_continue_legacy(data)
+
+
+def merge_auto_continue_collections(data: dict[str, Any], existing: dict[str, Any]) -> None:
+    incoming_states = list(auto_continue_states(data))
+    merged = list(auto_continue_states(existing))
+    positions = {auto_continue_state_key(state): index for index, state in enumerate(merged)}
+    for state in incoming_states:
+        key = auto_continue_state_key(state)
+        position = positions.get(key)
+        if position is None:
+            positions[key] = len(merged)
+            merged.append(state)
+            continue
+        if compare_auto_continue_states(state, merged[position]) >= 0:
+            merged[position] = state
+    data["auto_continues"] = merged
+    sync_auto_continue_legacy(data)
 
 
 @contextlib.contextmanager
@@ -4519,25 +4655,35 @@ def queue_write_lock(queue_file: Path, timeout: float = 10.0):
 
 def load_queue(queue_file: Path) -> dict[str, Any]:
     if not queue_file.exists():
-        return {"version": QUEUE_VERSION, "items": [], "recovery": None, "auto_continue": None}
+        return {"version": QUEUE_VERSION, "items": [], "recovery": None, "auto_continue": None, "auto_continues": []}
     try:
         data = json.loads(queue_file.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError):
-        return {"version": QUEUE_VERSION, "items": [], "recovery": None, "auto_continue": None}
+        return {"version": QUEUE_VERSION, "items": [], "recovery": None, "auto_continue": None, "auto_continues": []}
     if not isinstance(data, dict):
-        return {"version": QUEUE_VERSION, "items": [], "recovery": None, "auto_continue": None}
+        return {"version": QUEUE_VERSION, "items": [], "recovery": None, "auto_continue": None, "auto_continues": []}
     if not isinstance(data.get("items"), list):
         data["items"] = []
-    data.setdefault("version", QUEUE_VERSION)
+    data["version"] = QUEUE_VERSION
     data.setdefault("recovery", None)
     data.setdefault("auto_continue", None)
+    auto_continue_states(data)
     apply_auto_continue_cancellation(queue_file, data)
     return data
 
 
-def save_queue(queue_file: Path, data: dict[str, Any]) -> None:
+def save_queue(queue_file: Path, data: dict[str, Any], *, merge_auto_continues: bool = True) -> None:
     queue_file.parent.mkdir(parents=True, exist_ok=True)
     with queue_write_lock(queue_file):
+        if merge_auto_continues and queue_file.is_file():
+            try:
+                existing = json.loads(queue_file.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                existing = None
+            if isinstance(existing, dict):
+                merge_auto_continue_collections(data, existing)
+        data["version"] = QUEUE_VERSION
+        auto_continue_states(data)
         apply_auto_continue_cancellation(queue_file, data)
         payload = json.dumps(data, ensure_ascii=False, indent=2)
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=queue_file.parent, delete=False) as handle:
@@ -5356,10 +5502,14 @@ def active_recovery(queue: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def active_auto_continue(queue: dict[str, Any]) -> dict[str, Any] | None:
-    auto_continue = queue.get("auto_continue")
-    if not isinstance(auto_continue, dict) or not auto_continue.get("enabled"):
-        return None
-    return auto_continue
+    active = active_auto_continues(queue)
+    selected = min(active, key=auto_continue_schedule_key) if active else None
+    queue["auto_continue"] = selected or sync_auto_continue_legacy(queue)
+    return selected
+
+
+def active_auto_continues(queue: dict[str, Any]) -> list[dict[str, Any]]:
+    return [state for state in auto_continue_states(queue) if state.get("enabled")]
 
 
 def item_ready(item: dict[str, Any]) -> bool:
@@ -5836,19 +5986,19 @@ def command_status(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.windows_home, args.state_dir)
     queue = load_queue(paths.queue_file)
     recovery = active_recovery(queue)
-    auto_continue = active_auto_continue(queue)
+    auto_continues = active_auto_continues(queue)
     if recovery:
         print(
             f"Recovery attiva: prossima azione '{truncate(recovery.get('recovery_prompt_preview') or recovery.get('prompt') or 'analisi automatica', 80)}' "
             f"chat={str(recovery.get('session_id', ''))[:8]} not_before={recovery.get('not_before')}"
         )
-    if auto_continue:
+    for auto_continue in auto_continues:
         print(
             f"Auto-continua attivo: chat={str(auto_continue.get('session_id', ''))[:8]} "
             f"azione={auto_continue.get('action') or 'monitor'} not_before={auto_continue.get('not_before')}"
         )
     items = queue.get("items", [])
-    if not items and not recovery and not auto_continue:
+    if not items and not recovery and not auto_continues:
         print("Coda vuota.")
         return 0
     for index, item in enumerate(items, start=1):
@@ -5870,16 +6020,19 @@ def command_clear(args: argparse.Namespace) -> int:
     queue = load_queue(paths.queue_file)
     before = len(queue.get("items", []))
     if args.all:
+        for auto_continue in active_auto_continues(queue):
+            mark_auto_continue_cancelled(paths.queue_file, auto_continue)
         queue["items"] = []
         queue["recovery"] = None
         queue["auto_continue"] = None
+        queue["auto_continues"] = []
     else:
         queue["items"] = [
             item
             for item in queue.get("items", [])
             if item.get("status") in {STATUS_PENDING, STATUS_RECOVERY}
         ]
-    save_queue(paths.queue_file, queue)
+    save_queue(paths.queue_file, queue, merge_auto_continues=not args.all)
     print(f"Rimossi {before - len(queue['items'])} elementi.")
     return 0
 
@@ -5916,13 +6069,20 @@ def command_reset(args: argparse.Namespace) -> int:
     if recovery and (not args.item or recovery.get("source_item_id") == args.item):
         queue["recovery"] = None
         changed += 1
-    auto_continue = active_auto_continue(queue)
-    if auto_continue and (not args.item or auto_continue.get("session_id") == args.item):
+    for auto_continue in active_auto_continues(queue):
+        if args.item and auto_continue.get("session_id") != args.item:
+            continue
         mark_auto_continue_cancelled(paths.queue_file, auto_continue)
-        auto_continue["enabled"] = False
-        auto_continue["status"] = "disabled"
-        auto_continue["disabled_at"] = now_utc()
+        update_auto_continue_state(
+            auto_continue,
+            "disabled",
+            enabled=False,
+            disabled_at=now_utc(),
+            sending_started_at=None,
+            next_check_in_seconds=None,
+        )
         changed += 1
+    sync_auto_continue_legacy(queue)
     save_queue(paths.queue_file, queue)
     print(f"Riattivati {changed} elementi.")
     return 0
@@ -5964,8 +6124,7 @@ def seconds_until_ready(queue: dict[str, Any], default: int) -> int:
         not_before = parse_iso(recovery.get("not_before"))
         if not_before and not_before > now:
             waits.append(max(1, int((not_before - now).total_seconds())))
-    auto_continue = active_auto_continue(queue)
-    if auto_continue:
+    for auto_continue in active_auto_continues(queue):
         not_before = parse_iso(auto_continue.get("not_before"))
         if not_before and not_before > now:
             waits.append(max(1, int((not_before - now).total_seconds())))
@@ -6143,7 +6302,9 @@ def command_run(args: argparse.Namespace) -> int:
                     last_error="Chat non trovata per auto-continua",
                 )
                 save_queue(paths.queue_file, queue)
-                return 1
+                if args.once:
+                    return 1
+                continue
 
             diffs = compare_fingerprints(item["fingerprint"], settings_fingerprint(paths, chat))
             if diffs and not args.ignore_settings_change:
@@ -6157,7 +6318,9 @@ def command_run(args: argparse.Namespace) -> int:
                 print("Auto-continua bloccato: impostazioni della chat cambiate.")
                 for diff in diffs:
                     print(f"  - {diff}")
-                return CONFIG_CHANGED_EXIT
+                if args.once:
+                    return CONFIG_CHANGED_EXIT
+                continue
 
             account_error = account_mismatch_for_item(paths, item) or account_mismatch_for_chat(paths, chat)
             if account_error:
@@ -6171,9 +6334,15 @@ def command_run(args: argparse.Namespace) -> int:
                 )
                 save_queue(paths.queue_file, queue)
                 print(f"Auto-continua bloccato: {account_error}")
-                return 1
+                if args.once:
+                    return 1
+                continue
 
-            if auto_continue.get("monitor_limit", True) and auto_continue.get("status") in {"armed", "monitoring"}:
+            if (
+                auto_continue.get("monitor_limit", True)
+                and auto_continue.get("status") in {"armed", "monitoring"}
+                and not claude_item_is_desktop(item)
+            ):
                 reset_at = latest_rate_limit_reset_from_chat(chat)
                 if reset_at is None:
                     next_check = (
@@ -6191,8 +6360,6 @@ def command_run(args: argparse.Namespace) -> int:
                     print("Auto-continua armato: nessun limite attivo rilevato, non invio nulla.")
                     if args.once:
                         return RATE_LIMIT_EXIT
-                    if not any(item_ready(queued_item) for queued_item in pending_items(queue)):
-                        time.sleep(args.poll_seconds)
                     continue
                 ready_at = reset_at + dt.timedelta(seconds=RATE_LIMIT_RESET_DELAY_SECONDS)
                 update_auto_continue_state(
@@ -6215,12 +6382,16 @@ def command_run(args: argparse.Namespace) -> int:
                         last_error="CLI Codex non trovato durante auto-continua.",
                     )
                     save_queue(paths.queue_file, queue)
-                    return 1
+                    if args.once:
+                        return 1
+                    continue
                 try:
                     prepare_codex_recovery_state(paths, codex_exe, queue, auto_continue)
                 except AutoContinueCancelled as exc:
                     print(str(exc))
-                    return 0
+                    if args.once:
+                        return 0
+                    continue
                 except (OSError, subprocess.SubprocessError, ValueError) as exc:
                     update_auto_continue_state(
                         auto_continue,
@@ -6230,7 +6401,9 @@ def command_run(args: argparse.Namespace) -> int:
                     )
                     save_queue(paths.queue_file, queue)
                     print(f"Auto-continua Codex bloccato: {exc}")
-                    return 1
+                    if args.once:
+                        return 1
+                    continue
                 item = auto_continue_as_item(auto_continue)
             elif claude_item_is_desktop(item):
                 update_auto_continue_state(
@@ -6270,11 +6443,18 @@ def command_run(args: argparse.Namespace) -> int:
             save_queue(paths.queue_file, queue)
             if not auto_continue.get("enabled"):
                 print("Auto-continua disattivato prima dell'invio: nessuna azione eseguita.")
-                return 0
+                if args.once:
+                    return 0
+                continue
             run_started_at = dt.datetime.now(UTC) - dt.timedelta(seconds=5)
             try:
                 if claude_item_is_desktop(item):
-                    result = run_claude_desktop_try_again(paths, item, timeout=min(args.timeout, 55))
+                    result = run_claude_desktop_try_again(
+                        paths,
+                        item,
+                        timeout=min(args.timeout, 20),
+                        scan_seconds=12,
+                    )
                 else:
                     result = run_agent(paths, claude_exe, codex_exe, item, args.timeout, args.ide)
             except subprocess.TimeoutExpired:
@@ -6285,11 +6465,15 @@ def command_run(args: argparse.Namespace) -> int:
                     last_error=f"Timeout auto-continua dopo {args.timeout}s",
                 )
                 save_queue(paths.queue_file, queue)
-                return 1
+                if args.once:
+                    return 1
+                continue
             except (OSError, SystemExit) as exc:
                 update_auto_continue_state(auto_continue, "failed", enabled=False, last_error=str(exc))
                 save_queue(paths.queue_file, queue)
-                return 1
+                if args.once:
+                    return 1
+                continue
 
             auto_continue["last_log"] = write_run_log(paths, item, result)
             if result.returncode == 0:
@@ -6309,7 +6493,9 @@ def command_run(args: argparse.Namespace) -> int:
                     )
                     save_queue(paths.queue_file, queue)
                     print(f"Auto-continua bloccato: {missing_prompt_error}")
-                    return 1
+                    if args.once:
+                        return 1
+                    continue
                 combined_output = f"{result.stdout}\n{result.stderr}"
                 if is_permission_wait_text(combined_output):
                     update_auto_continue_state(
@@ -6322,7 +6508,29 @@ def command_run(args: argparse.Namespace) -> int:
                     )
                     save_queue(paths.queue_file, queue)
                     print(f"Auto-continua bloccato: il provider richiede approvazione. Log: {auto_continue.get('last_log')}")
-                    return 1
+                    if args.once:
+                        return 1
+                    continue
+                if claude_item_is_desktop(item):
+                    update_auto_continue_state(
+                        auto_continue,
+                        "monitoring",
+                        enabled=True,
+                        actions_completed=int(auto_continue.get("actions_completed", 0)) + 1,
+                        last_action_at=now_utc(),
+                        last_observation="try_again_invoked",
+                        last_error=None,
+                        not_before=(
+                            dt.datetime.now(UTC) + dt.timedelta(seconds=args.poll_seconds)
+                        ).replace(microsecond=0).isoformat(),
+                        sending_started_at=None,
+                        next_check_in_seconds=args.poll_seconds,
+                    )
+                    save_queue(paths.queue_file, queue)
+                    print(f"Try again eseguito; monitoraggio ancora attivo. Log: {auto_continue.get('last_log')}")
+                    if args.once:
+                        return 0
+                    continue
                 update_auto_continue_state(
                     auto_continue,
                     "done",
@@ -6339,14 +6547,18 @@ def command_run(args: argparse.Namespace) -> int:
                 continue
 
             if claude_item_is_desktop(item) and result.returncode == CLAUDE_DESKTOP_TRY_AGAIN_EXIT:
+                already_recovered = int(auto_continue.get("actions_completed", 0)) > 0
                 update_auto_continue_state(
                     auto_continue,
-                    "waiting_retry",
+                    "monitoring" if already_recovered else "waiting_retry",
                     enabled=True,
-                    last_error=(
+                    last_error=None
+                    if already_recovered
+                    else (
                         "La chat e' stata aperta, ma il pulsante Try again non e' ancora visibile. "
                         "Non ho inviato alcun messaggio; riprovero' automaticamente."
                     ),
+                    last_observation="try_again_not_visible",
                     not_before=(dt.datetime.now(UTC) + dt.timedelta(seconds=args.poll_seconds)).replace(microsecond=0).isoformat(),
                     sending_started_at=None,
                     next_check_in_seconds=args.poll_seconds,
@@ -6356,7 +6568,6 @@ def command_run(args: argparse.Namespace) -> int:
                 print("Try again non visibile: nessun messaggio inviato, nuovo tentativo programmato.")
                 if args.once:
                     return RATE_LIMIT_EXIT
-                time.sleep(args.poll_seconds)
                 continue
 
             if result.rate_limited:
@@ -6374,7 +6585,6 @@ def command_run(args: argparse.Namespace) -> int:
                 print(f"Session limit ancora attivo. Auto-continua dopo: {auto_continue['not_before']}")
                 if args.once:
                     return RATE_LIMIT_EXIT
-                time.sleep(args.poll_seconds)
                 continue
 
             update_auto_continue_state(
@@ -6386,7 +6596,9 @@ def command_run(args: argparse.Namespace) -> int:
             )
             save_queue(paths.queue_file, queue)
             print(f"Auto-continua fallito. Log: {auto_continue.get('last_log')}")
-            return result.returncode or 1
+            if args.once:
+                return result.returncode or 1
+            continue
 
         candidates = [item for item in pending_items(queue) if item_ready(item)]
         if not candidates:

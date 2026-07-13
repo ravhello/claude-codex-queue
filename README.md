@@ -166,12 +166,16 @@ flowchart LR
     K --> A
 ```
 
-Auto-continue can also monitor a selected session with an empty queue. It sends
-nothing while no active limit is detected.
+Auto-continue can monitor any number of selected sessions with an empty queue.
+Each session keeps independent status, timing, settings and cancellation state;
+one failed or waiting session does not replace or stop the others.
 
 For Claude Desktop Code sessions, auto-continue opens the exact local session
 through Claude's supported deep link and invokes the visible `Try again` control
-through Windows UI Automation. It never substitutes a new `continua` message.
+through Windows UI Automation. It checks the native control directly because
+Claude Desktop can show it without recording a limit in the transcript, and it
+keeps monitoring after a successful invocation. It never substitutes a new
+`continua` message.
 For Codex App tasks, the runner reads structured turn state through app-server:
 a failed turn with no agent progress is removed with `thread/rollback` and sent
 again unchanged, while an interrupted turn that already contains agent activity

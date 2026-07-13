@@ -81,10 +81,12 @@ the original text through the normal authenticated CLI; interrupted work that
 already has agent activity receives `continua`. Additional failed prompts are
 persisted as ordered, high-priority queue items. Rollback plans are stored before
 execution and verified against turn IDs so a restart cannot apply them twice.
-Each auto-continue activation also has a durable cancellation marker. Queue
-writes are serialized, so a runner holding stale state cannot re-enable a
-monitor after it has been disabled; cancellation is checked again immediately
-before dispatch.
+Auto-continue states are stored per session and scheduled fairly by readiness
+and last check time. Each activation also has a durable cancellation marker.
+Queue writes are serialized and merge independently activated sessions, so a
+runner holding stale state cannot drop a newly armed monitor or re-enable one
+after it has been disabled; cancellation is checked again immediately before
+dispatch.
 
 ### Provider execution
 
@@ -111,6 +113,7 @@ timeouts and shutdowns cannot leave detached console processes behind.
 
 - Never consume the next queued prompt as the recovery probe.
 - Never replace Claude Desktop `Try again` with a newly created prompt.
+- Never let one auto-continue activation replace or block another selected session.
 - Never replay a failed Codex user message before its failed turn is rolled back.
 - Never let a stale runner write resurrect a disabled auto-continue activation.
 - Never enable bypass permissions implicitly.

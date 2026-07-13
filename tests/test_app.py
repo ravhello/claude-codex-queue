@@ -568,7 +568,9 @@ class QueueAppTests(unittest.TestCase):
             native.assert_called_once()
             cli.assert_not_called()
             refreshed = app.load_queue(paths.queue_file)
-            self.assertEqual(refreshed["auto_continue"]["status"], "done")
+            self.assertEqual(refreshed["auto_continue"]["status"], "monitoring")
+            self.assertTrue(refreshed["auto_continue"]["enabled"])
+            self.assertEqual(refreshed["auto_continue"]["actions_completed"], 1)
             self.assertEqual(refreshed["auto_continue"]["action"], "claude_try_again")
             self.assertEqual(refreshed["auto_continue"]["prompt"], "Try again")
 
@@ -611,8 +613,206 @@ class QueueAppTests(unittest.TestCase):
             cli.assert_not_called()
             waiting = app.load_queue(paths.queue_file)["auto_continue"]
             self.assertTrue(waiting["enabled"])
-            self.assertEqual(waiting["status"], "waiting_retry")
-            self.assertIn("Non ho inviato alcun messaggio", waiting["last_error"])
+            self.assertEqual(waiting["status"], "monitoring")
+            self.assertIsNone(waiting["last_error"])
+            self.assertEqual(waiting["last_observation"], "try_again_not_visible")
+
+    def test_multiple_claude_desktop_auto_continues_run_independently(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude_home = root / ".claude"
+            project = claude_home / "projects" / "p"
+            project.mkdir(parents=True)
+            sessions = [
+                "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+            ]
+            for session in sessions:
+                (project / f"{session}.jsonl").write_text(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "sessionId": session,
+                            "timestamp": app.now_utc(),
+                            "cwd": str(root),
+                            "message": {"content": f"prompt {session[:8]}"},
+                        }
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            paths = app.Paths(
+                root,
+                claude_home,
+                root / ".state",
+                root / ".state" / "queue.json",
+                root / ".state" / "logs",
+            )
+            chats = {chat.session_id: chat for chat in app.discover_chats(claude_home)}
+            created_at = app.now_utc()
+            states = [
+                {
+                    "activation_id": f"activation-{session[:8]}",
+                    "enabled": True,
+                    "status": "armed",
+                    "monitor_limit": True,
+                    "created_at": created_at,
+                    "updated_at": created_at,
+                    "session_id": session,
+                    "title": "Claude Desktop",
+                    "cwd": str(root),
+                    "prompt": "Try again",
+                    "source": "Claude Windows App",
+                    "source_key": "claude_windows_app",
+                    "provider": app.PROVIDER_CLAUDE,
+                    "attempts": 0,
+                    "not_before": None,
+                    "fingerprint": app.settings_fingerprint(paths, chats[session]),
+                }
+                for session in sessions
+            ]
+            app.save_queue(
+                paths.queue_file,
+                {
+                    "version": app.QUEUE_VERSION,
+                    "items": [],
+                    "recovery": None,
+                    "auto_continue": None,
+                    "auto_continues": states,
+                },
+            )
+            fake = root / "claude"
+            fake.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+            fake.chmod(fake.stat().st_mode | 0o111)
+            missing = app.ClaudeRunResult(
+                app.CLAUDE_DESKTOP_TRY_AGAIN_EXIT,
+                "",
+                "CLAUDE_TRY_AGAIN_NOT_FOUND",
+                False,
+                None,
+            )
+            invoked = app.ClaudeRunResult(0, "CLAUDE_TRY_AGAIN_INVOKED:Try again", "", False, None)
+            command = [
+                "--windows-home",
+                str(root),
+                "--state-dir",
+                str(paths.state_dir),
+                "--claude",
+                str(fake),
+                "run",
+                "--once",
+                "--no-ide",
+                "--poll-seconds",
+                "60",
+            ]
+
+            with patch.object(
+                app,
+                "run_claude_desktop_try_again",
+                side_effect=[missing, invoked],
+            ) as native, patch.object(app, "run_agent") as cli:
+                first = app.main(command)
+                second = app.main(command)
+
+            self.assertEqual(first, app.RATE_LIMIT_EXIT)
+            self.assertEqual(second, 0)
+            cli.assert_not_called()
+            self.assertEqual(
+                [call.args[1]["session_id"] for call in native.call_args_list],
+                sessions,
+            )
+            refreshed = app.load_queue(paths.queue_file)
+            by_session = {state["session_id"]: state for state in app.auto_continue_states(refreshed)}
+            self.assertEqual(set(by_session), set(sessions))
+            self.assertTrue(all(state["enabled"] for state in by_session.values()))
+            self.assertEqual(by_session[sessions[0]]["status"], "waiting_retry")
+            self.assertEqual(by_session[sessions[1]]["status"], "monitoring")
+            self.assertEqual(by_session[sessions[1]]["actions_completed"], 1)
+
+    def test_stale_runner_save_preserves_new_auto_continue_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_file = Path(tmp) / "queue.json"
+            first = {
+                "activation_id": "first-activation",
+                "enabled": True,
+                "status": "armed",
+                "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "created_at": "2026-07-13T10:00:00+02:00",
+                "updated_at": "2026-07-13T10:00:00+02:00",
+            }
+            app.save_queue(
+                queue_file,
+                {"version": 1, "items": [], "recovery": None, "auto_continue": first},
+            )
+            stale = app.load_queue(queue_file)
+            current = app.load_queue(queue_file)
+            app.set_auto_continue_state(
+                current,
+                {
+                    "activation_id": "second-activation",
+                    "enabled": True,
+                    "status": "armed",
+                    "session_id": "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                    "created_at": "2026-07-13T10:01:00+02:00",
+                    "updated_at": "2026-07-13T10:01:00+02:00",
+                },
+            )
+            app.save_queue(queue_file, current)
+            app.update_auto_continue_state(stale["auto_continue"], "monitoring")
+            app.save_queue(queue_file, stale)
+
+            sessions = {
+                state["session_id"]
+                for state in app.auto_continue_states(app.load_queue(queue_file))
+            }
+            self.assertEqual(
+                sessions,
+                {
+                    "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                    "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                },
+            )
+
+    def test_stale_runner_cannot_replace_new_activation_for_same_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            queue_file = Path(tmp) / "queue.json"
+            session_id = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            old_activation = {
+                "activation_id": "old-activation",
+                "enabled": True,
+                "status": "sending",
+                "session_id": session_id,
+                "created_at": "2026-07-13T10:00:00+02:00",
+                "updated_at": "2026-07-13T10:00:00+02:00",
+            }
+            app.save_queue(
+                queue_file,
+                {"version": app.QUEUE_VERSION, "items": [], "recovery": None, "auto_continue": old_activation},
+            )
+            stale_runner = app.load_queue(queue_file)
+            current = app.load_queue(queue_file)
+            app.mark_auto_continue_cancelled(queue_file, current["auto_continue"])
+            app.set_auto_continue_state(
+                current,
+                {
+                    "activation_id": "new-activation",
+                    "enabled": True,
+                    "status": "armed",
+                    "session_id": session_id,
+                    "created_at": "2026-07-13T10:01:00+02:00",
+                    "updated_at": "2026-07-13T10:01:00+02:00",
+                },
+            )
+            app.save_queue(queue_file, current)
+
+            app.update_auto_continue_state(stale_runner["auto_continue"], "monitoring")
+            app.save_queue(queue_file, stale_runner)
+
+            refreshed = app.find_auto_continue_state(app.load_queue(queue_file), session_id)
+            self.assertIsNotNone(refreshed)
+            self.assertEqual(refreshed["activation_id"], "new-activation")
+            self.assertTrue(refreshed["enabled"])
+            self.assertEqual(refreshed["status"], "armed")
 
     def test_claude_desktop_try_again_normalizes_clixml_not_found_as_retryable(self) -> None:
         paths = app.Paths(

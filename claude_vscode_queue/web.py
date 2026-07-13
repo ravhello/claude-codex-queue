@@ -89,6 +89,17 @@ def queue_summary(queue: dict[str, Any]) -> dict[str, int]:
     return counts
 
 
+def auto_continue_payload(
+    queue: dict[str, Any],
+    selected: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    states = app.auto_continue_states(queue)
+    return {
+        "auto_continue": selected if isinstance(selected, dict) else app.sync_auto_continue_legacy(queue),
+        "auto_continues": states,
+    }
+
+
 class WebState:
     def __init__(self, paths: app.Paths, claude_exe: Path | None, codex_exe: Path | None = None):
         self.paths = paths
@@ -615,7 +626,7 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
                     {
                         "items": queue.get("items", []),
                         "recovery": app.active_recovery(queue),
-                        "auto_continue": queue.get("auto_continue"),
+                        **auto_continue_payload(queue),
                         "summary": queue_summary(queue),
                         "queue_file": str(self.state.paths.queue_file),
                         "runner": self.state.runner_status(),
@@ -783,7 +794,7 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             "added": len(messages),
             "items": queue.get("items", []),
             "recovery": app.active_recovery(queue),
-            "auto_continue": queue.get("auto_continue"),
+            **auto_continue_payload(queue),
             "summary": queue_summary(queue),
         }
 
@@ -799,7 +810,7 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             "removed": before - len(queue["items"]),
             "items": queue["items"],
             "recovery": app.active_recovery(queue),
-            "auto_continue": queue.get("auto_continue"),
+            **auto_continue_payload(queue),
             "summary": queue_summary(queue),
         }
 
@@ -820,7 +831,7 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             "reset": changed,
             "items": queue.get("items", []),
             "recovery": app.active_recovery(queue),
-            "auto_continue": queue.get("auto_continue"),
+            **auto_continue_payload(queue),
             "summary": queue_summary(queue),
         }
 
@@ -860,40 +871,59 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             "stderr": result.stderr,
             "items": queue.get("items", []),
             "recovery": app.active_recovery(queue),
-            "auto_continue": queue.get("auto_continue"),
+            **auto_continue_payload(queue),
             "summary": queue_summary(queue),
         }
 
     def api_auto_continue(self, payload: dict[str, Any]) -> dict[str, Any]:
         enabled = bool(payload.get("enabled"))
+        session_id = str(payload.get("session_id") or "")
         queue = app.load_queue(self.state.paths.queue_file)
         if not enabled:
-            auto_continue = queue.get("auto_continue")
-            idle_monitor = False
-            if isinstance(auto_continue, dict):
-                idle_monitor = auto_continue.get("status") in {
+            states = app.auto_continue_states(queue)
+            targets = (
+                [state for state in states if state.get("session_id") == session_id]
+                if session_id
+                else app.active_auto_continues(queue)
+            )
+            idle_monitor = any(
+                state.get("status") in {
                     "armed",
                     "monitoring",
                     "waiting_limit",
                     "waiting_retry",
                 }
+                for state in targets
+            )
+            for auto_continue in targets:
                 app.mark_auto_continue_cancelled(self.state.paths.queue_file, auto_continue)
-                auto_continue["enabled"] = False
-                auto_continue["status"] = "disabled"
-                auto_continue["disabled_at"] = app.now_utc()
+                app.update_auto_continue_state(
+                    auto_continue,
+                    "disabled",
+                    enabled=False,
+                    disabled_at=app.now_utc(),
+                    sending_started_at=None,
+                    next_check_in_seconds=None,
+                )
+            app.sync_auto_continue_legacy(queue)
             app.save_queue(self.state.paths.queue_file, queue)
             runner = self.state.runner_status()
-            if idle_monitor and not app.pending_items(queue) and not app.active_recovery(queue):
+            if (
+                idle_monitor
+                and not app.active_auto_continues(queue)
+                and not app.pending_items(queue)
+                and not app.active_recovery(queue)
+            ):
                 runner = self.state.stop_runner()
+            selected = targets[0] if len(targets) == 1 else None
             return {
                 "items": queue.get("items", []),
                 "recovery": app.active_recovery(queue),
-                "auto_continue": queue.get("auto_continue"),
+                **auto_continue_payload(queue, selected),
                 "summary": queue_summary(queue),
                 "runner": runner,
             }
 
-        session_id = str(payload.get("session_id") or "")
         if not session_id:
             raise ValueError("Seleziona una chat.")
         chats = self.state.chats(max_age_seconds=0)
@@ -909,6 +939,7 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             )
         chat = app.remember_chat_account(self.state.paths, chat)
         overrides = app.selected_setting_overrides(payload)
+        execution_fields = app.chat_execution_fields(chat)
         reset_at = app.latest_rate_limit_reset_from_chat(chat)
         not_before = None
         status = "armed"
@@ -919,51 +950,60 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             status = "waiting_limit"
             last_error = "Usage limit attivo: attendo reset + 1 minuto prima di riprovare."
 
-        queue["auto_continue"] = {
+        existing = app.find_auto_continue_state(queue, chat.session_id)
+        if existing is not None:
+            app.mark_auto_continue_cancelled(self.state.paths.queue_file, existing)
+        created_at = app.now_utc()
+        auto_continue = {
             "activation_id": str(uuid.uuid4()),
             "enabled": True,
             "status": status,
-            "created_at": app.now_utc(),
+            "created_at": created_at,
+            "updated_at": created_at,
             "session_id": chat.session_id,
             "title": chat.title,
             "cwd": chat.cwd,
             "source": chat.source,
             "provider": chat.provider,
             "jsonl_path": str(chat.jsonl_path),
-            "prompt": "Try again" if app.claude_item_is_desktop(app.chat_execution_fields(chat)) else app.RECOVERY_PROMPT,
+            "prompt": "Try again" if app.claude_item_is_desktop(execution_fields) else app.RECOVERY_PROMPT,
             "action": (
                 "claude_try_again"
-                if app.claude_item_is_desktop(app.chat_execution_fields(chat))
+                if app.claude_item_is_desktop(execution_fields)
                 else "codex_inspect"
                 if chat.provider == app.PROVIDER_CODEX
                 else "continue_interrupted"
             ),
             "recovery_prompt_preview": (
                 "Try again"
-                if app.claude_item_is_desktop(app.chat_execution_fields(chat))
+                if app.claude_item_is_desktop(execution_fields)
                 else "Analisi automatica del turno"
                 if chat.provider == app.PROVIDER_CODEX
                 else app.RECOVERY_PROMPT
             ),
             "recovery_followup_count": 0,
             "monitor_limit": True,
+            "persistent": app.claude_item_is_desktop(execution_fields),
             "attempts": 0,
+            "actions_completed": 0,
             "not_before": not_before,
             "last_error": last_error,
             "last_log": None,
+            "last_observation": None,
             "fingerprint": app.settings_fingerprint(self.state.paths, chat),
             "allow_cwd_fallback": False,
             "cwd_fallback": None,
-            "last_check_at": app.now_utc(),
+            "last_check_at": created_at,
             **overrides,
-            **app.chat_execution_fields(chat),
+            **execution_fields,
         }
+        app.set_auto_continue_state(queue, auto_continue)
         app.save_queue(self.state.paths.queue_file, queue)
         runner = self.state.start_runner(60)
         return {
             "items": queue.get("items", []),
             "recovery": app.active_recovery(queue),
-            "auto_continue": queue.get("auto_continue"),
+            **auto_continue_payload(queue, auto_continue),
             "summary": queue_summary(queue),
             "runner": runner,
         }
@@ -1290,7 +1330,7 @@ HTML = r"""<!doctype html>
     </div>
   </main>
   <script>
-    const state = { chats: [], selected: null, queue: [], autoContinue: null, runner: {}, autoBusy: false, autoBusyAction: null, settingsSession: null, transferBusy: false, refreshBusy: false };
+    const state = { chats: [], selected: null, queue: [], autoContinues: [], runner: {}, autoBusy: false, autoBusyAction: null, settingsSession: null, transferBusy: false, refreshBusy: false };
     const $ = (id) => document.getElementById(id);
     const CLAUDE_MODEL_OPTIONS = ["opus", "sonnet", "haiku", "claude-opus-4-8", "claude-sonnet-4-5"];
     const CODEX_MODEL_OPTIONS = ["gpt-5.6-sol", "gpt-5.5", "gpt-5.4", "gpt-5.1-codex-max"];
@@ -1376,6 +1416,18 @@ HTML = r"""<!doctype html>
       return state.chats.find((chat) => chat.session_id === state.selected) || null;
     }
 
+    function autoContinueForSession(sessionId) {
+      return state.autoContinues.find((auto) => auto.session_id === sessionId) || null;
+    }
+
+    function selectedAutoContinue() {
+      return autoContinueForSession(state.selected);
+    }
+
+    function activeAutoContinues() {
+      return state.autoContinues.filter((auto) => auto.enabled);
+    }
+
     function accountText(chat) {
       if (!chat) return "";
       const provider = chat.provider === "codex" ? "Codex" : "Claude";
@@ -1449,18 +1501,17 @@ HTML = r"""<!doctype html>
     }
 
     function renderAutoButton() {
-      const auto = state.autoContinue;
+      const auto = selectedAutoContinue();
       const selected = selectedChat();
       const selectedAvailable = !!(selected && selected.can_queue);
-      const activeForSelected = !!(auto && auto.enabled && auto.session_id === state.selected);
-      const activeOther = !!(auto && auto.enabled && auto.session_id !== state.selected);
+      const activeForSelected = !!(auto && auto.enabled);
       $("auto-btn").disabled = !selectedAvailable || state.autoBusy;
       $("auto-btn").className = activeForSelected ? "danger" : "blue";
       $("auto-btn").textContent = state.autoBusy
         ? (state.autoBusyAction === "disable" ? "Disattivo..." : "Attivo...")
         : activeForSelected
         ? "Disattiva auto-continua"
-        : (activeOther ? "Sposta auto-continua" : "Auto-continua");
+        : "Attiva auto-continua";
     }
 
     function transferAvailable(chat) {
@@ -1520,7 +1571,10 @@ HTML = r"""<!doctype html>
       if (auto.enabled) {
         if (auto.status === "armed" || auto.status === "monitoring") {
           const wait = auto.next_check_in_seconds ? `, nuovo controllo tra ${formatDuration(auto.next_check_in_seconds)}` : "";
-          return `Auto-continua attivo su ${shortId}${title}: monitoraggio del limite, nessun messaggio inviato${wait}, ${runnerText}.`;
+          const action = auto.last_observation === "try_again_invoked" && auto.last_action_at
+            ? `, ultimo Try again eseguito ${formatDateTime(auto.last_action_at)}`
+            : "";
+          return `Auto-continua attivo su ${shortId}${title}: monitoraggio nativo${action}${wait}, ${runnerText}.`;
         }
         if (auto.status === "waiting_limit") {
           const wait = auto.next_check_in_seconds ? `, controllo tra ${formatDuration(auto.next_check_in_seconds)}` : "";
@@ -1540,8 +1594,9 @@ HTML = r"""<!doctype html>
 
     function renderAutoFeedback(message = null, level = null) {
       const el = $("auto-feedback");
-      const auto = state.autoContinue;
-      const text = message ?? autoStatusText(auto);
+      const auto = selectedAutoContinue();
+      const activeCount = activeAutoContinues().length;
+      const text = message ?? (autoStatusText(auto) || (activeCount ? `${activeCount} chat con auto-continua attivo.` : ""));
       el.textContent = text || "";
       const resolvedLevel = level || (
         auto && (auto.status === "failed" || auto.status === "blocked" || auto.status === "blocked_permission")
@@ -1584,6 +1639,7 @@ HTML = r"""<!doctype html>
             <span class="badge">${chat.provider === "codex" ? "Codex" : "Claude"}</span>
             ${chat.remote_host ? `<span class="badge">SSH ${escapeHtml(chat.remote_host)}</span>` : ""}
             <span class="badge">${chat.can_queue ? "utilizzabile" : "solo visibile"}</span>
+            ${autoContinueForSession(chat.session_id)?.enabled ? `<span class="badge">auto-continua attivo</span>` : ""}
             <span class="badge">${escapeHtml(accountBadge)}</span>
             ${chat.model ? `<span class="badge">${escapeHtml(chat.model)}</span>` : ""}
             ${chat.message_count >= 0 ? `${escapeHtml(String(chat.message_count || 0))} msg` : ""}
@@ -1610,7 +1666,9 @@ HTML = r"""<!doctype html>
 
     function renderQueue(data) {
       state.queue = data.items || [];
-      state.autoContinue = data.auto_continue || null;
+      state.autoContinues = Array.isArray(data.auto_continues)
+        ? data.auto_continues
+        : (data.auto_continue ? [data.auto_continue] : []);
       renderRunner(data.runner || {});
       renderAutoButton();
       renderAutoFeedback();
@@ -1622,41 +1680,45 @@ HTML = r"""<!doctype html>
           ${recovery.not_before ? `<br><span class="meta">Non prima di ${escapeHtml(formatDateTime(recovery.not_before))}</span>` : ""}
         </div>
       ` : "";
-      const auto = state.autoContinue;
       const runner = state.runner || {};
-      const effective = auto && auto.fingerprint && auto.fingerprint.effective ? auto.fingerprint.effective : {};
-      const autoIsCodex = !!(auto && auto.provider === "codex");
-      const autoDetails = auto ? [
-        `Stato: ${escapeHtml(auto.status || "spento")}`,
-        `Azione: ${escapeHtml(autoActionLabel(auto))}`,
-        auto.recovery_followup_count ? `Messaggi recuperati in coda: ${escapeHtml(String(auto.recovery_followup_count))}` : "",
-        `Runner: ${runner.running ? `attivo${runner.pid ? ` #${escapeHtml(runner.pid)}` : ""}` : (runner.automatic ? "automatico in attesa" : "fermo")}`,
-        `Origine: ${escapeHtml(auto.source || (autoIsCodex ? "Codex App" : "Claude Code"))}`,
-        !autoIsCodex && auto.source_key === "claude_windows_app" ? "Integrazione IDE: non usata" : "",
-        `Modello: ${escapeHtml(auto.model_override || effective.model || "chat")}`,
-        `Effort: ${escapeHtml(auto.effort_level_override || effective.effortLevel || "chat")}`,
-        autoIsCodex
-          ? `Sandbox: ${escapeHtml(auto.sandbox_mode_override || effective.sandboxMode || "task")}`
-          : `Permessi: ${escapeHtml(auto.permission_mode_override || effective.permissionMode || "chat")}`,
-        autoIsCodex ? `Approvazioni: ${escapeHtml(auto.approval_policy_override || effective.approvalPolicy || "task")}` : "",
-        `Tentativi: ${escapeHtml(String(auto.attempts || 0))}`,
-        auto.sending_started_at ? `Invio iniziato: ${escapeHtml(formatDateTime(auto.sending_started_at))}` : "",
-        auto.not_before && auto.status !== "sending" ? `Prossimo tentativo: ${escapeHtml(formatDateTime(auto.not_before))}` : "",
-        auto.next_check_in_seconds ? `Prossimo controllo: tra ${escapeHtml(formatDuration(auto.next_check_in_seconds))}` : "",
-        auto.last_check_at ? `Ultimo check: ${escapeHtml(formatDateTime(auto.last_check_at))}` : "",
-        auto.updated_at ? `Aggiornato: ${escapeHtml(formatDateTime(auto.updated_at))}` : "",
-      ].filter(Boolean).join("<br>") : "";
-      const autoBox = auto ? `
-        <div class="auto-box">
-          Auto-continua: <b>${auto.enabled ? "attivo" : escapeHtml(auto.status || "spento")}</b>
-          sulla chat ${escapeHtml((auto.session_id || "").slice(0, 8))}
-          ${auto.title ? ` · ${escapeHtml(auto.title)}` : ""}.
-          <br><span class="meta">${autoDetails}</span>
-          ${auto.last_error && auto.status !== "sending" ? `<br><span class="meta">${escapeHtml(auto.last_error)}</span>` : ""}
-        </div>
-      ` : "";
+      const autos = [...state.autoContinues].sort((a, b) => Number(!!b.enabled) - Number(!!a.enabled));
+      const autoBoxes = autos.map((auto) => {
+        const effective = auto.fingerprint && auto.fingerprint.effective ? auto.fingerprint.effective : {};
+        const autoIsCodex = auto.provider === "codex";
+        const autoDetails = [
+          `Stato: ${escapeHtml(auto.status || "spento")}`,
+          `Azione: ${escapeHtml(autoActionLabel(auto))}`,
+          auto.recovery_followup_count ? `Messaggi recuperati in coda: ${escapeHtml(String(auto.recovery_followup_count))}` : "",
+          `Runner: ${runner.running ? `attivo${runner.pid ? ` #${escapeHtml(runner.pid)}` : ""}` : (runner.automatic ? "automatico in attesa" : "fermo")}`,
+          `Origine: ${escapeHtml(auto.source || (autoIsCodex ? "Codex App" : "Claude Code"))}`,
+          !autoIsCodex && auto.source_key === "claude_windows_app" ? "Integrazione IDE: non usata" : "",
+          `Modello: ${escapeHtml(auto.model_override || effective.model || "chat")}`,
+          `Effort: ${escapeHtml(auto.effort_level_override || effective.effortLevel || "chat")}`,
+          autoIsCodex
+            ? `Sandbox: ${escapeHtml(auto.sandbox_mode_override || effective.sandboxMode || "task")}`
+            : `Permessi: ${escapeHtml(auto.permission_mode_override || effective.permissionMode || "chat")}`,
+          autoIsCodex ? `Approvazioni: ${escapeHtml(auto.approval_policy_override || effective.approvalPolicy || "task")}` : "",
+          `Controlli: ${escapeHtml(String(auto.attempts || 0))}`,
+          auto.actions_completed ? `Try again eseguiti: ${escapeHtml(String(auto.actions_completed))}` : "",
+          auto.last_action_at ? `Ultima azione: ${escapeHtml(formatDateTime(auto.last_action_at))}` : "",
+          auto.sending_started_at ? `Invio iniziato: ${escapeHtml(formatDateTime(auto.sending_started_at))}` : "",
+          auto.not_before && auto.status !== "sending" ? `Prossimo tentativo: ${escapeHtml(formatDateTime(auto.not_before))}` : "",
+          auto.next_check_in_seconds ? `Prossimo controllo: tra ${escapeHtml(formatDuration(auto.next_check_in_seconds))}` : "",
+          auto.last_check_at ? `Ultimo check: ${escapeHtml(formatDateTime(auto.last_check_at))}` : "",
+          auto.updated_at ? `Aggiornato: ${escapeHtml(formatDateTime(auto.updated_at))}` : "",
+        ].filter(Boolean).join("<br>");
+        return `
+          <div class="auto-box">
+            Auto-continua: <b>${auto.enabled ? "attivo" : escapeHtml(auto.status || "spento")}</b>
+            sulla chat ${escapeHtml((auto.session_id || "").slice(0, 8))}
+            ${auto.title ? ` · ${escapeHtml(auto.title)}` : ""}.
+            <br><span class="meta">${autoDetails}</span>
+            ${auto.last_error && auto.status !== "sending" ? `<br><span class="meta">${escapeHtml(auto.last_error)}</span>` : ""}
+          </div>
+        `;
+      }).join("");
       if (!state.queue.length) {
-        $("queue").innerHTML = autoBox + recoveryBox + `<div class="empty">Coda vuota</div>`;
+        $("queue").innerHTML = autoBoxes + recoveryBox + `<div class="empty">Coda vuota</div>`;
         return;
       }
       const rows = state.queue.map((item) => `
@@ -1670,7 +1732,7 @@ HTML = r"""<!doctype html>
           </td>
         </tr>
       `).join("");
-      $("queue").innerHTML = autoBox + recoveryBox + `<table><thead><tr><th>Stato</th><th>ID</th><th>Elemento</th><th>Azioni</th></tr></thead><tbody>${rows}</tbody></table>`;
+      $("queue").innerHTML = autoBoxes + recoveryBox + `<table><thead><tr><th>Stato</th><th>ID</th><th>Elemento</th><th>Azioni</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
     async function refreshAll() {
@@ -1729,8 +1791,8 @@ HTML = r"""<!doctype html>
     }
 
     async function toggleAutoContinue() {
-      const auto = state.autoContinue;
-      const activeForSelected = !!(auto && auto.enabled && auto.session_id === state.selected);
+      const auto = selectedAutoContinue();
+      const activeForSelected = !!(auto && auto.enabled);
       state.autoBusy = true;
       state.autoBusyAction = activeForSelected ? "disable" : "enable";
       renderAutoButton();
@@ -1741,10 +1803,13 @@ HTML = r"""<!doctype html>
           method: "POST",
           body: JSON.stringify({ enabled: !activeForSelected, session_id: state.selected, ...selectedSettingPayload() }),
         });
-        state.autoContinue = result.auto_continue || null;
-        const message = autoStatusText(state.autoContinue) || (activeForSelected ? "Auto-continua disattivato." : "Auto-continua attivato.");
+        state.autoContinues = Array.isArray(result.auto_continues)
+          ? result.auto_continues
+          : (result.auto_continue ? [result.auto_continue] : []);
+        const changed = result.auto_continue || selectedAutoContinue();
+        const message = autoStatusText(changed) || (activeForSelected ? "Auto-continua disattivato." : "Auto-continua attivato.");
         appendLog(message);
-        renderAutoFeedback(message, state.autoContinue && (state.autoContinue.status === "failed" || state.autoContinue.status === "blocked") ? "error" : "ok");
+        renderAutoFeedback(message, changed && (changed.status === "failed" || changed.status === "blocked") ? "error" : "ok");
         await refreshAll();
       } catch (err) {
         renderAutoFeedback("Errore auto-continua: " + err.message, "error");
