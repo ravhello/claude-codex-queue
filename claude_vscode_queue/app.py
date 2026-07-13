@@ -30,6 +30,7 @@ QUEUE_FILE_NAME = "queue.json"
 ACCOUNT_INDEX_FILE_NAME = "accounts.json"
 DESKTOP_SYNC_STATE_FILE_NAME = "desktop-sync-state.json"
 LOG_DIR_NAME = "logs"
+AUTO_CONTINUE_CANCEL_DIR_NAME = "auto-continue-cancellations"
 QUEUE_VERSION = 1
 
 STATUS_PENDING = "pending"
@@ -38,6 +39,8 @@ STATUS_FAILED = "failed"
 STATUS_BLOCKED = "blocked"
 STATUS_RECOVERY = "recovery"
 RECOVERY_PROMPT = "continua"
+CODEX_RECOVERY_PRIORITY = -1000
+CLAUDE_DESKTOP_TRY_AGAIN_EXIT = 4
 
 RATE_LIMIT_EXIT = 75
 CONFIG_CHANGED_EXIT = 78
@@ -260,6 +263,19 @@ class ClaudeRunResult:
     stderr: str
     rate_limited: bool
     reset_at: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class CodexRecoveryPlan:
+    prompt: str
+    kind: str
+    rollback_turn_ids: tuple[str, ...]
+    followup_prompts: tuple[str, ...]
+    source_turn_ids: tuple[str, ...]
+
+
+class AutoContinueCancelled(Exception):
+    pass
 
 
 @dataclasses.dataclass(frozen=True)
@@ -537,6 +553,141 @@ def find_claude_desktop_executable(paths: Paths, item: dict[str, Any]) -> Path |
         return None
     candidates.sort(key=lambda candidate: candidate.stat().st_mtime_ns, reverse=True)
     return candidates[0]
+
+
+def claude_desktop_local_session_id(paths: Paths, item: dict[str, Any]) -> str | None:
+    session_id = item.get("session_id")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    account_key = item.get("account_key")
+    account_uuid = (
+        account_key.removeprefix("claude-app:")
+        if isinstance(account_key, str) and account_key.startswith("claude-app:")
+        else None
+    )
+    candidates: list[DesktopSessionRecord] = []
+    for record in desktop_session_records(paths):
+        if desktop_record_cli_session_id(record) != session_id:
+            continue
+        app_session_id = record.data.get("sessionId")
+        if not isinstance(app_session_id, str) or not app_session_id:
+            continue
+        candidates.append(record)
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda record: (
+            record.account_uuid == account_uuid,
+            record.account_uuid == record.active_account_uuid,
+            desktop_record_mtime_ns(record),
+        ),
+        reverse=True,
+    )
+    value = candidates[0].data.get("sessionId")
+    return value if isinstance(value, str) and re.fullmatch(r"[A-Za-z0-9_-]+", value) else None
+
+
+def run_claude_desktop_try_again(paths: Paths, item: dict[str, Any], timeout: int = 50) -> ClaudeRunResult:
+    local_session_id = claude_desktop_local_session_id(paths, item)
+    if not local_session_id:
+        return ClaudeRunResult(
+            returncode=CLAUDE_DESKTOP_TRY_AGAIN_EXIT,
+            stdout="",
+            stderr="ID locale della sessione Claude Desktop non trovato.",
+            rate_limited=False,
+            reset_at=None,
+        )
+    powershell = shutil.which("powershell.exe") or shutil.which("powershell")
+    if not powershell:
+        return ClaudeRunResult(
+            returncode=CLAUDE_DESKTOP_TRY_AGAIN_EXIT,
+            stdout="",
+            stderr="Windows PowerShell non trovato: impossibile invocare Try again.",
+            rate_limited=False,
+            reset_at=None,
+        )
+    script = r'''
+$ErrorActionPreference = "Stop"
+$sessionId = "__SESSION_ID__"
+Start-Process ("claude://code/" + $sessionId)
+Add-Type -AssemblyName UIAutomationClient
+Add-Type -AssemblyName UIAutomationTypes
+$names = @("Try again", "Retry", "Riprova", "Prova di nuovo", "Ritenta")
+$deadline = [DateTime]::UtcNow.AddSeconds(40)
+do {
+  Start-Sleep -Milliseconds 750
+  $root = [System.Windows.Automation.AutomationElement]::RootElement
+  $windows = $root.FindAll(
+    [System.Windows.Automation.TreeScope]::Children,
+    [System.Windows.Automation.Condition]::TrueCondition
+  )
+  $candidates = @()
+  foreach ($window in $windows) {
+    try {
+      $process = Get-Process -Id $window.Current.ProcessId -ErrorAction Stop
+    } catch {
+      continue
+    }
+    if ($process.ProcessName -ne "claude") { continue }
+    $buttonCondition = [System.Windows.Automation.PropertyCondition]::new(
+      [System.Windows.Automation.AutomationElement]::ControlTypeProperty,
+      [System.Windows.Automation.ControlType]::Button
+    )
+    $buttons = $window.FindAll(
+      [System.Windows.Automation.TreeScope]::Descendants,
+      $buttonCondition
+    )
+    foreach ($button in $buttons) {
+      $name = $button.Current.Name
+      if ($button.Current.IsEnabled -and $names -contains $name) {
+        $candidates += $button
+      }
+    }
+  }
+  if ($candidates.Count -gt 0) {
+    $button = $candidates | Sort-Object { $_.Current.BoundingRectangle.Bottom } -Descending | Select-Object -First 1
+    $pattern = $button.GetCurrentPattern([System.Windows.Automation.InvokePattern]::Pattern)
+    ([System.Windows.Automation.InvokePattern]$pattern).Invoke()
+    Write-Output ("CLAUDE_TRY_AGAIN_INVOKED:" + $button.Current.Name)
+    exit 0
+  }
+} while ([DateTime]::UtcNow -lt $deadline)
+Write-Error "CLAUDE_TRY_AGAIN_NOT_FOUND"
+exit 4
+'''.replace("__SESSION_ID__", local_session_id)
+    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    try:
+        process = subprocess.run(
+            [
+                powershell,
+                "-NoProfile",
+                "-NonInteractive",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-EncodedCommand",
+                encoded,
+            ],
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired:
+        return ClaudeRunResult(
+            returncode=CLAUDE_DESKTOP_TRY_AGAIN_EXIT,
+            stdout="",
+            stderr=f"Timeout dopo {timeout}s cercando il pulsante Try again.",
+            rate_limited=False,
+            reset_at=None,
+        )
+    return ClaudeRunResult(
+        returncode=process.returncode,
+        stdout=process.stdout,
+        stderr=process.stderr,
+        rate_limited=False,
+        reset_at=None,
+    )
 
 
 def find_codex_executable(paths: Paths, override: str | None = None) -> Path | None:
@@ -1258,8 +1409,30 @@ def codex_app_server_request(
         if isinstance(initialize.get("error"), dict):
             raise ValueError(f"Inizializzazione Codex app-server fallita: {initialize['error']}")
         send({"method": "initialized"})
-        send({"id": 2, "method": method, "params": params})
-        response = wait_for(2, deadline)
+        request_id = 2
+        if method == "thread/rollback":
+            thread_id = params.get("threadId")
+            if not isinstance(thread_id, str) or not thread_id:
+                raise ValueError("thread/rollback richiede un threadId valido.")
+            send(
+                {
+                    "id": request_id,
+                    "method": "thread/resume",
+                    "params": {"threadId": thread_id},
+                }
+            )
+            resumed = wait_for(request_id, deadline)
+            resume_error = resumed.get("error")
+            if isinstance(resume_error, dict):
+                message = (
+                    resume_error.get("message")
+                    if isinstance(resume_error.get("message"), str)
+                    else json.dumps(resume_error)
+                )
+                raise ValueError(f"Codex thread/resume prima del rollback non riuscito: {message}")
+            request_id += 1
+        send({"id": request_id, "method": method, "params": params})
+        response = wait_for(request_id, deadline)
     finally:
         if process.stdin is not None:
             try:
@@ -1284,6 +1457,201 @@ def codex_app_server_request(
     if not isinstance(value, dict):
         raise ValueError(f"Risposta Codex {method} non valida.")
     return value
+
+
+def codex_thread_turns(
+    codex_exe: Path,
+    session_id: str,
+    *,
+    codex_home: Path | None = None,
+) -> list[dict[str, Any]]:
+    result = codex_app_server_request(
+        codex_exe,
+        "thread/read",
+        {"threadId": session_id, "includeTurns": True},
+        codex_home=codex_home,
+    )
+    thread = result.get("thread") if isinstance(result.get("thread"), dict) else {}
+    turns = thread.get("turns") if isinstance(thread.get("turns"), list) else []
+    return [turn for turn in turns if isinstance(turn, dict)]
+
+
+def codex_turn_user_prompt(turn: dict[str, Any]) -> str | None:
+    items = turn.get("items") if isinstance(turn.get("items"), list) else []
+    for item in items:
+        if not isinstance(item, dict) or item.get("type") != "userMessage":
+            continue
+        content = item.get("content")
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return None
+        parts: list[str] = []
+        for entry in content:
+            if not isinstance(entry, dict):
+                return None
+            if entry.get("type") != "text" or not isinstance(entry.get("text"), str):
+                return None
+            parts.append(entry["text"])
+        return "\n".join(parts) if parts else None
+    return None
+
+
+def codex_turn_has_progress(turn: dict[str, Any]) -> bool:
+    progress_types = {
+        "agentMessage",
+        "commandExecution",
+        "fileChange",
+        "mcpToolCall",
+        "dynamicToolCall",
+        "collabAgentToolCall",
+        "subAgentActivity",
+        "webSearch",
+        "imageGeneration",
+        "enteredReviewMode",
+        "exitedReviewMode",
+        "contextCompaction",
+    }
+    items = turn.get("items") if isinstance(turn.get("items"), list) else []
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        if item_type in progress_types:
+            return True
+        if item_type == "reasoning" and (item.get("content") or item.get("summary")):
+            return True
+    return False
+
+
+def codex_recovery_plan_from_turns(turns: list[dict[str, Any]]) -> CodexRecoveryPlan:
+    if turns and turns[-1].get("status") in {"inProgress", "in_progress", "running"}:
+        raise ValueError("La task Codex e' ancora in esecuzione; il recupero attende che il turno si fermi.")
+
+    recoverable: list[dict[str, Any]] = []
+    for turn in reversed(turns):
+        if turn.get("status") not in {"failed", "interrupted"}:
+            break
+        recoverable.append(turn)
+    recoverable.reverse()
+    if not recoverable:
+        return CodexRecoveryPlan(
+            prompt=RECOVERY_PROMPT,
+            kind="continue_interrupted",
+            rollback_turn_ids=(),
+            followup_prompts=(),
+            source_turn_ids=(),
+        )
+
+    progress_indexes = [index for index, turn in enumerate(recoverable) if codex_turn_has_progress(turn)]
+    if progress_indexes:
+        progress_index = progress_indexes[-1]
+        if progress_index != 0:
+            raise ValueError(
+                "Codex mostra un turno senza risposta prima di un turno gia' avviato: non modifico la cronologia automaticamente."
+            )
+        rollback_turns = recoverable[progress_index + 1 :]
+        prompts: list[str] = []
+        for turn in rollback_turns:
+            prompt = codex_turn_user_prompt(turn)
+            if not prompt:
+                raise ValueError(
+                    "Un messaggio Codex fallito contiene allegati o input non testuali e non puo' essere reinviato in sicurezza."
+                )
+            prompts.append(prompt)
+        return CodexRecoveryPlan(
+            prompt=RECOVERY_PROMPT,
+            kind="continue_interrupted",
+            rollback_turn_ids=tuple(
+                str(turn.get("id")) for turn in rollback_turns if isinstance(turn.get("id"), str)
+            ),
+            followup_prompts=tuple(prompts),
+            source_turn_ids=tuple(
+                str(turn.get("id")) for turn in recoverable if isinstance(turn.get("id"), str)
+            ),
+        )
+
+    prompts = []
+    for turn in recoverable:
+        prompt = codex_turn_user_prompt(turn)
+        if not prompt:
+            raise ValueError(
+                "Un messaggio Codex fallito contiene allegati o input non testuali e non puo' essere reinviato in sicurezza."
+            )
+        prompts.append(prompt)
+    rollback_ids = tuple(
+        str(turn.get("id")) for turn in recoverable if isinstance(turn.get("id"), str)
+    )
+    if len(rollback_ids) != len(recoverable):
+        raise ValueError("Codex non ha restituito tutti gli ID dei turni falliti; cronologia non modificata.")
+    return CodexRecoveryPlan(
+        prompt=prompts[0],
+        kind="retry_failed_prompt",
+        rollback_turn_ids=rollback_ids,
+        followup_prompts=tuple(prompts[1:]),
+        source_turn_ids=rollback_ids,
+    )
+
+
+def codex_recovery_plan(
+    codex_exe: Path,
+    session_id: str,
+    *,
+    codex_home: Path | None = None,
+) -> CodexRecoveryPlan:
+    return codex_recovery_plan_from_turns(
+        codex_thread_turns(codex_exe, session_id, codex_home=codex_home)
+    )
+
+
+def apply_codex_rollback(
+    codex_exe: Path,
+    session_id: str,
+    turn_ids: tuple[str, ...] | list[str],
+    *,
+    codex_home: Path | None = None,
+) -> bool:
+    expected = tuple(turn_id for turn_id in turn_ids if isinstance(turn_id, str) and turn_id)
+    if not expected:
+        return False
+    turns = codex_thread_turns(codex_exe, session_id, codex_home=codex_home)
+    current_ids = tuple(str(turn.get("id")) for turn in turns if isinstance(turn.get("id"), str))
+    if not any(turn_id in current_ids for turn_id in expected):
+        return False
+    if len(current_ids) < len(expected) or current_ids[-len(expected) :] != expected:
+        raise ValueError("La cronologia Codex e' cambiata dopo il piano di recupero; rollback annullato.")
+    codex_app_server_request(
+        codex_exe,
+        "thread/rollback",
+        {"threadId": session_id, "numTurns": len(expected)},
+        codex_home=codex_home,
+    )
+    return True
+
+
+def rollback_latest_failed_codex_prompt(
+    codex_exe: Path,
+    session_id: str,
+    prompt: str,
+    *,
+    codex_home: Path | None = None,
+) -> str:
+    turns = codex_thread_turns(codex_exe, session_id, codex_home=codex_home)
+    if not turns:
+        raise ValueError("La task Codex non contiene il tentativo fallito da sostituire.")
+    turn = turns[-1]
+    recorded = codex_turn_user_prompt(turn)
+    if (
+        turn.get("status") not in {"failed", "interrupted"}
+        or codex_turn_has_progress(turn)
+        or normalize_prompt(recorded) != normalize_prompt(prompt)
+    ):
+        raise ValueError("L'ultimo turno Codex non coincide con il prompt fallito atteso; non eseguo il rollback.")
+    turn_id = turn.get("id")
+    if not isinstance(turn_id, str) or not turn_id:
+        raise ValueError("L'ultimo turno Codex non ha un ID valido.")
+    apply_codex_rollback(codex_exe, session_id, (turn_id,), codex_home=codex_home)
+    return turn_id
 
 
 def codex_local_thread_states(paths: Paths) -> dict[str, str]:
@@ -3820,6 +4188,84 @@ def remote_settings_fingerprint(paths: Paths, chat: Chat) -> dict[str, Any]:
     }
 
 
+def ensure_auto_continue_activation_id(auto_continue: dict[str, Any]) -> str:
+    value = auto_continue.get("activation_id")
+    if isinstance(value, str) and value:
+        return value
+    session_id = str(auto_continue.get("session_id") or "")
+    created_at = str(auto_continue.get("created_at") or "")
+    value = (
+        str(uuid.uuid5(uuid.NAMESPACE_URL, f"claude-codex-queue:auto:{session_id}:{created_at}"))
+        if session_id or created_at
+        else str(uuid.uuid4())
+    )
+    auto_continue["activation_id"] = value
+    return value
+
+
+def auto_continue_cancel_marker(queue_file: Path, auto_continue: dict[str, Any]) -> Path | None:
+    value = ensure_auto_continue_activation_id(auto_continue)
+    digest = hashlib.sha256(value.encode("utf-8")).hexdigest()
+    return queue_file.parent / AUTO_CONTINUE_CANCEL_DIR_NAME / f"{digest}.cancelled"
+
+
+def auto_continue_is_cancelled(queue_file: Path, auto_continue: dict[str, Any]) -> bool:
+    marker = auto_continue_cancel_marker(queue_file, auto_continue)
+    return marker is not None and marker.is_file()
+
+
+def mark_auto_continue_cancelled(queue_file: Path, auto_continue: dict[str, Any]) -> None:
+    ensure_auto_continue_activation_id(auto_continue)
+    marker = auto_continue_cancel_marker(queue_file, auto_continue)
+    if marker is None:
+        return
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        with marker.open("x", encoding="utf-8") as handle:
+            handle.write(now_utc() + "\n")
+    except FileExistsError:
+        pass
+
+
+def apply_auto_continue_cancellation(queue_file: Path, data: dict[str, Any]) -> None:
+    auto_continue = data.get("auto_continue")
+    if not isinstance(auto_continue, dict) or not auto_continue_is_cancelled(queue_file, auto_continue):
+        return
+    auto_continue["enabled"] = False
+    auto_continue["status"] = "disabled"
+    auto_continue.setdefault("disabled_at", now_utc())
+    auto_continue["sending_started_at"] = None
+    auto_continue["next_check_in_seconds"] = None
+
+
+@contextlib.contextmanager
+def queue_write_lock(queue_file: Path, timeout: float = 10.0):
+    lock_dir = queue_file.parent / f".{queue_file.name}.lock"
+    deadline = time.monotonic() + timeout
+    acquired = False
+    while not acquired:
+        try:
+            lock_dir.mkdir()
+            acquired = True
+        except FileExistsError:
+            try:
+                stale = time.time() - lock_dir.stat().st_mtime > 120
+            except OSError:
+                stale = False
+            if stale:
+                with contextlib.suppress(OSError):
+                    lock_dir.rmdir()
+                continue
+            if time.monotonic() >= deadline:
+                raise TimeoutError(f"Timeout acquisendo il lock della coda: {lock_dir}")
+            time.sleep(0.02)
+    try:
+        yield
+    finally:
+        with contextlib.suppress(OSError):
+            lock_dir.rmdir()
+
+
 def load_queue(queue_file: Path) -> dict[str, Any]:
     if not queue_file.exists():
         return {"version": QUEUE_VERSION, "items": [], "recovery": None, "auto_continue": None}
@@ -3834,17 +4280,24 @@ def load_queue(queue_file: Path) -> dict[str, Any]:
     data.setdefault("version", QUEUE_VERSION)
     data.setdefault("recovery", None)
     data.setdefault("auto_continue", None)
+    apply_auto_continue_cancellation(queue_file, data)
     return data
 
 
 def save_queue(queue_file: Path, data: dict[str, Any]) -> None:
     queue_file.parent.mkdir(parents=True, exist_ok=True)
-    payload = json.dumps(data, ensure_ascii=False, indent=2)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=queue_file.parent, delete=False) as handle:
-        handle.write(payload)
-        handle.write("\n")
-        temp_path = Path(handle.name)
-    temp_path.replace(queue_file)
+    with queue_write_lock(queue_file):
+        apply_auto_continue_cancellation(queue_file, data)
+        payload = json.dumps(data, ensure_ascii=False, indent=2)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=queue_file.parent, delete=False) as handle:
+            handle.write(payload)
+            handle.write("\n")
+            temp_path = Path(handle.name)
+        try:
+            temp_path.replace(queue_file)
+        finally:
+            with contextlib.suppress(OSError):
+                temp_path.unlink()
 
 
 def select_chat(selector: str | None, chats: list[Chat]) -> Chat:
@@ -4676,7 +5129,7 @@ def recovery_as_item(recovery: dict[str, Any]) -> dict[str, Any]:
         "session_id": recovery["session_id"],
         "title": recovery.get("title") or "Recovery",
         "cwd": recovery.get("cwd"),
-        "prompt": RECOVERY_PROMPT,
+        "prompt": recovery.get("prompt") or RECOVERY_PROMPT,
         "attempts": recovery.get("attempts", 0),
         "not_before": recovery.get("not_before"),
         "last_error": recovery.get("last_error"),
@@ -4703,7 +5156,7 @@ def auto_continue_as_item(auto_continue: dict[str, Any]) -> dict[str, Any]:
         "session_id": auto_continue["session_id"],
         "title": auto_continue.get("title") or "Auto continua",
         "cwd": auto_continue.get("cwd"),
-        "prompt": RECOVERY_PROMPT,
+        "prompt": auto_continue.get("prompt") or RECOVERY_PROMPT,
         "attempts": auto_continue.get("attempts", 0),
         "not_before": auto_continue.get("not_before"),
         "last_error": auto_continue.get("last_error"),
@@ -4740,6 +5193,163 @@ def update_auto_continue_state(auto_continue: dict[str, Any], status: str | None
         auto_continue[key] = value
 
 
+def codex_recovery_plan_dict(plan: CodexRecoveryPlan) -> dict[str, Any]:
+    return {
+        "prompt": plan.prompt,
+        "kind": plan.kind,
+        "rollback_turn_ids": list(plan.rollback_turn_ids),
+        "followup_prompts": list(plan.followup_prompts),
+        "source_turn_ids": list(plan.source_turn_ids),
+    }
+
+
+def enqueue_codex_recovery_followups(
+    queue: dict[str, Any],
+    source: dict[str, Any],
+    prompts: list[str],
+    recovery_group: str,
+) -> int:
+    existing_sequences = {
+        int(item.get("recovery_sequence"))
+        for item in queue.get("items", [])
+        if item.get("recovery_group") == recovery_group and isinstance(item.get("recovery_sequence"), int)
+    }
+    created = now_utc()
+    start_order = len(queue.get("items", []))
+    added = 0
+    for sequence, prompt in enumerate(prompts, start=1):
+        if sequence in existing_sequences:
+            continue
+        queue.setdefault("items", []).append(
+            {
+                "id": str(uuid.uuid4())[:8],
+                "status": STATUS_PENDING,
+                "created_at": created,
+                "order": start_order + added,
+                "priority": CODEX_RECOVERY_PRIORITY,
+                "session_id": source["session_id"],
+                "title": source.get("title") or "Recupero Codex",
+                "cwd": source.get("cwd"),
+                "prompt": prompt,
+                "attempts": 0,
+                "not_before": None,
+                "last_error": "Messaggio Codex fallito ripristinato automaticamente in coda.",
+                "last_log": None,
+                "fingerprint": source.get("fingerprint", {}),
+                "provider": PROVIDER_CODEX,
+                "source": source.get("source"),
+                "source_key": source.get("source_key"),
+                "jsonl_path": source.get("jsonl_path"),
+                "allow_cwd_fallback": bool(source.get("allow_cwd_fallback")),
+                "cwd_fallback": source.get("cwd_fallback"),
+                "recovery_group": recovery_group,
+                "recovery_sequence": sequence,
+                **item_account_fields(source),
+                **item_setting_overrides(source),
+            }
+        )
+        added += 1
+    return added
+
+
+def prepare_codex_recovery_state(
+    paths: Paths,
+    codex_exe: Path,
+    queue: dict[str, Any],
+    state: dict[str, Any],
+) -> None:
+    if state.get("activation_id") and auto_continue_is_cancelled(paths.queue_file, state):
+        update_auto_continue_state(
+            state,
+            "disabled",
+            enabled=False,
+            sending_started_at=None,
+            next_check_in_seconds=None,
+        )
+        save_queue(paths.queue_file, queue)
+        raise AutoContinueCancelled("Auto-continua disattivato prima del recupero Codex.")
+    raw_plan = state.get("codex_recovery_plan")
+    if not isinstance(raw_plan, dict):
+        plan = codex_recovery_plan(
+            codex_exe,
+            state["session_id"],
+            codex_home=paths.codex_home,
+        )
+        source_prompt = state.get("source_prompt")
+        if (
+            not plan.source_turn_ids
+            and state.get("source_prompt_recorded") is False
+            and isinstance(source_prompt, str)
+            and source_prompt
+        ):
+            plan = CodexRecoveryPlan(
+                prompt=source_prompt,
+                kind="retry_failed_prompt",
+                rollback_turn_ids=(),
+                followup_prompts=(),
+                source_turn_ids=(),
+            )
+        raw_plan = codex_recovery_plan_dict(plan)
+        state["codex_recovery_plan"] = raw_plan
+        state["prompt"] = plan.prompt
+        state["action"] = plan.kind
+        state["recovery_prompt_preview"] = truncate(plan.prompt, 180)
+        state["recovery_followup_count"] = len(plan.followup_prompts)
+        state["recovery_group"] = state.get("recovery_group") or f"codex-recovery-{uuid.uuid4()}"
+        state["rollback_applied"] = False
+        state["followups_queued"] = False
+        save_queue(paths.queue_file, queue)
+
+    prompt = raw_plan.get("prompt")
+    if not isinstance(prompt, str) or not prompt:
+        raise ValueError("Piano di recupero Codex privo del prompt iniziale.")
+    state["prompt"] = prompt
+
+    if state.get("retry_needs_rollback"):
+        if state.get("activation_id") and auto_continue_is_cancelled(paths.queue_file, state):
+            raise AutoContinueCancelled("Auto-continua disattivato prima del rollback Codex.")
+        turn_id = rollback_latest_failed_codex_prompt(
+            codex_exe,
+            state["session_id"],
+            prompt,
+            codex_home=paths.codex_home,
+        )
+        state["retry_needs_rollback"] = False
+        state["last_retry_rollback_turn_id"] = turn_id
+        state["rollback_applied_at"] = now_utc()
+        save_queue(paths.queue_file, queue)
+
+    if not state.get("rollback_applied"):
+        if state.get("activation_id") and auto_continue_is_cancelled(paths.queue_file, state):
+            raise AutoContinueCancelled("Auto-continua disattivato prima del rollback Codex.")
+        raw_ids = raw_plan.get("rollback_turn_ids")
+        turn_ids = tuple(value for value in raw_ids if isinstance(value, str)) if isinstance(raw_ids, list) else ()
+        apply_codex_rollback(
+            codex_exe,
+            state["session_id"],
+            turn_ids,
+            codex_home=paths.codex_home,
+        )
+        state["rollback_applied"] = True
+        state["rollback_applied_at"] = now_utc()
+        save_queue(paths.queue_file, queue)
+
+    if not state.get("followups_queued"):
+        if state.get("activation_id") and auto_continue_is_cancelled(paths.queue_file, state):
+            raise AutoContinueCancelled("Auto-continua disattivato prima del ripristino della coda Codex.")
+        raw_prompts = raw_plan.get("followup_prompts")
+        prompts = [value for value in raw_prompts if isinstance(value, str) and value] if isinstance(raw_prompts, list) else []
+        recovery_group = state.get("recovery_group")
+        if not isinstance(recovery_group, str) or not recovery_group:
+            recovery_group = f"codex-recovery-{uuid.uuid4()}"
+            state["recovery_group"] = recovery_group
+        added = enqueue_codex_recovery_followups(queue, state, prompts, recovery_group)
+        state["followups_queued"] = True
+        state["recovery_followup_count"] = len(prompts)
+        state["recovery_followups_added"] = int(state.get("recovery_followups_added") or 0) + added
+        save_queue(paths.queue_file, queue)
+
+
 def set_recovery_after_limit(
     queue: dict[str, Any],
     item: dict[str, Any],
@@ -4753,6 +5363,7 @@ def set_recovery_after_limit(
         "created_at": now_utc(),
         "source_item_id": item.get("id"),
         "source_prompt_recorded": prompt_was_recorded,
+        "source_prompt": item.get("prompt"),
         "session_id": item["session_id"],
         "title": item.get("title"),
         "cwd": item.get("cwd"),
@@ -4776,16 +5387,17 @@ def set_recovery_after_limit(
     if prompt_was_recorded:
         item["status"] = STATUS_RECOVERY
         item["not_before"] = None
-        item["last_error"] = "Session limit: riprendero' con 'continua' prima della coda."
+        item["last_error"] = "Session limit: determino il recupero corretto prima di proseguire la coda."
     else:
         item["status"] = STATUS_PENDING
         item["not_before"] = None
-        item["last_error"] = "Session limit prima della conferma: prima mando 'continua', poi ritento questo prompt."
+        item["last_error"] = "Session limit prima della conferma: recupero il turno senza consumare il prompt successivo."
 
 
 def complete_recovery(queue: dict[str, Any], recovery: dict[str, Any]) -> None:
     source_item_id = recovery.get("source_item_id")
-    if recovery.get("source_prompt_recorded") and source_item_id:
+    retried_source_prompt = recovery.get("action") == "retry_failed_prompt"
+    if (recovery.get("source_prompt_recorded") or retried_source_prompt) and source_item_id:
         for item in queue.get("items", []):
             if item.get("id") == source_item_id:
                 item["status"] = STATUS_DONE
@@ -4963,13 +5575,13 @@ def command_status(args: argparse.Namespace) -> int:
     auto_continue = active_auto_continue(queue)
     if recovery:
         print(
-            f"Recovery attiva: prossimo invio '{RECOVERY_PROMPT}' "
+            f"Recovery attiva: prossima azione '{truncate(recovery.get('recovery_prompt_preview') or recovery.get('prompt') or 'analisi automatica', 80)}' "
             f"chat={str(recovery.get('session_id', ''))[:8]} not_before={recovery.get('not_before')}"
         )
     if auto_continue:
         print(
             f"Auto-continua attivo: chat={str(auto_continue.get('session_id', ''))[:8]} "
-            f"not_before={auto_continue.get('not_before')}"
+            f"azione={auto_continue.get('action') or 'monitor'} not_before={auto_continue.get('not_before')}"
         )
     items = queue.get("items", [])
     if not items and not recovery and not auto_continue:
@@ -5042,6 +5654,7 @@ def command_reset(args: argparse.Namespace) -> int:
         changed += 1
     auto_continue = active_auto_continue(queue)
     if auto_continue and (not args.item or auto_continue.get("session_id") == args.item):
+        mark_auto_continue_cancelled(paths.queue_file, auto_continue)
         auto_continue["enabled"] = False
         auto_continue["status"] = "disabled"
         auto_continue["disabled_at"] = now_utc()
@@ -5116,12 +5729,28 @@ def command_run(args: argparse.Namespace) -> int:
                 return 1
             if not recovery_ready(recovery):
                 wait_seconds = seconds_until_ready(queue, args.poll_seconds)
+                pending_prompt = truncate(recovery.get("prompt") or RECOVERY_PROMPT, 80)
                 if args.once:
-                    print(f"Recovery in attesa. Prossimo 'continua' tra circa {wait_seconds}s.")
+                    print(f"Recovery in attesa. Prossimo '{pending_prompt}' tra circa {wait_seconds}s.")
                     return RATE_LIMIT_EXIT
-                print(f"Recovery in attesa: prossimo 'continua' tra circa {wait_seconds}s.")
+                print(f"Recovery in attesa: prossimo '{pending_prompt}' tra circa {wait_seconds}s.")
                 time.sleep(min(wait_seconds, args.poll_seconds))
                 continue
+
+            if recovery.get("provider") == PROVIDER_CODEX:
+                if codex_exe is None:
+                    recovery["blocked"] = True
+                    recovery["last_error"] = "CLI Codex non trovato durante il recupero."
+                    save_queue(paths.queue_file, queue)
+                    return 1
+                try:
+                    prepare_codex_recovery_state(paths, codex_exe, queue, recovery)
+                except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                    recovery["blocked"] = True
+                    recovery["last_error"] = str(exc)
+                    save_queue(paths.queue_file, queue)
+                    print(f"Recovery Codex bloccata: {exc}")
+                    return 1
 
             item = recovery_as_item(recovery)
             chats = discover_agent_chats(paths)
@@ -5152,10 +5781,10 @@ def command_run(args: argparse.Namespace) -> int:
 
             if args.dry_run:
                 print("DRY RUN RECOVERY")
-                print_agent_dry_run_details(paths, claude_exe, codex_exe, item, args.ide, RECOVERY_PROMPT)
+                print_agent_dry_run_details(paths, claude_exe, codex_exe, item, args.ide, item["prompt"])
                 return 0
 
-            print(f"Recovery: invio '{RECOVERY_PROMPT}' a chat {item['session_id'][:8]}")
+            print(f"Recovery: invio '{truncate(item['prompt'], 80)}' a chat {item['session_id'][:8]}")
             recovery["attempts"] = int(recovery.get("attempts", 0)) + 1
             run_started_at = dt.datetime.now(UTC) - dt.timedelta(seconds=5)
             try:
@@ -5182,7 +5811,7 @@ def command_run(args: argparse.Namespace) -> int:
                     return 1
                 complete_recovery(queue, recovery)
                 save_queue(paths.queue_file, queue)
-                print(f"Recovery completata con '{RECOVERY_PROMPT}'. Log: {item.get('last_log') or recovery.get('last_log')}")
+                print(f"Recovery completata con '{truncate(item['prompt'], 80)}'. Log: {item.get('last_log') or recovery.get('last_log')}")
                 if args.once:
                     return 0
                 continue
@@ -5190,8 +5819,10 @@ def command_run(args: argparse.Namespace) -> int:
             if result.rate_limited:
                 recovery["last_error"] = truncate(result.stderr or result.stdout, 500)
                 recovery["not_before"] = retry_time_after_limit(result, args.poll_seconds)
+                if recovery.get("provider") == PROVIDER_CODEX:
+                    recovery["retry_needs_rollback"] = True
                 save_queue(paths.queue_file, queue)
-                print(f"Session limit ancora attivo. Prossimo '{RECOVERY_PROMPT}' dopo: {recovery['not_before']}")
+                print(f"Session limit ancora attivo. Prossimo '{truncate(item['prompt'], 80)}' dopo: {recovery['not_before']}")
                 if args.once:
                     return RATE_LIMIT_EXIT
                 time.sleep(args.poll_seconds)
@@ -5227,10 +5858,13 @@ def command_run(args: argparse.Namespace) -> int:
                     next_check_in_seconds=wait_seconds,
                 )
                 save_queue(paths.queue_file, queue)
+                action_label = auto_continue.get("recovery_prompt_preview") or (
+                    "Try again" if auto_continue.get("action") == "claude_try_again" else RECOVERY_PROMPT
+                )
                 if args.once:
-                    print(f"Auto-continua in attesa. Prossimo 'continua' tra circa {wait_seconds}s.")
+                    print(f"Auto-continua in attesa. Prossima azione '{truncate(str(action_label), 80)}' tra circa {wait_seconds}s.")
                     return RATE_LIMIT_EXIT
-                print(f"Auto-continua in attesa: prossimo 'continua' tra circa {wait_seconds}s.")
+                print(f"Auto-continua in attesa: prossima azione '{truncate(str(action_label), 80)}' tra circa {wait_seconds}s.")
                 time.sleep(min(wait_seconds, args.poll_seconds))
                 continue
 
@@ -5308,14 +5942,57 @@ def command_run(args: argparse.Namespace) -> int:
                 save_queue(paths.queue_file, queue)
                 continue
 
+            if item.get("provider") == PROVIDER_CODEX:
+                if codex_exe is None:
+                    update_auto_continue_state(
+                        auto_continue,
+                        "blocked",
+                        enabled=False,
+                        last_error="CLI Codex non trovato durante auto-continua.",
+                    )
+                    save_queue(paths.queue_file, queue)
+                    return 1
+                try:
+                    prepare_codex_recovery_state(paths, codex_exe, queue, auto_continue)
+                except AutoContinueCancelled as exc:
+                    print(str(exc))
+                    return 0
+                except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                    update_auto_continue_state(
+                        auto_continue,
+                        "blocked",
+                        enabled=False,
+                        last_error=str(exc),
+                    )
+                    save_queue(paths.queue_file, queue)
+                    print(f"Auto-continua Codex bloccato: {exc}")
+                    return 1
+                item = auto_continue_as_item(auto_continue)
+            elif claude_item_is_desktop(item):
+                update_auto_continue_state(
+                    auto_continue,
+                    auto_continue.get("status"),
+                    action="claude_try_again",
+                    prompt="Try again",
+                    recovery_prompt_preview="Try again",
+                    recovery_followup_count=0,
+                )
+                item = auto_continue_as_item(auto_continue)
+                save_queue(paths.queue_file, queue)
+
             if args.dry_run:
                 print("DRY RUN AUTO-CONTINUA")
                 if item.get("allow_cwd_fallback"):
                     print(f"cwd fallback: {item.get('cwd_fallback')}")
-                print_agent_dry_run_details(paths, claude_exe, codex_exe, item, args.ide, RECOVERY_PROMPT)
+                if claude_item_is_desktop(item):
+                    print(f"provider: {PROVIDER_CLAUDE}")
+                    print(f"azione: Try again nativo sulla sessione {item['session_id']}")
+                else:
+                    print_agent_dry_run_details(paths, claude_exe, codex_exe, item, args.ide, item["prompt"])
                 return 0
 
-            print(f"Auto-continua: invio '{RECOVERY_PROMPT}' a chat {item['session_id'][:8]}")
+            action_preview = auto_continue.get("recovery_prompt_preview") or truncate(item["prompt"], 80)
+            print(f"Auto-continua: eseguo '{action_preview}' sulla chat {item['session_id'][:8]}")
             update_auto_continue_state(
                 auto_continue,
                 "sending",
@@ -5327,9 +6004,15 @@ def command_run(args: argparse.Namespace) -> int:
                 not_before=None,
             )
             save_queue(paths.queue_file, queue)
+            if not auto_continue.get("enabled"):
+                print("Auto-continua disattivato prima dell'invio: nessuna azione eseguita.")
+                return 0
             run_started_at = dt.datetime.now(UTC) - dt.timedelta(seconds=5)
             try:
-                result = run_agent(paths, claude_exe, codex_exe, item, args.timeout, args.ide)
+                if claude_item_is_desktop(item):
+                    result = run_claude_desktop_try_again(paths, item, timeout=min(args.timeout, 55))
+                else:
+                    result = run_agent(paths, claude_exe, codex_exe, item, args.timeout, args.ide)
             except subprocess.TimeoutExpired:
                 update_auto_continue_state(
                     auto_continue,
@@ -5346,7 +6029,11 @@ def command_run(args: argparse.Namespace) -> int:
 
             auto_continue["last_log"] = write_run_log(paths, item, result)
             if result.returncode == 0:
-                missing_prompt_error = prompt_missing_after_success(paths, item, run_started_at)
+                missing_prompt_error = (
+                    None
+                    if claude_item_is_desktop(item)
+                    else prompt_missing_after_success(paths, item, run_started_at)
+                )
                 if missing_prompt_error:
                     update_auto_continue_state(
                         auto_continue,
@@ -5387,6 +6074,27 @@ def command_run(args: argparse.Namespace) -> int:
                     return 0
                 continue
 
+            if claude_item_is_desktop(item) and result.returncode == CLAUDE_DESKTOP_TRY_AGAIN_EXIT:
+                update_auto_continue_state(
+                    auto_continue,
+                    "waiting_retry",
+                    enabled=True,
+                    last_error=(
+                        "La chat e' stata aperta, ma il pulsante Try again non e' ancora visibile. "
+                        "Non ho inviato alcun messaggio; riprovero' automaticamente."
+                    ),
+                    not_before=(dt.datetime.now(UTC) + dt.timedelta(seconds=args.poll_seconds)).replace(microsecond=0).isoformat(),
+                    sending_started_at=None,
+                    next_check_in_seconds=args.poll_seconds,
+                    last_check_at=now_utc(),
+                )
+                save_queue(paths.queue_file, queue)
+                print("Try again non visibile: nessun messaggio inviato, nuovo tentativo programmato.")
+                if args.once:
+                    return RATE_LIMIT_EXIT
+                time.sleep(args.poll_seconds)
+                continue
+
             if result.rate_limited:
                 update_auto_continue_state(
                     auto_continue,
@@ -5396,6 +6104,7 @@ def command_run(args: argparse.Namespace) -> int:
                     sending_started_at=None,
                     next_check_in_seconds=None,
                     last_check_at=now_utc(),
+                    retry_needs_rollback=item.get("provider") == PROVIDER_CODEX,
                 )
                 save_queue(paths.queue_file, queue)
                 print(f"Session limit ancora attivo. Auto-continua dopo: {auto_continue['not_before']}")
@@ -5505,8 +6214,8 @@ def command_run(args: argparse.Namespace) -> int:
             set_recovery_after_limit(queue, item, result, prompt_was_recorded, args.poll_seconds)
             save_queue(paths.queue_file, queue)
             print(
-                "Session limit rilevato. Prima della coda mandero' "
-                f"'{RECOVERY_PROMPT}' dopo: {queue['recovery']['not_before']}"
+                "Session limit rilevato. Prima della coda determinero' il recupero corretto "
+                f"dopo: {queue['recovery']['not_before']}"
             )
             if args.once:
                 return RATE_LIMIT_EXIT

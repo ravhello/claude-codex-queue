@@ -6,7 +6,7 @@
 
 <p align="center">
   Queue prompts for existing Claude Code sessions and Codex App tasks.<br>
-  Wait out usage limits, send <code>continua</code>, then resume the queue without wasting the next prompt.
+  Wait out usage limits, retry the interrupted turn correctly, then resume the queue without wasting the next prompt.
 </p>
 
 <p align="center">
@@ -31,8 +31,8 @@
 
 AI coding sessions often stop at the usage-limit boundary. Sending the next real
 prompt immediately can waste it on another limit response. Claude + Codex Queue
-keeps that prompt pending, waits for the reset, resumes the interrupted work
-with `continua`, and only then processes the rest of the queue in order.
+keeps that prompt pending, waits for the reset, and recovers the interrupted turn
+without duplicating a failed message. It then processes the rest of the queue in order.
 
 The app works with sessions you already use. It does not create a separate chat
 system and does not require external Anthropic or OpenAI API keys.
@@ -153,19 +153,34 @@ flowchart LR
     C -- "No" --> D["Confirm prompt in transcript"]
     C -- "Yes" --> E["Keep prompt pending"]
     E --> F["Wait until reset + 60 seconds"]
-    F --> G["Send 'continua'"]
-    G --> H{"Previous work finished?"}
-    H -- "Not yet" --> G
-    H -- "Yes" --> A
+    F --> G{"Provider and turn state"}
+    G -- "Claude Desktop Code" --> H["Invoke native Try again"]
+    G -- "Codex prompt never started" --> I["Rollback failed turn and resend the same prompt"]
+    G -- "Codex work stopped before recap" --> J["Send 'continua'"]
+    I --> K["Queue any additional failed prompts in order"]
+    J --> K
+    H --> A
+    K --> A
 ```
 
 Auto-continue can also monitor a selected session with an empty queue. It sends
 nothing while no active limit is detected.
 
+For Claude Desktop Code sessions, auto-continue opens the exact local session
+through Claude's supported deep link and invokes the visible `Try again` control
+through Windows UI Automation. It never substitutes a new `continua` message.
+For Codex App tasks, the runner reads structured turn state through app-server:
+a failed turn with no agent progress is removed with `thread/rollback` and sent
+again unchanged, while an interrupted turn that already contains agent activity
+receives `continua`. Additional failed text prompts are placed in the persistent
+queue in their original order.
+
 ## Safety guarantees
 
 - The project does not bypass or evade provider limits.
 - The next queued prompt remains pending when a limit is detected.
+- Failed Codex prompts are rolled back before replay, so the task does not show a duplicate user message.
+- Claude Desktop `Try again` failures never fall back to sending a new prompt.
 - Chat settings are fingerprinted and checked before sending.
 - External Anthropic and OpenAI API-key/base-URL overrides are removed from
   child processes, so local CLI authentication remains authoritative.

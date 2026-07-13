@@ -8,6 +8,7 @@ import subprocess
 import sys
 import threading
 import time
+import uuid
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -843,17 +844,28 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
         queue = app.load_queue(self.state.paths.queue_file)
         if not enabled:
             auto_continue = queue.get("auto_continue")
+            idle_monitor = False
             if isinstance(auto_continue, dict):
+                idle_monitor = auto_continue.get("status") in {
+                    "armed",
+                    "monitoring",
+                    "waiting_limit",
+                    "waiting_retry",
+                }
+                app.mark_auto_continue_cancelled(self.state.paths.queue_file, auto_continue)
                 auto_continue["enabled"] = False
                 auto_continue["status"] = "disabled"
                 auto_continue["disabled_at"] = app.now_utc()
             app.save_queue(self.state.paths.queue_file, queue)
+            runner = self.state.runner_status()
+            if idle_monitor and not app.pending_items(queue) and not app.active_recovery(queue):
+                runner = self.state.stop_runner()
             return {
                 "items": queue.get("items", []),
                 "recovery": app.active_recovery(queue),
                 "auto_continue": queue.get("auto_continue"),
                 "summary": queue_summary(queue),
-                "runner": self.state.runner_status(),
+                "runner": runner,
             }
 
         session_id = str(payload.get("session_id") or "")
@@ -883,6 +895,7 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             last_error = "Usage limit attivo: attendo reset + 1 minuto prima di riprovare."
 
         queue["auto_continue"] = {
+            "activation_id": str(uuid.uuid4()),
             "enabled": True,
             "status": status,
             "created_at": app.now_utc(),
@@ -892,7 +905,22 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             "source": chat.source,
             "provider": chat.provider,
             "jsonl_path": str(chat.jsonl_path),
-            "prompt": app.RECOVERY_PROMPT,
+            "prompt": "Try again" if app.claude_item_is_desktop(app.chat_execution_fields(chat)) else app.RECOVERY_PROMPT,
+            "action": (
+                "claude_try_again"
+                if app.claude_item_is_desktop(app.chat_execution_fields(chat))
+                else "codex_inspect"
+                if chat.provider == app.PROVIDER_CODEX
+                else "continue_interrupted"
+            ),
+            "recovery_prompt_preview": (
+                "Try again"
+                if app.claude_item_is_desktop(app.chat_execution_fields(chat))
+                else "Analisi automatica del turno"
+                if chat.provider == app.PROVIDER_CODEX
+                else app.RECOVERY_PROMPT
+            ),
+            "recovery_followup_count": 0,
             "monitor_limit": True,
             "attempts": 0,
             "not_before": not_before,
@@ -1451,6 +1479,14 @@ HTML = r"""<!doctype html>
       return `${secs}s`;
     }
 
+    function autoActionLabel(auto) {
+      if (!auto) return "continua";
+      if (auto.action === "claude_try_again") return "Try again nativo";
+      if (auto.action === "retry_failed_prompt") return `reinvio senza duplicato: ${auto.recovery_prompt_preview || "ultimo messaggio"}`;
+      if (auto.action === "codex_inspect") return "analisi automatica del turno Codex";
+      return `continua${auto.action === "continue_interrupted" ? " per completare il turno interrotto" : ""}`;
+    }
+
     function autoStatusText(auto) {
       if (!auto) return "";
       const shortId = (auto.session_id || "").slice(0, 8);
@@ -1463,9 +1499,10 @@ HTML = r"""<!doctype html>
         }
         if (auto.status === "waiting_limit") {
           const wait = auto.next_check_in_seconds ? `, controllo tra ${formatDuration(auto.next_check_in_seconds)}` : "";
-          return `Auto-continua attivo su ${shortId}${title}: in attesa del limite${auto.not_before ? ` fino a ${formatDateTime(auto.not_before)}` : ""}${wait}, ${runnerText}.`;
+          return `Auto-continua attivo su ${shortId}${title}: attendo reset + margine${auto.not_before ? ` fino a ${formatDateTime(auto.not_before)}` : ""}; poi ${autoActionLabel(auto)}${wait}, ${runnerText}.`;
         }
-        if (auto.status === "sending") return `Auto-continua attivo su ${shortId}${title}: invio di continua in corso, ${runnerText}.`;
+        if (auto.status === "waiting_retry") return `Auto-continua attivo su ${shortId}${title}: Try again non era ancora visibile; nessun messaggio inviato, riprovo automaticamente, ${runnerText}.`;
+        if (auto.status === "sending") return `Auto-continua attivo su ${shortId}${title}: ${autoActionLabel(auto)} in corso, ${runnerText}.`;
         return `Auto-continua attivo su ${shortId}${title}, ${runnerText}.`;
       }
       if (auto.status === "failed" || auto.status === "blocked" || auto.status === "blocked_permission") {
@@ -1555,7 +1592,8 @@ HTML = r"""<!doctype html>
       const recovery = data.recovery || null;
       const recoveryBox = recovery ? `
         <div class="recovery-box">
-          Recovery attiva: il prossimo invio sara' <b>continua</b> sulla chat ${escapeHtml((recovery.session_id || "").slice(0, 8))}.
+          Recovery attiva: la prossima azione sara' <b>${escapeHtml(recovery.recovery_prompt_preview || recovery.prompt || "analisi automatica")}</b> sulla chat ${escapeHtml((recovery.session_id || "").slice(0, 8))}.
+          ${recovery.recovery_followup_count ? `<br><span class="meta">Altri ${escapeHtml(String(recovery.recovery_followup_count))} messaggi falliti sono in coda nello stesso ordine.</span>` : ""}
           ${recovery.not_before ? `<br><span class="meta">Non prima di ${escapeHtml(formatDateTime(recovery.not_before))}</span>` : ""}
         </div>
       ` : "";
@@ -1565,6 +1603,8 @@ HTML = r"""<!doctype html>
       const autoIsCodex = !!(auto && auto.provider === "codex");
       const autoDetails = auto ? [
         `Stato: ${escapeHtml(auto.status || "spento")}`,
+        `Azione: ${escapeHtml(autoActionLabel(auto))}`,
+        auto.recovery_followup_count ? `Messaggi recuperati in coda: ${escapeHtml(String(auto.recovery_followup_count))}` : "",
         `Runner: ${runner.running ? `attivo${runner.pid ? ` #${escapeHtml(runner.pid)}` : ""}` : (runner.automatic ? "automatico in attesa" : "fermo")}`,
         `Origine: ${escapeHtml(auto.source || (autoIsCodex ? "Codex App" : "Claude Code"))}`,
         !autoIsCodex && auto.source_key === "claude_windows_app" ? "Integrazione IDE: non usata" : "",

@@ -18,7 +18,7 @@ flowchart TD
     C --> D["Local web UI / CLI"]
     D --> E["Persistent queue"]
     E --> F["Runner"]
-    F --> G["Official Claude or Codex CLI"]
+    F --> G["Claude native retry or provider CLI"]
     G --> H["Local transcript confirmation"]
     H --> E
 ```
@@ -70,13 +70,28 @@ settings, and a settings fingerprint.
 
 The runner preserves FIFO order within each priority. A rate-limit response
 creates recovery state without consuming the queued prompt. Recovery waits for
-the parsed reset plus a safety delay, sends `continua`, and returns to the
-pending prompt only after the interrupted session can proceed.
+the parsed reset plus a safety delay, inspects provider-specific turn state and
+returns to the pending queue only after the interrupted session can proceed.
+
+Claude Desktop Code recovery resolves the app-local session ID, opens it with
+`claude://code/<session-id>` and invokes its native `Try again` button through
+Windows UI Automation. Codex recovery reads turns through app-server. It uses
+`thread/rollback` only for trailing turns with no agent progress, then replays
+the original text through the normal authenticated CLI; interrupted work that
+already has agent activity receives `continua`. Additional failed prompts are
+persisted as ordered, high-priority queue items. Rollback plans are stored before
+execution and verified against turn IDs so a restart cannot apply them twice.
+Each auto-continue activation also has a durable cancellation marker. Queue
+writes are serialized, so a runner holding stale state cannot re-enable a
+monitor after it has been disabled; cancellation is checked again immediately
+before dispatch.
 
 ### Provider execution
 
-Claude sessions resume through the official Claude Code executable. Codex tasks
-resume through `codex exec resume`. The child environment removes external API
+Claude queue messages resume through the official Claude Code executable, while
+Claude Desktop auto-recovery invokes the app's own retry control. Codex tasks
+resume through `codex exec resume`; history replacement uses app-server
+`thread/rollback`. The child environment removes external API
 authentication overrides so the locally authenticated CLI account remains the
 source of truth.
 
@@ -91,6 +106,9 @@ later.
 ## Safety invariants
 
 - Never consume the next queued prompt as the recovery probe.
+- Never replace Claude Desktop `Try again` with a newly created prompt.
+- Never replay a failed Codex user message before its failed turn is rolled back.
+- Never let a stale runner write resurrect a disabled auto-continue activation.
 - Never enable bypass permissions implicitly.
 - Never silently change model, effort, sandbox, approval, or permission mode.
 - Never use an external API key accidentally inherited from the environment.

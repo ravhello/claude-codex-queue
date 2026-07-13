@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Replaced Claude Desktop auto-continue messages with the native `Try again` action on the exact local Code session.
+- Added Codex turn-aware recovery: rollback and replay untouched failed prompts, continue interrupted work, and queue additional failed messages in order.
+- Prevented a stale runner write from re-enabling auto-continue after the user disables it.
 - Added real Codex task copying through app-server `thread/fork` for the active ChatGPT account.
 - Fixed Claude Desktop recovery routing so it omits `--ide`, prefers the app CLI, and preserves UTF-8 output on Windows.
 - Pinned every Codex subprocess to the indexed `CODEX_HOME`, including Windows CLI calls launched from WSL.

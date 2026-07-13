@@ -155,6 +155,36 @@ class QueueAppTests(unittest.TestCase):
             self.assertEqual(refreshed["items"][0]["status"], app.STATUS_DONE)
             self.assertTrue(refreshed["auto_continue"]["enabled"])
 
+    def test_cancelled_auto_continue_cannot_be_resurrected_by_stale_runner_save(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            queue_file = root / ".state" / "queue.json"
+            active = {
+                "enabled": True,
+                "status": "armed",
+                "session_id": "dddddddd-4444-4444-8444-dddddddddddd",
+                "created_at": "2026-07-13T02:00:00+02:00",
+            }
+            app.save_queue(
+                queue_file,
+                {"version": 1, "items": [], "recovery": None, "auto_continue": active},
+            )
+            stale_runner_queue = app.load_queue(queue_file)
+
+            current = app.load_queue(queue_file)
+            app.mark_auto_continue_cancelled(queue_file, current["auto_continue"])
+            activation_id = current["auto_continue"]["activation_id"]
+            current["auto_continue"].update(enabled=False, status="disabled")
+            app.save_queue(queue_file, current)
+
+            stale_runner_queue["auto_continue"].update(enabled=True, status="monitoring")
+            app.save_queue(queue_file, stale_runner_queue)
+
+            final = app.load_queue(queue_file)["auto_continue"]
+            self.assertFalse(final["enabled"])
+            self.assertEqual(final["status"], "disabled")
+            self.assertEqual(final["activation_id"], activation_id)
+
     def test_discover_codex_app_sessions_reads_index_and_thread_settings(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -321,6 +351,248 @@ class QueueAppTests(unittest.TestCase):
             reset = app.latest_rate_limit_reset_from_chat(chat)
             self.assertIsNotNone(reset)
             self.assertEqual(int(reset.timestamp()), reset_epoch)
+
+    def test_codex_recovery_retries_failed_prompt_without_duplicate(self) -> None:
+        turns = [
+            {
+                "id": "done",
+                "status": "completed",
+                "items": [
+                    {"type": "userMessage", "content": [{"type": "text", "text": "prima"}]},
+                    {"type": "agentMessage", "text": "completato"},
+                ],
+            },
+            {
+                "id": "failed-1",
+                "status": "failed",
+                "error": {"message": "usage limit reached"},
+                "items": [
+                    {"type": "userMessage", "content": [{"type": "text", "text": "messaggio oltre il limite"}]},
+                ],
+            },
+        ]
+
+        plan = app.codex_recovery_plan_from_turns(turns)
+
+        self.assertEqual(plan.kind, "retry_failed_prompt")
+        self.assertEqual(plan.prompt, "messaggio oltre il limite")
+        self.assertEqual(plan.rollback_turn_ids, ("failed-1",))
+        self.assertEqual(plan.followup_prompts, ())
+
+    def test_codex_recovery_continues_interrupted_work_then_queues_failed_messages(self) -> None:
+        turns = [
+            {
+                "id": "interrupted",
+                "status": "interrupted",
+                "items": [
+                    {"type": "userMessage", "content": [{"type": "text", "text": "completa il progetto"}]},
+                    {"type": "agentMessage", "text": "Ho modificato i file, ora eseguo i test."},
+                    {"type": "commandExecution", "status": "completed"},
+                ],
+            },
+            {
+                "id": "failed-1",
+                "status": "failed",
+                "items": [
+                    {"type": "userMessage", "content": [{"type": "text", "text": "primo messaggio in coda"}]},
+                ],
+            },
+            {
+                "id": "failed-2",
+                "status": "failed",
+                "items": [
+                    {"type": "userMessage", "content": [{"type": "text", "text": "secondo messaggio in coda"}]},
+                ],
+            },
+        ]
+
+        plan = app.codex_recovery_plan_from_turns(turns)
+
+        self.assertEqual(plan.kind, "continue_interrupted")
+        self.assertEqual(plan.prompt, app.RECOVERY_PROMPT)
+        self.assertEqual(plan.rollback_turn_ids, ("failed-1", "failed-2"))
+        self.assertEqual(
+            plan.followup_prompts,
+            ("primo messaggio in coda", "secondo messaggio in coda"),
+        )
+
+    def test_prepare_codex_recovery_rolls_back_once_and_queues_followups_once(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = app.Paths(root, root / ".claude", root / ".state", root / ".state" / "queue.json", root / ".state" / "logs")
+            state = {
+                "session_id": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "title": "Codex recovery",
+                "cwd": str(root),
+                "provider": app.PROVIDER_CODEX,
+                "source": "Codex App",
+                "source_key": "codex_app",
+                "jsonl_path": str(root / "rollout.jsonl"),
+                "fingerprint": {"effective": {"model": "gpt-test"}},
+            }
+            queue = {"version": 1, "items": [], "recovery": None, "auto_continue": state}
+            plan = app.CodexRecoveryPlan(
+                prompt="primo",
+                kind="retry_failed_prompt",
+                rollback_turn_ids=("turn-1", "turn-2", "turn-3"),
+                followup_prompts=("secondo", "terzo"),
+                source_turn_ids=("turn-1", "turn-2", "turn-3"),
+            )
+
+            with patch.object(app, "codex_recovery_plan", return_value=plan), patch.object(
+                app, "apply_codex_rollback", return_value=True
+            ) as rollback:
+                app.prepare_codex_recovery_state(paths, root / "codex", queue, state)
+                app.prepare_codex_recovery_state(paths, root / "codex", queue, state)
+
+            rollback.assert_called_once_with(
+                root / "codex",
+                state["session_id"],
+                ("turn-1", "turn-2", "turn-3"),
+                codex_home=paths.codex_home,
+            )
+            self.assertEqual(state["prompt"], "primo")
+            self.assertEqual(state["action"], "retry_failed_prompt")
+            self.assertTrue(state["rollback_applied"])
+            self.assertTrue(state["followups_queued"])
+            self.assertEqual([item["prompt"] for item in queue["items"]], ["secondo", "terzo"])
+            self.assertTrue(all(item["priority"] == app.CODEX_RECOVERY_PRIORITY for item in queue["items"]))
+            self.assertEqual([item["recovery_sequence"] for item in queue["items"]], [1, 2])
+
+    def test_apply_codex_rollback_is_idempotent_after_persisted_rollback(self) -> None:
+        with patch.object(
+            app,
+            "codex_thread_turns",
+            return_value=[{"id": "completed", "status": "completed", "items": []}],
+        ), patch.object(app, "codex_app_server_request") as request:
+            changed = app.apply_codex_rollback(
+                Path("codex"),
+                "thread-id",
+                ("already-removed",),
+                codex_home=Path("home"),
+            )
+
+        self.assertFalse(changed)
+        request.assert_not_called()
+
+    def test_claude_desktop_auto_continue_uses_native_try_again_not_cli(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude_home = root / ".claude"
+            project = claude_home / "projects" / "p"
+            project.mkdir(parents=True)
+            session = "dddddddd-dddd-4ddd-8ddd-dddddddddddd"
+            transcript = project / f"{session}.jsonl"
+            transcript.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": session,
+                        "timestamp": app.now_utc(),
+                        "cwd": str(root),
+                        "message": {"content": "messaggio fallito"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            paths = app.Paths(root, claude_home, root / ".state", root / ".state" / "queue.json", root / ".state" / "logs")
+            chat = app.discover_chats(claude_home)[0]
+            fake = root / "claude"
+            fake.write_text("#!/bin/sh\nexit 99\n", encoding="utf-8")
+            fake.chmod(fake.stat().st_mode | 0o111)
+            app.save_queue(
+                paths.queue_file,
+                {
+                    "version": 1,
+                    "items": [],
+                    "recovery": None,
+                    "auto_continue": {
+                        "enabled": True,
+                        "status": "waiting_limit",
+                        "monitor_limit": False,
+                        "created_at": app.now_utc(),
+                        "session_id": session,
+                        "title": "Claude Desktop",
+                        "cwd": str(root),
+                        "prompt": "Try again",
+                        "source": "Claude Windows App",
+                        "source_key": "claude_windows_app",
+                        "provider": app.PROVIDER_CLAUDE,
+                        "attempts": 0,
+                        "not_before": None,
+                        "fingerprint": app.settings_fingerprint(paths, chat),
+                    },
+                },
+            )
+            native_result = app.ClaudeRunResult(0, "CLAUDE_TRY_AGAIN_INVOKED:Try again", "", False, None)
+
+            with patch.object(app, "run_claude_desktop_try_again", return_value=native_result) as native, patch.object(
+                app, "run_agent"
+            ) as cli:
+                result = app.main(
+                    [
+                        "--windows-home",
+                        str(root),
+                        "--state-dir",
+                        str(paths.state_dir),
+                        "--claude",
+                        str(fake),
+                        "run",
+                        "--once",
+                        "--no-ide",
+                    ]
+                )
+
+            self.assertEqual(result, 0)
+            native.assert_called_once()
+            cli.assert_not_called()
+            refreshed = app.load_queue(paths.queue_file)
+            self.assertEqual(refreshed["auto_continue"]["status"], "done")
+            self.assertEqual(refreshed["auto_continue"]["action"], "claude_try_again")
+            self.assertEqual(refreshed["auto_continue"]["prompt"], "Try again")
+
+            refreshed["auto_continue"].update(
+                {
+                    "enabled": True,
+                    "status": "waiting_limit",
+                    "not_before": None,
+                    "last_error": None,
+                }
+            )
+            app.save_queue(paths.queue_file, refreshed)
+            missing_button = app.ClaudeRunResult(
+                app.CLAUDE_DESKTOP_TRY_AGAIN_EXIT,
+                "",
+                "CLAUDE_TRY_AGAIN_NOT_FOUND",
+                False,
+                None,
+            )
+            with patch.object(app, "run_claude_desktop_try_again", return_value=missing_button), patch.object(
+                app, "run_agent"
+            ) as cli:
+                retry_result = app.main(
+                    [
+                        "--windows-home",
+                        str(root),
+                        "--state-dir",
+                        str(paths.state_dir),
+                        "--claude",
+                        str(fake),
+                        "run",
+                        "--once",
+                        "--no-ide",
+                        "--poll-seconds",
+                        "1",
+                    ]
+                )
+
+            self.assertEqual(retry_result, app.RATE_LIMIT_EXIT)
+            cli.assert_not_called()
+            waiting = app.load_queue(paths.queue_file)["auto_continue"]
+            self.assertTrue(waiting["enabled"])
+            self.assertEqual(waiting["status"], "waiting_retry")
+            self.assertIn("Non ho inviato alcun messaggio", waiting["last_error"])
 
     def test_run_codex_uses_structured_transcript_reset_when_output_has_no_time(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
