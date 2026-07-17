@@ -94,10 +94,26 @@ VALID_PERMISSION_MODES = {
 DESKTOP_STATE_ACTIVE = "active"
 DESKTOP_STATE_ARCHIVED = "archived"
 DESKTOP_STATE_DELETED = "deleted"
-DESKTOP_SYNC_STATE_VERSION = 1
+DESKTOP_SYNC_STATE_VERSION = 2
+DESKTOP_ACCOUNT_LOG_TAIL_BYTES = 4 * 1024 * 1024
+DESKTOP_ACCOUNT_EVENT_PATTERN = re.compile(
+    r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?"
+    r"\[sessions-bridge\] account-change reevaluate: .*?(?:→|->)\s*"
+    r"(?:(?P<organization>[0-9a-fA-F-]{36}):(?P<account>[0-9a-fA-F-]{36})|(?P<none><none>))"
+)
+DESKTOP_ARTIFACT_LOCAL_ONLY_FIELDS = {
+    "autoPublish",
+    "importedAt",
+    "lastRefreshCheckedAt",
+    "mcpTools",
+    "shareCounter",
+    "sharedAnchorConversationUuid",
+    "sharedArtifactUuid",
+}
 _DESKTOP_SYNC_LOCK = threading.RLock()
 _ACCOUNT_INDEX_LOCK = threading.RLock()
 _STATE_FILE_LOCKS = threading.local()
+ATOMIC_REPLACE_RETRY_DELAYS = (0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.0)
 
 
 class StateFileError(ValueError):
@@ -178,6 +194,19 @@ def account_index_lock(paths: Paths) -> Any:
 
 def desktop_sync_lock(paths: Paths) -> Any:
     return _state_file_lock(_DESKTOP_SYNC_LOCK, desktop_sync_state_path(paths))
+
+
+def atomic_replace_with_retry(source: Path, destination: Path) -> None:
+    """Replace a state file atomically, tolerating brief Windows sharing races."""
+
+    for delay in (*ATOMIC_REPLACE_RETRY_DELAYS, None):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError:
+            if delay is None:
+                raise
+            time.sleep(delay)
 
 RATE_LIMIT_PATTERNS = [
     r"\brate[- ]?limit(?:ed)?\b",
@@ -290,6 +319,14 @@ class DesktopSessionRecord:
     data: dict[str, Any]
     mtime_ns: int
     active_account_uuid: str | None
+
+
+@dataclasses.dataclass(frozen=True)
+class DesktopAccountContext:
+    account_uuid: str | None
+    organization_uuid: str | None
+    changed_at: str | None
+    logged_out: bool = False
 
 
 def local_now() -> dt.datetime:
@@ -1185,7 +1222,7 @@ def save_account_index(paths: Paths, index: dict[str, Any]) -> None:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
             handle.write(payload)
             temp_path = Path(handle.name)
-        temp_path.replace(path)
+        atomic_replace_with_retry(temp_path, path)
 
 
 def migrate_account_key(index: dict[str, Any], account: AccountInfo, provider: str) -> None:
@@ -2296,10 +2333,82 @@ def claude_windows_app_roots(paths: Paths) -> list[Path]:
     return [path for path in unique_paths(candidates) if path.exists()]
 
 
+def file_tail_text(path: Path, max_bytes: int) -> str:
+    try:
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            size = handle.tell()
+            offset = max(0, size - max_bytes)
+            handle.seek(offset)
+            payload = handle.read()
+    except OSError:
+        return ""
+    text = payload.decode("utf-8", errors="replace")
+    if offset:
+        _, separator, text = text.partition("\n")
+        if not separator:
+            return ""
+    return text
+
+
+def desktop_account_log_contexts(root: Path) -> list[DesktopAccountContext]:
+    contexts: list[tuple[str, int, int, DesktopAccountContext]] = []
+    try:
+        log_paths = list((root / "logs").glob("main*.log"))
+    except OSError:
+        log_paths = []
+    for log_path in log_paths:
+        try:
+            log_mtime_ns = log_path.stat().st_mtime_ns
+        except OSError:
+            log_mtime_ns = 0
+        for line_number, line in enumerate(
+            file_tail_text(log_path, DESKTOP_ACCOUNT_LOG_TAIL_BYTES).splitlines()
+        ):
+            match = DESKTOP_ACCOUNT_EVENT_PATTERN.search(line)
+            if match is None:
+                continue
+            changed_at = match.group("timestamp")
+            contexts.append(
+                (
+                    changed_at,
+                    log_mtime_ns,
+                    line_number,
+                    DesktopAccountContext(
+                        account_uuid=match.group("account"),
+                        organization_uuid=match.group("organization"),
+                        changed_at=changed_at,
+                        logged_out=match.group("none") is not None,
+                    ),
+                )
+            )
+    contexts.sort(key=lambda item: (item[0], item[1], item[2]))
+    return [item[3] for item in contexts]
+
+
+def active_desktop_account_context(root: Path) -> DesktopAccountContext:
+    contexts = desktop_account_log_contexts(root)
+    if contexts:
+        return contexts[-1]
+    value = desktop_config(root).get("lastKnownAccountUuid")
+    account_uuid = value if isinstance(value, str) and value else None
+    return DesktopAccountContext(
+        account_uuid=account_uuid,
+        organization_uuid=None,
+        changed_at=None,
+        logged_out=False,
+    )
+
+
 def claude_desktop_change_signature(paths: Paths) -> tuple[str, ...]:
     entries: list[str] = []
     for root in claude_windows_app_roots(paths):
-        entries.append(f"{str(root).casefold()}|active={active_desktop_account_uuid(root) or ''}")
+        context = active_desktop_account_context(root)
+        entries.append(
+            f"{str(root).casefold()}|active={context.account_uuid or ''}"
+            f"|org={context.organization_uuid or ''}|changed={context.changed_at or ''}"
+            f"|logged_out={int(context.logged_out)}"
+        )
         sessions_root = root / "claude-code-sessions"
         try:
             workspace_dirs = [path for path in sessions_root.glob("*/*") if path.is_dir()]
@@ -2315,6 +2424,17 @@ def claude_desktop_change_signature(paths: Paths) -> tuple[str, ...]:
             except ValueError:
                 relative = str(workspace_dir).casefold()
             entries.append(f"{str(root).casefold()}|{relative}|{mtime_ns}")
+        try:
+            artifact_manifests = list((root / "local-agent-mode-sessions").glob("*/*/artifacts.json"))
+        except OSError:
+            artifact_manifests = []
+        for manifest in artifact_manifests:
+            try:
+                stat = manifest.stat()
+                relative = manifest.relative_to(root).as_posix().casefold()
+                entries.append(f"{str(root).casefold()}|{relative}|{stat.st_mtime_ns}|{stat.st_size}")
+            except (OSError, ValueError):
+                continue
     return tuple(sorted(entries))
 
 
@@ -2323,13 +2443,16 @@ def desktop_config(root: Path) -> dict[str, Any]:
 
 
 def active_desktop_account_uuid(root: Path) -> str | None:
-    value = desktop_config(root).get("lastKnownAccountUuid")
-    return value if isinstance(value, str) and value else None
+    context = active_desktop_account_context(root)
+    return None if context.logged_out else context.account_uuid
 
 
 def active_desktop_workspace_uuid(root: Path, account_uuid: str | None) -> str | None:
     if not account_uuid:
         return None
+    context = active_desktop_account_context(root)
+    if context.account_uuid == account_uuid and context.organization_uuid:
+        return context.organization_uuid
     log_path = root / "logs" / "main.log"
     try:
         lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
@@ -2473,7 +2596,7 @@ def write_desktop_session_json(path: Path, data: dict[str, Any]) -> None:
     with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
         handle.write(payload)
         temp_path = Path(handle.name)
-    temp_path.replace(path)
+    atomic_replace_with_retry(temp_path, path)
 
 
 def desktop_session_data_for_path(
@@ -2522,6 +2645,304 @@ def desktop_account_workspace_uuids(
     return [preferred_workspace_uuid or str(uuid.uuid4())]
 
 
+def desktop_cowork_user_files_root(paths: Paths, root: Path) -> Path:
+    value = load_json_file(root / "claude_desktop_config.json").get("coworkUserFilesPath")
+    if isinstance(value, str) and value.strip():
+        return windows_to_local_path(value)
+    return paths.windows_home / "Claude"
+
+
+def desktop_artifact_manifest_path(root: Path, account_uuid: str, organization_uuid: str) -> Path:
+    return root / "local-agent-mode-sessions" / account_uuid / organization_uuid / "artifacts.json"
+
+
+def load_desktop_artifact_manifest(path: Path) -> list[dict[str, Any]]:
+    if not path.exists():
+        return []
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise StateFileError(f"Manifest artefatti Claude non leggibile ({path}): {exc}") from exc
+    if not isinstance(payload, list):
+        raise StateFileError(f"Manifest artefatti Claude non valido ({path}): deve essere una lista.")
+    entries: list[dict[str, Any]] = []
+    for entry in payload:
+        artifact_id = entry.get("id") if isinstance(entry, dict) else None
+        if not isinstance(artifact_id, str) or re.fullmatch(r"[a-z0-9_-]+", artifact_id) is None:
+            raise StateFileError(f"Manifest artefatti Claude non valido ({path}): id artefatto non valido.")
+        entries.append(dict(entry))
+    return entries
+
+
+def write_desktop_artifact_manifest(path: Path, entries: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps(entries, ensure_ascii=False, indent=2) + "\n"
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        handle.write(payload)
+        temp_path = Path(handle.name)
+    atomic_replace_with_retry(temp_path, path)
+
+
+def desktop_artifact_timestamp(entry: dict[str, Any]) -> float:
+    for key in ["updatedAt", "createdAt"]:
+        value = entry.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+        if isinstance(value, str):
+            parsed = parse_iso(value)
+            if parsed is not None:
+                return parsed.timestamp() * 1000
+    return 0.0
+
+
+def desktop_artifact_slots(
+    root: Path,
+    records: list[DesktopSessionRecord],
+    account_uuids: set[str],
+    workspace_uuids_by_account: dict[str, list[str]],
+) -> dict[str, tuple[str, str, Path]]:
+    organizations: dict[str, set[str]] = {account_uuid: set() for account_uuid in account_uuids}
+    base = root / "local-agent-mode-sessions"
+    try:
+        account_dirs = [path for path in base.iterdir() if path.is_dir() and path.name != "skills-plugin"]
+    except OSError:
+        account_dirs = []
+    for account_dir in account_dirs:
+        organizations.setdefault(account_dir.name, set())
+        try:
+            organizations[account_dir.name].update(
+                path.name for path in account_dir.iterdir() if path.is_dir()
+            )
+        except OSError:
+            pass
+    for context in desktop_account_log_contexts(root):
+        if context.account_uuid and context.organization_uuid:
+            organizations.setdefault(context.account_uuid, set()).add(context.organization_uuid)
+    active = active_desktop_account_context(root)
+    if active.account_uuid and active.organization_uuid:
+        organizations.setdefault(active.account_uuid, set()).add(active.organization_uuid)
+
+    records_by_account: dict[str, list[DesktopSessionRecord]] = {}
+    for record in records:
+        records_by_account.setdefault(record.account_uuid, []).append(record)
+    for account_uuid in account_uuids:
+        if organizations.get(account_uuid):
+            continue
+        fallback = workspace_uuids_by_account.get(account_uuid) or [
+            record.workspace_uuid for record in records_by_account.get(account_uuid, [])
+        ]
+        organizations.setdefault(account_uuid, set()).update(value for value in fallback if value)
+
+    slots: dict[str, tuple[str, str, Path]] = {}
+    for account_uuid, organization_uuids in organizations.items():
+        for organization_uuid in organization_uuids:
+            slot = desktop_replica_slot(account_uuid, organization_uuid)
+            slots[slot] = (
+                account_uuid,
+                organization_uuid,
+                desktop_artifact_manifest_path(root, account_uuid, organization_uuid),
+            )
+    return slots
+
+
+def desktop_artifact_session_maps(
+    records: list[DesktopSessionRecord],
+) -> tuple[dict[tuple[str, str], str], dict[tuple[str, str], str]]:
+    cli_by_app: dict[tuple[str, str], str] = {}
+    app_by_cli_record: dict[tuple[str, str], DesktopSessionRecord] = {}
+    for record in records:
+        app_session_id = record.data.get("sessionId")
+        cli_session_id = desktop_record_cli_session_id(record)
+        if not isinstance(app_session_id, str) or not app_session_id or not cli_session_id:
+            continue
+        cli_by_app[(record.account_uuid, app_session_id)] = cli_session_id
+        key = (record.account_uuid, cli_session_id)
+        current = app_by_cli_record.get(key)
+        if current is None or desktop_record_mtime_ns(record) >= desktop_record_mtime_ns(current):
+            app_by_cli_record[key] = record
+    app_by_cli = {
+        key: str(record.data["sessionId"])
+        for key, record in app_by_cli_record.items()
+        if isinstance(record.data.get("sessionId"), str)
+    }
+    return cli_by_app, app_by_cli
+
+
+def desktop_artifact_entry_for_slot(
+    source: dict[str, Any],
+    source_slot: str,
+    target_slot: str,
+    target: dict[str, Any] | None,
+    cli_by_app: dict[tuple[str, str], str],
+    app_by_cli: dict[tuple[str, str], str],
+) -> dict[str, Any]:
+    data = dict(source)
+    source_account = source_slot.split("/", 1)[0]
+    target_account = target_slot.split("/", 1)[0]
+    if source_slot != target_slot:
+        for field in DESKTOP_ARTIFACT_LOCAL_ONLY_FIELDS:
+            data.pop(field, None)
+        for field in ["createdBySessionId", "lastModifiedBySessionId"]:
+            source_app_session = source.get(field)
+            cli_session = (
+                cli_by_app.get((source_account, source_app_session))
+                if isinstance(source_app_session, str)
+                else None
+            )
+            target_app_session = app_by_cli.get((target_account, cli_session)) if cli_session else None
+            if target_app_session:
+                data[field] = target_app_session
+            else:
+                data.pop(field, None)
+    if target is not None:
+        for field in DESKTOP_ARTIFACT_LOCAL_ONLY_FIELDS:
+            if field in target:
+                data[field] = target[field]
+            else:
+                data.pop(field, None)
+    return data
+
+
+def sync_claude_desktop_artifacts(
+    paths: Paths,
+    root: Path,
+    records: list[DesktopSessionRecord],
+    account_uuids: set[str],
+    workspace_uuids_by_account: dict[str, list[str]],
+    state: dict[str, Any],
+    root_state: dict[str, Any],
+    result: dict[str, Any],
+) -> None:
+    slots = desktop_artifact_slots(root, records, account_uuids, workspace_uuids_by_account)
+    if not slots:
+        return
+    manifests: dict[str, dict[str, dict[str, Any]]] = {}
+    for slot, (_, _, manifest_path) in slots.items():
+        manifests[slot] = {
+            entry["id"]: entry for entry in load_desktop_artifact_manifest(manifest_path)
+        }
+
+    artifact_state = root_state.setdefault("artifacts", {})
+    if not isinstance(artifact_state, dict):
+        raise StateFileError("Journal sync Claude Desktop corrotto: 'artifacts' deve essere un oggetto.")
+    artifact_ids = set(artifact_state)
+    for entries in manifests.values():
+        artifact_ids.update(entries)
+    result["artifact_accounts"] += len(slots)
+    result["artifacts"] += len(artifact_ids)
+    cli_by_app, app_by_cli = desktop_artifact_session_maps(records)
+    artifact_files_root = desktop_cowork_user_files_root(paths, root) / "Artifacts"
+    dirty_slots: set[str] = set()
+
+    for artifact_id in sorted(artifact_ids):
+        state_entry = artifact_state.get(artifact_id)
+        if not isinstance(state_entry, dict):
+            state_entry = {}
+        previous_state = state_entry.get("state")
+        previous_replicas = state_entry.get("replicas")
+        if not isinstance(previous_replicas, dict):
+            previous_replicas = {}
+        current_sources = [
+            (entry, slot)
+            for slot, entries in manifests.items()
+            if (entry := entries.get(artifact_id)) is not None
+        ]
+
+        delete_confirmed = False
+        for slot, previous in previous_replicas.items():
+            if not isinstance(previous, dict) or previous.get("excluded") or slot not in slots:
+                continue
+            if artifact_id in manifests[slot]:
+                previous.update({"present": True, "missing_scans": 0, "scan_blocked": False})
+                continue
+            manifest_path = slots[slot][2]
+            if manifest_path.is_file():
+                missing_scans = int(previous.get("missing_scans") or 0) + 1
+                previous.update({"present": False, "missing_scans": missing_scans, "scan_blocked": False})
+                if missing_scans >= 2:
+                    delete_confirmed = True
+                else:
+                    result["pending_artifact_deletions"] += 1
+            else:
+                previous.update({"present": False, "missing_scans": 0, "scan_blocked": True})
+
+        canonical_state = (
+            DESKTOP_STATE_DELETED
+            if previous_state == DESKTOP_STATE_DELETED or delete_confirmed
+            else DESKTOP_STATE_ACTIVE
+        )
+        state_entry["state"] = canonical_state
+        state_entry["replicas"] = previous_replicas
+        artifact_state[artifact_id] = state_entry
+        if canonical_state == DESKTOP_STATE_DELETED:
+            if previous_state != DESKTOP_STATE_DELETED:
+                # Keep the tombstone durable before removing any account manifest entry.
+                save_desktop_sync_state(paths, state)
+            for slot, entries in manifests.items():
+                if entries.pop(artifact_id, None) is not None:
+                    dirty_slots.add(slot)
+                    result["artifacts_removed"] += 1
+            if previous_state != DESKTOP_STATE_DELETED:
+                result["artifacts_deleted"] += 1
+            continue
+        if not current_sources:
+            continue
+        if not (artifact_files_root / artifact_id / "index.html").is_file():
+            result["artifact_missing_files"] += 1
+            continue
+
+        canonical, source_slot = max(
+            current_sources,
+            key=lambda item: (desktop_artifact_timestamp(item[0]), item[1]),
+        )
+        for target_slot, entries in manifests.items():
+            target = entries.get(artifact_id)
+            previous = previous_replicas.get(target_slot)
+            if target is None and isinstance(previous, dict) and (
+                previous.get("scan_blocked") or int(previous.get("missing_scans") or 0) > 0
+            ):
+                continue
+            desired = desktop_artifact_entry_for_slot(
+                canonical,
+                source_slot,
+                target_slot,
+                target,
+                cli_by_app,
+                app_by_cli,
+            )
+            if target is None:
+                entries[artifact_id] = desired
+                dirty_slots.add(target_slot)
+                result["artifacts_created"] += 1
+            elif (
+                desktop_artifact_timestamp(canonical) >= desktop_artifact_timestamp(target)
+                and desired != target
+            ):
+                entries[artifact_id] = desired
+                dirty_slots.add(target_slot)
+                result["artifacts_updated"] += 1
+
+        replicas: dict[str, dict[str, Any]] = {}
+        for slot, entries in manifests.items():
+            if artifact_id in entries:
+                replicas[slot] = {"present": True, "missing_scans": 0, "scan_blocked": False}
+            elif isinstance(previous_replicas.get(slot), dict):
+                replicas[slot] = previous_replicas[slot]
+        state_entry["replicas"] = replicas
+
+    for slot in sorted(dirty_slots):
+        manifest_path = slots[slot][2]
+        if manifest_path.exists():
+            backup = backup_desktop_session_file(paths, manifest_path)
+            result["artifact_backups"].append(str(backup))
+        entries = sorted(
+            manifests[slot].values(),
+            key=lambda entry: (desktop_artifact_timestamp(entry), str(entry.get("id") or "")),
+            reverse=True,
+        )
+        write_desktop_artifact_manifest(manifest_path, entries)
+
+
 def desktop_sync_state_path(paths: Paths) -> Path:
     return paths.state_dir / DESKTOP_SYNC_STATE_FILE_NAME
 
@@ -2549,7 +2970,7 @@ def save_desktop_sync_state(paths: Paths, state: dict[str, Any]) -> None:
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
             handle.write(payload)
             temp_path = Path(handle.name)
-        temp_path.replace(path)
+        atomic_replace_with_retry(temp_path, path)
 
 
 def desktop_sync_root_key(root: Path) -> str:
@@ -2708,20 +3129,29 @@ def sync_claude_desktop_accounts(
         "pending_deletions": 0,
         "tombstone_skips": 0,
         "backups": [],
+        "artifact_accounts": 0,
+        "artifacts": 0,
+        "artifacts_created": 0,
+        "artifacts_updated": 0,
+        "artifacts_deleted": 0,
+        "artifacts_removed": 0,
+        "pending_artifact_deletions": 0,
+        "artifact_missing_files": 0,
+        "artifact_backups": [],
         "transcripts_scanned": include_transcripts,
     }
 
+    transcript_chats = (
+        {
+            chat.session_id: chat
+            for chat in discover_chats(paths.claude_home)
+            if chat.session_id and chat.cwd and chat.can_queue
+        }
+        if include_transcripts
+        else {}
+    )
     with desktop_sync_lock(paths):
         state = load_desktop_sync_state(paths)
-        transcript_chats = (
-            {
-                chat.session_id: chat
-                for chat in discover_chats(paths.claude_home)
-                if chat.session_id and chat.cwd and chat.can_queue
-            }
-            if include_transcripts
-            else {}
-        )
         records = desktop_session_records(paths)
         for record in records:
             sanitized = sanitize_desktop_session_data(record.data)
@@ -2748,6 +3178,13 @@ def sync_claude_desktop_accounts(
             account_uuids = {record.account_uuid for record in root_records if record.account_uuid}
             if sessions_root.exists():
                 account_uuids.update(path.name for path in sessions_root.iterdir() if path.is_dir())
+            artifact_sessions_root = root / "local-agent-mode-sessions"
+            if artifact_sessions_root.exists():
+                account_uuids.update(
+                    path.name
+                    for path in artifact_sessions_root.iterdir()
+                    if path.is_dir() and path.name != "skills-plugin"
+                )
             if active_account_uuid:
                 account_uuids.add(active_account_uuid)
             if not account_uuids:
@@ -2790,6 +3227,7 @@ def sync_claude_desktop_accounts(
                         result["backups"].append(str(backup))
                         duplicate.path.unlink()
                         result["deduped"] += 1
+
                 records_by_session[session_id] = kept
 
             all_session_ids = set(records_by_session) | set(session_state) | set(transcript_chats)
@@ -3034,6 +3472,22 @@ def sync_claude_desktop_accounts(
                         duplicate.path.unlink()
                         result["deduped"] += 1
 
+            current_root_records = [
+                record
+                for record in desktop_session_records(paths)
+                if record.root == root
+            ]
+            sync_claude_desktop_artifacts(
+                paths,
+                root,
+                current_root_records,
+                account_uuids,
+                workspace_uuids_by_account,
+                state,
+                root_state,
+                result,
+            )
+
         refresh_desktop_sync_snapshots(paths, state)
         save_desktop_sync_state(paths, state)
     return result
@@ -3148,6 +3602,7 @@ def transfer_chat_to_active_desktop_account(paths: Paths, chat: Chat, move: bool
                 record.path.unlink()
                 removed_source = str(record.path)
                 break
+        artifact_sync = sync_claude_desktop_accounts(paths, include_transcripts=False)
         return {
             "status": "already_active",
             "session_id": chat.session_id,
@@ -3157,6 +3612,16 @@ def transfer_chat_to_active_desktop_account(paths: Paths, chat: Chat, move: bool
             "active_workspace": active_workspace_uuid,
             "backup": str(backup_path) if backup_path else None,
             "removed_source": removed_source,
+            "artifact_sync": {
+                key: artifact_sync[key]
+                for key in [
+                    "artifacts_created",
+                    "artifacts_updated",
+                    "artifacts_deleted",
+                    "artifacts_removed",
+                    "artifact_missing_files",
+                ]
+            },
         }
 
     if source_record is not None:
@@ -3180,6 +3645,7 @@ def transfer_chat_to_active_desktop_account(paths: Paths, chat: Chat, move: bool
         source_record.path.unlink()
         removed_source = str(source_record.path)
 
+    artifact_sync = sync_claude_desktop_accounts(paths, include_transcripts=False)
     return {
         "status": "moved" if move and removed_source else "copied",
         "session_id": chat.session_id,
@@ -3191,6 +3657,16 @@ def transfer_chat_to_active_desktop_account(paths: Paths, chat: Chat, move: bool
         "backup": str(backup_path) if backup_path else None,
         "removed_source": removed_source,
         "synthetic": source_record is None,
+        "artifact_sync": {
+            key: artifact_sync[key]
+            for key in [
+                "artifacts_created",
+                "artifacts_updated",
+                "artifacts_deleted",
+                "artifacts_removed",
+                "artifact_missing_files",
+            ]
+        },
     }
 
 
@@ -4835,7 +5311,7 @@ def save_queue(queue_file: Path, data: dict[str, Any], *, merge_auto_continues: 
             handle.write("\n")
             temp_path = Path(handle.name)
         try:
-            temp_path.replace(queue_file)
+            atomic_replace_with_retry(temp_path, queue_file)
         finally:
             with contextlib.suppress(OSError):
                 temp_path.unlink()

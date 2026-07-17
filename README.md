@@ -51,7 +51,7 @@ Additional capabilities:
 - newest-real-message sorting across Claude and Codex;
 - persistent FIFO queue with per-prompt priorities;
 - one-minute safety delay after a parsed reset time;
-- multi-account Claude Code synchronization with archive, unarchive and delete propagation;
+- multi-account Claude Code and artifact synchronization with archive and delete propagation;
 - Codex task forks for the active ChatGPT-authenticated account, with linked lifecycle sync;
 - account mismatch and view-only checks before actions are enabled;
 - transcript confirmation after every Codex send;
@@ -70,6 +70,14 @@ to another account, preventing failed remote deletes from restoring a local
 replica. Account switches and session-directory changes wake the sync monitor
 immediately instead of waiting for the normal polling deadline.
 
+Account changes are read from Claude's session-bridge log as soon as login
+finishes, before the app writes its first activity to `config.json`. Cowork
+artifact manifests are replicated to every known account/organization and their
+session links are remapped to the destination copy. Connector grants, published
+share IDs and other account-local fields are not copied. Artifact deletion uses
+the same two-scan confirmation rule; the physical `Artifacts/<id>/index.html`
+file remains provider-owned and is never deleted by this project.
+
 The chat list keeps one row per logical Claude session and shows every account
 that currently owns a replica. Account identifiers are searchable, so switching
 accounts never makes the previous account's sessions appear to vanish. Each row
@@ -84,10 +92,17 @@ operations use the official `codex archive`, `codex unarchive` and
 files directly.
 
 The local web process runs a fast linked-account check on a ten-second cadence
-and a full Claude transcript discovery every minute. Slow transcript discovery
-does not add another fixed delay before the next metadata check, so lifecycle
+and a full Claude transcript discovery every minute. Startup and account changes
+use the fast metadata path first; Claude chats appear immediately while the full
+Claude/Codex list is refreshed in the background. Slow transcript discovery does
+not add another fixed delay before the next metadata check, so lifecycle
 synchronization does not depend on an open or foreground browser tab. The
 Windows Startup entry keeps the program running after login.
+
+Filesystem discovery, account synchronization and queue persistence do not
+require Claude, Codex or VS Code to be open. Sending still requires the matching
+authenticated CLI; Claude Desktop native retry opens the exact app session when
+needed.
 
 Codex changes for a copy owned by another ChatGPT account remain pending until
 that account becomes active, then the monitor applies them automatically. State
@@ -249,7 +264,7 @@ reproducible defects belong in
 
 ## Project status
 
-Current release: **v0.2.3**. The project is alpha software tested on Windows/WSL
+Current release: **v0.2.4**. The project is alpha software tested on Windows/WSL
 with local Claude Code and Codex App workflows. Upstream desktop metadata is not
 a public compatibility contract and may change between provider releases.
 

@@ -115,6 +115,8 @@ class WebState:
         self._chats_cache_at = 0.0
         self._chats_refreshing = False
         self._chats_refresh_started_at = 0.0
+        self._chats_generation = 0
+        self._chats_desktop_signature = app.claude_desktop_change_signature(paths)
         self._version_cache: str | None = None
         self._version_cache_at = 0.0
         self._codex_version_cache: str | None = None
@@ -263,19 +265,21 @@ class WebState:
             self.paths,
             app.merge_claude_chat_sources([], desktop_chats),
         )
-        codex_chats = app.annotate_codex_chats_with_accounts(
-            self.paths,
-            app.discover_codex_app_sessions(self.paths),
-        )
+        with self.lock:
+            codex_chats = [
+                chat for chat in self._chats_cache if chat.provider == app.PROVIDER_CODEX
+            ]
         return sorted(claude_chats + codex_chats, key=app.chat_sort_key, reverse=True)
 
     def refresh_chats_background(self) -> None:
         now = time.monotonic()
+        started_signature = app.claude_desktop_change_signature(self.paths)
         with self.lock:
             if self._chats_refreshing:
                 return
             self._chats_refreshing = True
             self._chats_refresh_started_at = now
+            generation = self._chats_generation
 
         def worker() -> None:
             try:
@@ -286,22 +290,51 @@ class WebState:
                 )
             except Exception:
                 chats = []
+            finished_signature = app.claude_desktop_change_signature(self.paths)
+            retry = False
             with self.lock:
-                if chats:
+                if generation != self._chats_generation:
+                    return
+                if finished_signature != started_signature:
+                    self._chats_generation += 1
+                    self._chats_desktop_signature = finished_signature
+                    self._chats_cache = []
+                    self._chats_cache_at = 0.0
+                    retry = True
+                elif chats:
                     self._chats_cache = chats
                     self._chats_cache_at = time.monotonic()
                 self._chats_refreshing = False
+            if retry:
+                self.refresh_chats_background()
 
         threading.Thread(target=worker, daemon=True).start()
 
     def chats(self, max_age_seconds: int = 15) -> list[app.Chat]:
         now = time.monotonic()
+        signature = app.claude_desktop_change_signature(self.paths)
+        signature_changed = False
         with self.lock:
-            if self._chats_cache and now - self._chats_cache_at < max_age_seconds:
+            if signature != self._chats_desktop_signature:
+                signature_changed = True
+                self._chats_generation += 1
+                self._chats_desktop_signature = signature
+                self._chats_cache = [
+                    chat for chat in self._chats_cache if chat.provider == app.PROVIDER_CODEX
+                ]
+                self._chats_cache_at = 0.0
+                self._chats_refreshing = False
+                self._chats_refresh_started_at = 0.0
+            generation = self._chats_generation
+            if (
+                not signature_changed
+                and self._chats_cache
+                and now - self._chats_cache_at < max_age_seconds
+            ):
                 return list(self._chats_cache)
             cached = list(self._chats_cache)
             refreshing = self._chats_refreshing
-        if cached:
+        if cached and not signature_changed:
             if not refreshing:
                 self.refresh_chats_background()
             return cached
@@ -310,7 +343,7 @@ class WebState:
         except Exception:
             chats = []
         with self.lock:
-            if chats:
+            if chats and generation == self._chats_generation:
                 self._chats_cache = chats
                 self._chats_cache_at = time.monotonic()
         self.refresh_chats_background()
@@ -321,7 +354,10 @@ class WebState:
             return list(self._chats_cache)
 
     def invalidate_chats(self) -> None:
+        signature = app.claude_desktop_change_signature(self.paths)
         with self.lock:
+            self._chats_generation += 1
+            self._chats_desktop_signature = signature
             self._chats_cache = []
             self._chats_cache_at = 0.0
             self._chats_refreshing = False
@@ -388,7 +424,21 @@ class WebState:
             results["claude"] = claude
             changed = any(
                 int(claude.get(key) or 0) > 0
-                for key in ["created", "transcripts_created", "updated", "repaired", "deduped", "archived", "unarchived", "deleted", "removed"]
+                for key in [
+                    "created",
+                    "transcripts_created",
+                    "updated",
+                    "repaired",
+                    "deduped",
+                    "archived",
+                    "unarchived",
+                    "deleted",
+                    "removed",
+                    "artifacts_created",
+                    "artifacts_updated",
+                    "artifacts_deleted",
+                    "artifacts_removed",
+                ]
             )
         except Exception as exc:
             errors.append(f"Claude: {exc}")
@@ -407,8 +457,8 @@ class WebState:
             self._account_sync_cycle_started_at = None
             self._account_sync_last_duration_seconds = round(time.monotonic() - started, 3)
             self._account_sync_last_error = " | ".join(errors) if errors else None
-            if changed:
-                self._chats_cache_at = 0.0
+        if changed:
+            self.invalidate_chats()
         return {
             **results,
             "changed": changed,
@@ -464,7 +514,7 @@ class WebState:
             self._account_sync_stop.clear()
 
             def worker() -> None:
-                next_full_at = 0.0
+                next_full_at = time.monotonic() + self._account_sync_full_poll_seconds
                 signature = app.claude_desktop_change_signature(self.paths)
                 while not self._account_sync_stop.is_set():
                     cycle_started = time.monotonic()
@@ -475,7 +525,10 @@ class WebState:
                     signature = app.claude_desktop_change_signature(self.paths)
                     elapsed = time.monotonic() - cycle_started
                     claude_result = result.get("claude") if isinstance(result.get("claude"), dict) else {}
-                    confirmation_due = int(claude_result.get("pending_deletions") or 0) > 0
+                    confirmation_due = (
+                        int(claude_result.get("pending_deletions") or 0) > 0
+                        or int(claude_result.get("pending_artifact_deletions") or 0) > 0
+                    )
                     wait_seconds = 1.0 if confirmation_due else max(0.05, self._account_sync_poll_seconds - elapsed)
                     stopped, signature = self.wait_for_account_sync_trigger(wait_seconds, signature)
                     if stopped:
@@ -738,6 +791,7 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
         claude_chats = [chat for chat in chats if chat.provider == app.PROVIDER_CLAUDE]
         codex_chats = [chat for chat in chats if chat.provider == app.PROVIDER_CODEX]
         return {
+            "app_version": __version__,
             "windows_home": str(self.state.paths.windows_home),
             "claude_home": str(self.state.paths.claude_home),
             "state_dir": str(self.state.paths.state_dir),
@@ -1937,7 +1991,18 @@ HTML = r"""<!doctype html>
         });
         state.chats = hydrateChatPreviews(result.chats || state.chats);
         const transfer = result.transfer || {};
-        appendLog(`Import completato: ${transfer.status || "ok"} · ${transfer.title || selected.title || state.selected}`);
+        const artifactSync = transfer.artifact_sync || {};
+        const artifactChanges = [
+          "artifacts_created",
+          "artifacts_updated",
+          "artifacts_deleted",
+          "artifacts_removed",
+        ].reduce((total, key) => total + Number(artifactSync[key] || 0), 0);
+        const artifactText = isCodex ? "" : ` · artefatti: ${artifactChanges}`;
+        appendLog(`Import completato: ${transfer.status || "ok"} · ${transfer.title || selected.title || state.selected}${artifactText}`);
+        if (Number(artifactSync.artifact_missing_files || 0) > 0) {
+          appendLog(`Attenzione: ${artifactSync.artifact_missing_files} artefatti hanno il manifesto ma manca il file locale.`);
+        }
         renderChats();
         await refreshAll();
       } catch (err) {

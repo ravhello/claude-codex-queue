@@ -46,6 +46,17 @@ never deletes the underlying `.claude/projects` transcript. Every overwritten
 or removed Claude metadata file is backed up under
 `account-transfer-backups/`.
 
+The same journal tracks Cowork artifacts by ID. The physical artifact directory
+is shared local data, while each Claude account/organization owns an
+`artifacts.json` manifest. Replication remaps `createdBySessionId` and
+`lastModifiedBySessionId` through the common CLI session ID, preserves existing
+destination-local connector grants and strips source account share IDs. Missing
+manifest entries require two complete scans before a tombstone is committed.
+
+Claude account identity comes from the latest session-bridge account-change log
+event, falling back to `config.json` only when no event exists. This makes a new
+login visible before the first conversation activity updates the config file.
+
 Codex uses one local store per Windows profile, so account copies must have
 different thread IDs. The transfer action calls app-server `thread/fork` while
 the destination ChatGPT-authenticated account is active and records the linked
@@ -55,7 +66,10 @@ links and delegates to the stable Codex CLI commands. SQLite,
 
 The web process owns a ten-second account lifecycle monitor. It invokes both
 provider synchronizers independently of browser polling and invalidates the
-chat cache whenever a replica changes.
+chat cache whenever a replica changes. The first cycle uses only provider
+metadata; full transcript discovery runs in the background on its own cadence.
+Discovery and lifecycle replication are filesystem operations and do not depend
+on Claude, Codex or VS Code processes being open.
 
 Account and Claude sync transactions use a process-local reentrant lock plus an
 OS file lock. Malformed durable state is an error, never an empty-state signal.

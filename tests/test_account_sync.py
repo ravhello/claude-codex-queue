@@ -9,6 +9,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from claude_vscode_queue import app
@@ -162,6 +163,33 @@ class AccountSyncTests(unittest.TestCase):
                 }
             },
         }
+
+    def test_atomic_replace_retries_a_transient_windows_sharing_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "new.json"
+            destination = root / "state.json"
+            source.write_text("new", encoding="utf-8")
+            destination.write_text("old", encoding="utf-8")
+            replace = os.replace
+            attempts = 0
+
+            def transient_replace(source_path: Path, destination_path: Path) -> None:
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise PermissionError(13, "sharing violation")
+                replace(source_path, destination_path)
+
+            with (
+                patch.object(app.os, "replace", side_effect=transient_replace),
+                patch.object(app.time, "sleep") as sleep,
+            ):
+                app.atomic_replace_with_retry(source, destination)
+
+            self.assertEqual(destination.read_text(encoding="utf-8"), "new")
+            self.assertFalse(source.exists())
+            sleep.assert_called_once_with(app.ATOMIC_REPLACE_RETRY_DELAYS[0])
 
     def test_claude_archive_propagates_from_account_a_to_b(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -395,6 +423,158 @@ class AccountSyncTests(unittest.TestCase):
             self.assertEqual({record.account_uuid for record in by_session[second_id]}, {"account-a", "account-b"})
             self.assertFalse((sessions_root / "account-a" / "workspace-b").exists())
             self.assertFalse((sessions_root / "account-b" / "workspace").exists())
+
+    def test_claude_account_switch_uses_log_before_config_or_first_activity(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            old_account = "11111111-1111-4111-8111-111111111111"
+            old_organization = "22222222-2222-4222-8222-222222222222"
+            new_account = "33333333-3333-4333-8333-333333333333"
+            new_organization = "44444444-4444-4444-8444-444444444444"
+            paths, app_root, old_dir, new_dir = self._claude_fixture(
+                root,
+                active_account=old_account,
+                other_account=new_account,
+                workspace=old_organization,
+            )
+            new_dir.rmdir()
+            new_dir.parent.rmdir()
+            session_id = "55555555-5555-4555-8555-555555555555"
+            self._write_claude_session(old_dir / "local_shared.json", session_id, root)
+            logs = app_root / "logs"
+            logs.mkdir()
+            main_log = logs / "main.log"
+            main_log.write_text(
+                "2026-07-17 12:52:38 [sessions-bridge] account-change reevaluate: "
+                f"{old_organization}:{old_account} -> <none>\n"
+                "2026-07-17 12:52:39 [sessions-bridge] account-change reevaluate: "
+                f"<none> -> {new_organization}:{new_account}\n",
+                encoding="utf-8",
+            )
+
+            context = app.active_desktop_account_context(app_root)
+            signature_before_logout = app.claude_desktop_change_signature(paths)
+            result = app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+
+            self.assertEqual(context.account_uuid, new_account)
+            self.assertEqual(context.organization_uuid, new_organization)
+            self.assertEqual(app.active_desktop_account_uuid(app_root), new_account)
+            self.assertEqual(app.active_desktop_workspace_uuid(app_root, new_account), new_organization)
+            self.assertEqual(result["created"], 1)
+            self.assertTrue(
+                (app_root / "claude-code-sessions" / new_account / new_organization / "local_shared.json").exists()
+            )
+
+            with main_log.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    "2026-07-17 12:53:00 [sessions-bridge] account-change reevaluate: "
+                    f"{new_organization}:{new_account} -> <none>\n"
+                )
+
+            self.assertIsNone(app.active_desktop_account_uuid(app_root))
+            self.assertNotEqual(signature_before_logout, app.claude_desktop_change_signature(paths))
+
+    def test_claude_artifacts_sync_session_links_and_propagate_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, app_root, account_a, account_b = self._claude_fixture(root)
+            session_id = "66666666-6666-4666-8666-666666666666"
+            self._write_claude_session(account_a / "local_source.json", session_id, root)
+            self._write_claude_session(account_b / "local_target.json", session_id, root)
+            files_root = root / "Claude files"
+            (app_root / "claude_desktop_config.json").write_text(
+                json.dumps({"coworkUserFilesPath": str(files_root)}),
+                encoding="utf-8",
+            )
+            artifact_id = "dashboard-1"
+            artifact_file = files_root / "Artifacts" / artifact_id / "index.html"
+            artifact_file.parent.mkdir(parents=True)
+            artifact_file.write_text("<html>shared</html>", encoding="utf-8")
+            source_manifest = app.desktop_artifact_manifest_path(app_root, "account-a", "workspace")
+            target_manifest = app.desktop_artifact_manifest_path(app_root, "account-b", "workspace")
+            source_entry = {
+                "id": artifact_id,
+                "name": "Dashboard",
+                "createdAt": 1_800_000_000_000,
+                "updatedAt": 1_800_000_001_000,
+                "createdBySessionId": "local_source",
+                "lastModifiedBySessionId": "local_source",
+                "versions": [],
+                "mcpTools": [{"server": "private-source-connector"}],
+                "sharedArtifactUuid": "source-only-share",
+                "autoPublish": True,
+            }
+            app.write_desktop_artifact_manifest(source_manifest, [source_entry])
+            app.write_desktop_artifact_manifest(target_manifest, [])
+
+            first = app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+            target_entry = app.load_desktop_artifact_manifest(target_manifest)[0]
+
+            self.assertEqual(first["artifacts_created"], 1)
+            self.assertEqual(target_entry["createdBySessionId"], "local_target")
+            self.assertEqual(target_entry["lastModifiedBySessionId"], "local_target")
+            self.assertNotIn("mcpTools", target_entry)
+            self.assertNotIn("sharedArtifactUuid", target_entry)
+            self.assertNotIn("autoPublish", target_entry)
+            self.assertEqual(
+                app.load_desktop_artifact_manifest(source_manifest)[0]["mcpTools"],
+                source_entry["mcpTools"],
+            )
+
+            app.write_desktop_artifact_manifest(source_manifest, [])
+            pending = app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+            self.assertEqual(pending["pending_artifact_deletions"], 1)
+            self.assertEqual(app.load_desktop_artifact_manifest(source_manifest), [])
+            self.assertEqual(len(app.load_desktop_artifact_manifest(target_manifest)), 1)
+
+            confirmed = app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+            self.assertEqual(confirmed["artifacts_deleted"], 1)
+            self.assertEqual(confirmed["artifacts_removed"], 1)
+            self.assertEqual(app.load_desktop_artifact_manifest(target_manifest), [])
+            self.assertTrue(artifact_file.exists())
+
+    def test_discovery_and_sync_do_not_require_claude_codex_or_vscode_processes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, _, account_a, account_b = self._claude_fixture(root)
+            claude_session = "77777777-7777-4777-8777-777777777777"
+            codex_session = "88888888-8888-4888-8888-888888888888"
+            self._write_claude_session(account_a / "local_shared.json", claude_session, root)
+            self._codex_rollout(paths.codex_home, codex_session)
+            state = web.WebState(paths, None, None)
+
+            external_process_error = AssertionError("external app process access is not allowed")
+            with (
+                patch.object(app.subprocess, "run", side_effect=external_process_error),
+                patch.object(app.subprocess, "Popen", side_effect=external_process_error),
+            ):
+                sync_result = app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+                chats = state.quick_chats()
+                codex_chats = app.discover_codex_app_sessions(paths)
+
+            self.assertEqual(sync_result["created"], 1)
+            self.assertTrue(any(chat.session_id == claude_session for chat in chats))
+            self.assertTrue(any(chat.session_id == codex_session for chat in codex_chats))
+            self.assertTrue(any(account_b.glob("*.json")))
+
+    def test_web_chat_cache_refreshes_immediately_when_claude_account_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            state = web.WebState(paths, None, None)
+            old_chat = SimpleNamespace(provider=app.PROVIDER_CLAUDE)
+            new_chat = SimpleNamespace(provider=app.PROVIDER_CLAUDE)
+            state._chats_cache = [old_chat]  # type: ignore[list-item]
+            state._chats_cache_at = time.monotonic()
+
+            with (
+                patch.object(app, "claude_desktop_change_signature", return_value=("new-account",)),
+                patch.object(state, "quick_chats", return_value=[new_chat]),  # type: ignore[list-item]
+                patch.object(state, "refresh_chats_background") as refresh,
+            ):
+                chats = state.chats()
+
+            self.assertEqual(chats, [new_chat])
+            refresh.assert_called_once()
 
     def test_account_identity_is_stable_when_email_claim_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1091,7 +1271,7 @@ class AccountSyncTests(unittest.TestCase):
             self.assertTrue(started["running"])
             self.assertFalse(stopped["running"])
 
-    def test_web_account_sync_monitor_alternates_full_and_fast_cycles(self) -> None:
+    def test_web_account_sync_monitor_starts_fast_before_full_scan_interval(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = self._paths(Path(tmp))
             state = web.WebState(paths, None, None)
@@ -1109,7 +1289,7 @@ class AccountSyncTests(unittest.TestCase):
                 self.assertTrue(observed.wait(timeout=3))
                 state.stop_account_sync_monitor()
 
-            self.assertEqual(scans[:2], [True, False])
+            self.assertEqual(scans[:2], [False, False])
 
     def test_web_account_sync_monitor_wakes_when_desktop_sessions_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

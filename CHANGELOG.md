@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.4 - 2026-07-17
+
+- Synchronized Claude Cowork artifact manifests across accounts, remapped their session links and preserved account-local connector/share state.
+- Added two-scan artifact deletion tombstones so changing account cannot resurrect a removed artifact.
+- Detected Claude logout/login directly from session-bridge logs before the first activity updates the app config.
+- Made startup and account-switch chat loading non-blocking, with Claude metadata first and full Claude/Codex discovery in the background.
+- Retried transient Windows sharing violations during atomic state-file replacement.
 - Added the latest real user-message preview to every Claude and Codex chat row.
 - Made the complete Windows launch chain consoleless, including Desktop/Startup shortcuts and periodic WSL-to-Windows CLI checks.
 - Replaced Claude Desktop auto-continue messages with the native `Try again` action on the exact local Code session.
