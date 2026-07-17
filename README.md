@@ -51,7 +51,7 @@ Additional capabilities:
 - newest-real-message sorting across Claude and Codex;
 - persistent FIFO queue with per-prompt priorities;
 - one-minute safety delay after a parsed reset time;
-- multi-account Claude Code and artifact synchronization with archive and delete propagation;
+- multi-account Claude Code, Cowork artifact and private Claude Code artifact synchronization with archive and delete propagation;
 - Codex task forks for the active ChatGPT-authenticated account, with linked lifecycle sync;
 - account mismatch and view-only checks before actions are enabled;
 - transcript confirmation after every Codex send;
@@ -78,6 +78,20 @@ share IDs and other account-local fields are not copied. Artifact deletion uses
 the same two-scan confirmation rule; the physical `Artifacts/<id>/index.html`
 file remains provider-owned and is never deleted by this project.
 
+Claude Code web artifacts use a different, account-private service. The sync
+monitor verifies locally cached OAuth credentials against `/api/oauth/profile`,
+caches the rendered artifact locally, creates one private server copy per
+account and points an account-specific derived transcript at that copy. The
+original provider transcript is never edited. If an account is logged out or
+its token is not currently cached, the UI reports that copy as waiting and
+finishes it automatically after the next login; a token belonging to another
+account is never substituted.
+
+When the monitor runs in WSL, private artifact replication uses hidden
+PowerShell 7 (`pwsh.exe`) to decrypt Claude Desktop's Chromium AES-GCM cache
+under the current Windows user. Without PowerShell 7, chat and lifecycle sync
+continue normally while private artifact copies remain pending.
+
 The chat list keeps one row per logical Claude session and shows every account
 that currently owns a replica. Account identifiers are searchable, so switching
 accounts never makes the previous account's sessions appear to vanish. Each row
@@ -91,13 +105,21 @@ operations use the official `codex archive`, `codex unarchive` and
 `codex delete --force` commands; the project never edits Codex SQLite or rollout
 files directly.
 
-The local web process runs a fast linked-account check on a ten-second cadence
-and a full Claude transcript discovery every minute. Startup and account changes
-use the fast metadata path first; Claude chats appear immediately while the full
-Claude/Codex list is refreshed in the background. Slow transcript discovery does
-not add another fixed delay before the next metadata check, so lifecycle
-synchronization does not depend on an open or foreground browser tab. The
-Windows Startup entry keeps the program running after login.
+The local web process runs a complete transcript and artifact scan on startup,
+then a fast linked-account check on a ten-second cadence and another full scan
+every minute. Account and session-directory changes wake it immediately, so
+clicking **Aggiorna** is not required. Verified OAuth sessions are retained only
+in process memory between fast checks; any credential-file change invalidates
+that cache immediately.
+Discovery, chat lifecycle replication and local artifact caching continue while
+Claude Desktop, Codex and VS Code are closed. A due Claude Desktop native
+`Try again` action opens the selected Claude session through its registered
+`claude://` link because that final UI action necessarily needs Claude Desktop.
+The browser API uses the fast metadata path first; Claude chats appear while the
+full Claude/Codex list is refreshed in the background. Slow transcript discovery
+does not add another fixed delay before the next metadata check, so lifecycle
+synchronization does not depend on an open or foreground browser tab. The Windows
+Startup entry keeps the program running after login.
 
 Filesystem discovery, account synchronization and queue persistence do not
 require Claude, Codex or VS Code to be open. Sending still requires the matching
@@ -264,7 +286,7 @@ reproducible defects belong in
 
 ## Project status
 
-Current release: **v0.2.4**. The project is alpha software tested on Windows/WSL
+Current release: **v0.2.5**. The project is alpha software tested on Windows/WSL
 with local Claude Code and Codex App workflows. Upstream desktop metadata is not
 a public compatibility contract and may change between provider releases.
 

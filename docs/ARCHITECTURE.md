@@ -46,6 +46,12 @@ never deletes the underlying `.claude/projects` transcript. Every overwritten
 or removed Claude metadata file is backed up under
 `account-transfer-backups/`.
 
+The journal key canonicalizes the Claude data root to the same identity on
+Windows and WSL. Version 4 merges legacy platform-specific entries and ignores
+unrelated stale roots. A missing old workspace slot is not a delete when the
+same account already has that logical session in a new organization/workspace;
+a real account-side deletion still requires two scans and propagates normally.
+
 The same journal tracks Cowork artifacts by ID. The physical artifact directory
 is shared local data, while each Claude account/organization owns an
 `artifacts.json` manifest. Replication remaps `createdBySessionId` and
@@ -53,9 +59,30 @@ is shared local data, while each Claude account/organization owns an
 destination-local connector grants and strips source account share IDs. Missing
 manifest entries require two complete scans before a tombstone is committed.
 
-Claude account identity comes from the latest session-bridge account-change log
-event, falling back to `config.json` only when no event exists. This makes a new
-login visible before the first conversation activity updates the config file.
+Claude Code `frame-link` artifacts are separate from Cowork manifests and are
+private to their owning account. The synchronizer extracts their source from the
+local file or historical `Write` tool call, stores a rendered cache under the
+application state directory and creates a private frame for each authenticated
+account. Account-specific transcript replicas contain remapped frame URLs and
+session IDs; `code_artifact_aliases` maps them back to one logical chat so
+lifecycle propagation and the UI do not duplicate the conversation. Original
+Claude JSONL transcripts remain provider-owned and unchanged.
+
+On Windows, Claude Desktop OAuth cache values are decrypted with the current
+user's DPAPI-protected Chromium key by a consoleless PowerShell 7 child. WSL
+launches the same `pwsh.exe` after converting the Desktop root to a Windows
+path; no secret crosses through `WSLENV`. Tokens exist only in process memory,
+are resolved through `/api/oauth/profile`, and are never written to the journal
+or logs. Verified sessions are reused only in memory between fast scans and
+invalidated by credential-file changes. Frame-list network calls run on full
+scans; an account with no matching credential is recorded as pending rather
+than attempted with a different account's token.
+
+Claude account identity comes from the latest session-bridge account-change,
+session-path or skills-plugin log evidence, falling back to `config.json` only
+when no event exists. This makes a new login visible before the first
+conversation activity updates the config file and prevents an old logout line
+from hiding a later active session.
 
 Codex uses one local store per Windows profile, so account copies must have
 different thread IDs. The transfer action calls app-server `thread/fork` while
@@ -66,8 +93,10 @@ links and delegates to the stable Codex CLI commands. SQLite,
 
 The web process owns a ten-second account lifecycle monitor. It invokes both
 provider synchronizers independently of browser polling and invalidates the
-chat cache whenever a replica changes. The first cycle uses only provider
-metadata; full transcript discovery runs in the background on its own cadence.
+chat cache whenever a replica changes. Its first cycle is a complete transcript
+and artifact scan; subsequent fast metadata checks run between minute scans.
+Unchanged session JSON and parsed account logs are reused in process memory;
+file timestamps, sizes and credential signatures invalidate those caches.
 Discovery and lifecycle replication are filesystem operations and do not depend
 on Claude, Codex or VS Code processes being open.
 

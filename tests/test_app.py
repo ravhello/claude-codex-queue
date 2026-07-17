@@ -10,12 +10,37 @@ from pathlib import Path
 from unittest.mock import patch
 
 import claude_codex_queue
-from claude_vscode_queue import app
+from claude_vscode_queue import app, web
 
 
 class QueueAppTests(unittest.TestCase):
+    def test_chat_payload_uses_last_prompt_as_preview_fallback(self) -> None:
+        chat = app.Chat(
+            session_id="11111111-1111-4111-8111-111111111111",
+            title="Latest chat",
+            cwd="C:\\work",
+            permission_mode="default",
+            model="opus",
+            jsonl_path=Path("session.json"),
+            last_timestamp="2026-07-17T22:47:20+02:00",
+            message_count=2,
+            last_prompt="continue the interrupted work",
+        )
+
+        payload = web.chat_to_dict(chat)
+
+        self.assertEqual(payload["last_user_message"], "continue the interrupted work")
+        self.assertTrue(payload["last_user_message_loaded"])
+
+    def test_web_refresh_renders_chats_without_waiting_for_doctor(self) -> None:
+        self.assertIn("async function refreshDoctor()", web.HTML)
+        self.assertIn("void refreshDoctor();", web.HTML)
+        self.assertIn('const chatsTask = api("/api/chats").then', web.HTML)
+        self.assertIn("Promise.allSettled([queueTask, chatsTask])", web.HTML)
+        self.assertNotIn("Promise.allSettled([doctorTask, chatsTask])", web.HTML)
+
     def test_public_version_and_legacy_state_compatibility(self) -> None:
-        self.assertEqual(claude_codex_queue.__version__, "0.2.4")
+        self.assertEqual(claude_codex_queue.__version__, "0.2.5")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             legacy = root / app.LEGACY_APP_DIR_NAME
@@ -81,14 +106,29 @@ class QueueAppTests(unittest.TestCase):
                         "cwd": str(root),
                         "message": {"content": "working"},
                     }
-                ),
+                )
+                + "\n",
                 encoding="utf-8",
             )
             paths = app.Paths(root, claude_home, root / ".state", root / ".state" / "queue.json", root / ".state" / "logs")
             chat = app.discover_chats(claude_home)[0]
             marker = root / "was-called"
-            fake = root / "fake-claude"
-            fake.write_text(f"#!/bin/sh\ntouch {marker}\n", encoding="utf-8")
+            fake = root / "fake_claude.py"
+            fake.write_text(
+                "#!/usr/bin/env python3\n"
+                "import json, sys\n"
+                "from datetime import datetime, timezone\n"
+                "from pathlib import Path\n"
+                f"transcript = Path({str(transcript)!r})\n"
+                f"session = {session!r}\n"
+                f"cwd = {str(root)!r}\n"
+                "prompt = sys.stdin.read()\n"
+                "row = {'type': 'user', 'sessionId': session, 'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'), 'cwd': cwd, 'message': {'role': 'user', 'content': prompt}}\n"
+                "with transcript.open('a', encoding='utf-8') as handle:\n"
+                "    handle.write(json.dumps(row) + '\\n')\n"
+                f"Path({str(marker)!r}).touch()\n",
+                encoding="utf-8",
+            )
             fake.chmod(fake.stat().st_mode | 0o111)
             app.save_queue(
                 paths.queue_file,
@@ -1076,6 +1116,72 @@ class QueueAppTests(unittest.TestCase):
             self.assertIsNotNone(account.key)
             self.assertIsNotNone(account.email_hash)
 
+    def test_active_claude_account_does_not_mix_a_new_profile_with_an_old_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            claude_home = root / ".claude"
+            claude_home.mkdir(parents=True)
+            (root / ".claude.json").write_text(
+                json.dumps(
+                    {
+                        "oauthAccount": {
+                            "accountUuid": "new-account",
+                            "emailAddress": "new@example.com",
+                            "organizationUuid": "new-org",
+                        }
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            (claude_home / ".credentials.json").write_text(
+                json.dumps(
+                    {
+                        "organizationUuid": "old-org",
+                        "claudeAiOauth": {
+                            "accessToken": "old-token",
+                            "refreshToken": "old-refresh",
+                        },
+                    }
+                ),
+                encoding="utf-8",
+            )
+            paths = app.Paths(
+                windows_home=root,
+                claude_home=claude_home,
+                state_dir=root / ".state",
+                queue_file=root / ".state" / "queue.json",
+                log_dir=root / ".state" / "logs",
+            )
+            app_root = root / "AppData" / "Local" / "Claude"
+            app_root.mkdir(parents=True)
+            (app_root / "config.json").write_text("{}", encoding="utf-8")
+            app.save_desktop_sync_state(
+                paths,
+                {
+                    "version": app.DESKTOP_SYNC_STATE_VERSION,
+                    "roots": {
+                        app.desktop_sync_root_key(app_root): {
+                            "sessions": {},
+                            "oauth_account_profiles": {
+                                "old-account": {
+                                    "account_uuid": "old-account",
+                                    "organization_uuid": "old-org",
+                                    "email": "old@example.com",
+                                }
+                            },
+                        }
+                    },
+                },
+            )
+
+            account = app.active_claude_account(paths)
+
+            self.assertIsNotNone(account)
+            self.assertEqual(account.label, "ol***@example.com")
+            self.assertEqual(account.account_uuid_hash, app.short_hash("old-account"))
+            self.assertNotEqual(account.account_uuid_hash, app.short_hash("new-account"))
+
     def test_known_other_account_chat_is_visible_but_not_queueable_until_account_switches_back(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1844,7 +1950,10 @@ class QueueAppTests(unittest.TestCase):
             self.assertEqual(result["status"], "copied")
             copied = Path(result["destination"])
             self.assertTrue(copied.exists())
-            self.assertTrue(str(copied).endswith("claude-code-sessions/active-account/workspace/local_source.json"))
+            self.assertEqual(
+                copied,
+                app_root / "claude-code-sessions" / active_account / workspace / "local_source.json",
+            )
             data = json.loads(copied.read_text(encoding="utf-8"))
             self.assertEqual(data["cliSessionId"], session)
             self.assertFalse(data["isArchived"])
@@ -2459,6 +2568,14 @@ class QueueAppTests(unittest.TestCase):
                 "    import sys\n"
                 "    print('Claude AI usage limit reached. Try again 2026-01-01T00:00:00Z.', file=sys.stderr)\n"
                 "    raise SystemExit(1)\n"
+                "import json\n"
+                "from datetime import datetime, timezone\n"
+                f"transcript = Path({str(transcript)!r})\n"
+                f"session = {session!r}\n"
+                f"cwd = {str(root)!r}\n"
+                "row = {'type': 'user', 'sessionId': session, 'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'), 'cwd': cwd, 'message': {'role': 'user', 'content': prompt}}\n"
+                "with transcript.open('a', encoding='utf-8') as handle:\n"
+                "    handle.write(json.dumps(row) + '\\n')\n"
                 "print('ok')\n",
                 encoding="utf-8",
             )
@@ -2598,10 +2715,10 @@ class QueueAppTests(unittest.TestCase):
                 "prompt = sys.stdin.read()\n"
                 "with prompts.open('a', encoding='utf-8') as handle:\n"
                 "    handle.write(prompt + '\\n---\\n')\n"
+                "row = {'type': 'user', 'sessionId': session, 'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'), 'cwd': cwd, 'message': {'role': 'user', 'content': prompt}}\n"
+                "with transcript.open('a', encoding='utf-8') as handle:\n"
+                "    handle.write(json.dumps(row) + '\\n')\n"
                 "if count == 0:\n"
-                "    row = {'type': 'user', 'sessionId': session, 'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'), 'cwd': cwd, 'message': {'role': 'user', 'content': prompt}}\n"
-                "    with transcript.open('a', encoding='utf-8') as handle:\n"
-                "        handle.write(json.dumps(row) + '\\n')\n"
                 "    print('Claude AI usage limit reached. Try again 2026-01-01T00:00:00Z.', file=sys.stderr)\n"
                 "    raise SystemExit(1)\n"
                 "print('ok')\n",
@@ -2739,6 +2856,14 @@ class QueueAppTests(unittest.TestCase):
                 "if count == 0:\n"
                 "    print('Claude AI usage limit reached. Try again 2026-01-01T00:00:00Z.', file=sys.stderr)\n"
                 "    raise SystemExit(1)\n"
+                "import json\n"
+                "from datetime import datetime, timezone\n"
+                f"transcript = Path({str(transcript)!r})\n"
+                f"session = {session!r}\n"
+                f"cwd = {str(root)!r}\n"
+                "row = {'type': 'user', 'sessionId': session, 'timestamp': datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z'), 'cwd': cwd, 'message': {'role': 'user', 'content': prompt}}\n"
+                "with transcript.open('a', encoding='utf-8') as handle:\n"
+                "    handle.write(json.dumps(row) + '\\n')\n"
                 "print('ok')\n",
                 encoding="utf-8",
             )

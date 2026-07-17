@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import base64
+import copy
 import contextlib
 import dataclasses
 import datetime as dt
@@ -22,7 +23,9 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlparse
+from urllib import error as urllib_error
+from urllib import request as urllib_request
+from urllib.parse import quote, unquote, urlparse
 
 
 APP_DIR_NAME = ".claude-codex-queue"
@@ -94,13 +97,36 @@ VALID_PERMISSION_MODES = {
 DESKTOP_STATE_ACTIVE = "active"
 DESKTOP_STATE_ARCHIVED = "archived"
 DESKTOP_STATE_DELETED = "deleted"
-DESKTOP_SYNC_STATE_VERSION = 2
+DESKTOP_SYNC_STATE_VERSION = 4
 DESKTOP_ACCOUNT_LOG_TAIL_BYTES = 4 * 1024 * 1024
 DESKTOP_ACCOUNT_EVENT_PATTERN = re.compile(
     r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}).*?"
     r"\[sessions-bridge\] account-change reevaluate: .*?(?:→|->)\s*"
     r"(?:(?P<organization>[0-9a-fA-F-]{36}):(?P<account>[0-9a-fA-F-]{36})|(?P<none><none>))"
 )
+DESKTOP_LOG_TIMESTAMP_PATTERN = re.compile(r"^(?P<timestamp>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})")
+DESKTOP_ACCOUNT_RUNTIME_PATTERNS = (
+    re.compile(
+        r"claude-code-sessions[\\/]+(?P<account>[0-9a-fA-F-]{36})"
+        r"[\\/]+(?P<organization>[0-9a-fA-F-]{36})",
+        re.IGNORECASE,
+    ),
+    re.compile(
+        r"local-agent-mode-sessions[\\/]+skills-plugin[\\/]+"
+        r"(?P<organization>[0-9a-fA-F-]{36})[\\/]+(?P<account>[0-9a-fA-F-]{36})",
+        re.IGNORECASE,
+    ),
+)
+CLAUDE_ARTIFACT_URL_PATTERN = re.compile(
+    r"https://claude\.ai/code/artifact/(?P<slug>[A-Za-z0-9_-]{16,64})"
+)
+CLAUDE_FRAME_API_ORIGIN = "https://api.anthropic.com"
+CLAUDE_FRAME_STYLE = (
+    "<style>:root{color-scheme:light}body{margin:0;padding:0;"
+    "font:14px -apple-system,BlinkMacSystemFont,sans-serif;"
+    "background:#faf9f5;color:#141413}img{max-width:100%}</style>"
+)
+CLAUDE_FRAME_MAX_BYTES = 16 * 1024 * 1024
 DESKTOP_ARTIFACT_LOCAL_ONLY_FIELDS = {
     "autoPublish",
     "importedAt",
@@ -110,8 +136,24 @@ DESKTOP_ARTIFACT_LOCAL_ONLY_FIELDS = {
     "sharedAnchorConversationUuid",
     "sharedArtifactUuid",
 }
+CLAUDE_OAUTH_SESSION_CACHE_TTL_SECONDS = 55.0
 _DESKTOP_SYNC_LOCK = threading.RLock()
 _ACCOUNT_INDEX_LOCK = threading.RLock()
+_CLAUDE_OAUTH_SESSION_CACHE_LOCK = threading.RLock()
+_DESKTOP_SESSION_FILE_CACHE_LOCK = threading.RLock()
+_DESKTOP_ACCOUNT_LOG_CACHE_LOCK = threading.RLock()
+_CLAUDE_OAUTH_SESSION_CACHE: dict[
+    str,
+    tuple[tuple[str, ...], float, dict[str, dict[str, str]]],
+] = {}
+_DESKTOP_SESSION_FILE_CACHE: dict[
+    str,
+    tuple[tuple[int, int, int], dict[str, Any]],
+] = {}
+_DESKTOP_ACCOUNT_LOG_CACHE: dict[
+    str,
+    tuple[tuple[str, ...], list[DesktopAccountContext]],
+] = {}
 _STATE_FILE_LOCKS = threading.local()
 ATOMIC_REPLACE_RETRY_DELAYS = (0.02, 0.05, 0.1, 0.2, 0.4, 0.8, 1.0, 1.0)
 
@@ -207,6 +249,14 @@ def atomic_replace_with_retry(source: Path, destination: Path) -> None:
             if delay is None:
                 raise
             time.sleep(delay)
+
+
+def atomic_write_utf8(path: Path, value: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", dir=path.parent, delete=False) as handle:
+        handle.write(value)
+        temp_path = Path(handle.name)
+    atomic_replace_with_retry(temp_path, path)
 
 RATE_LIMIT_PATTERNS = [
     r"\brate[- ]?limit(?:ed)?\b",
@@ -390,6 +440,11 @@ def is_wsl() -> bool:
 
 def windows_to_local_path(value: str | Path) -> Path:
     raw = normalize_windows_path(str(value).strip().strip('"'))
+    wsl_match = re.match(r"^[\\/]+mnt[\\/]([a-zA-Z])[\\/](.*)$", raw)
+    if os.name == "nt" and wsl_match:
+        drive = wsl_match.group(1).upper()
+        rest = wsl_match.group(2).replace("/", "\\")
+        return Path(f"{drive}:\\{rest}")
     match = re.match(r"^([a-zA-Z]):[\\/](.*)$", raw)
     if os.name != "nt" and match:
         drive = match.group(1).lower()
@@ -445,12 +500,42 @@ def chat_cwd_runnable(cwd: str | None) -> bool:
 
 def local_to_windows_path(path: Path) -> str:
     raw = str(path)
-    match = re.match(r"^/mnt/([a-zA-Z])/(.*)$", raw)
+    match = re.match(r"^[\\/]+mnt[\\/]([a-zA-Z])[\\/](.*)$", raw)
     if match:
         drive = match.group(1).upper()
         rest = match.group(2).replace("/", "\\")
         return f"{drive}:\\{rest}"
     return raw
+
+
+def canonical_windows_path(value: str | Path) -> str:
+    return local_to_windows_path(windows_to_local_path(value))
+
+
+def is_python_cli_script(executable: Path) -> bool:
+    if executable.suffix.lower() == ".py":
+        return True
+    if executable.suffix:
+        return False
+    try:
+        with executable.open("rb") as handle:
+            first_line = handle.readline(256).lower()
+    except OSError:
+        return False
+    return first_line.startswith(b"#!") and b"python" in first_line
+
+
+def local_executable_command(executable: Path, arguments: list[str]) -> list[str]:
+    if os.name == "nt" and is_python_cli_script(executable):
+        return [sys.executable, str(executable), *arguments]
+    return [str(executable), *arguments]
+
+
+def windows_executable_command(executable: Path, arguments: list[str]) -> list[str]:
+    windows_path = local_to_windows_path(executable)
+    if os.name == "nt" and is_python_cli_script(executable):
+        return [sys.executable, windows_path, *arguments]
+    return [windows_path, *arguments]
 
 
 def background_process_kwargs() -> dict[str, int]:
@@ -845,8 +930,15 @@ def claude_desktop_local_session_id(paths: Paths, item: dict[str, Any]) -> str |
         else None
     )
     candidates: list[DesktopSessionRecord] = []
+    sync_state = load_desktop_sync_state(paths)
     for record in desktop_session_records(paths):
-        if desktop_record_cli_session_id(record) != session_id:
+        physical_session_id = desktop_record_cli_session_id(record)
+        logical_session_id = (
+            desktop_logical_session_id(desktop_existing_root_state(sync_state, record.root), physical_session_id)
+            if physical_session_id
+            else None
+        )
+        if logical_session_id != session_id:
             continue
         app_session_id = record.data.get("sessionId")
         if not isinstance(app_session_id, str) or not app_session_id:
@@ -1009,7 +1101,9 @@ def find_codex_executable(paths: Paths, override: str | None = None) -> Path | N
 
 
 def codex_executable_is_windows(codex_exe: Path) -> bool:
-    return codex_exe.suffix.lower() in {".cmd", ".bat", ".exe"} or is_windows_path(str(codex_exe))
+    if is_python_cli_script(codex_exe):
+        return False
+    return codex_exe.suffix.lower() in {".cmd", ".bat", ".exe"} or (is_wsl() and is_windows_path(str(codex_exe)))
 
 
 def codex_cli_command(codex_exe: Path, arguments: list[str]) -> list[str]:
@@ -1129,13 +1223,31 @@ def active_claude_account(paths: Paths) -> AccountInfo | None:
     oauth_account = global_config.get("oauthAccount") if isinstance(global_config.get("oauthAccount"), dict) else {}
     claude_oauth = credentials.get("claudeAiOauth") if isinstance(credentials.get("claudeAiOauth"), dict) else {}
 
-    account_uuid = oauth_account.get("accountUuid") if isinstance(oauth_account.get("accountUuid"), str) else None
-    email = oauth_account.get("emailAddress") if isinstance(oauth_account.get("emailAddress"), str) else None
-    organization_uuid = (
+    configured_account_uuid = (
+        oauth_account.get("accountUuid") if isinstance(oauth_account.get("accountUuid"), str) else None
+    )
+    configured_email = (
+        oauth_account.get("emailAddress") if isinstance(oauth_account.get("emailAddress"), str) else None
+    )
+    configured_organization_uuid = (
         oauth_account.get("organizationUuid")
         if isinstance(oauth_account.get("organizationUuid"), str)
-        else credentials.get("organizationUuid") if isinstance(credentials.get("organizationUuid"), str) else None
+        else None
     )
+    credential_organization_uuid = (
+        credentials.get("organizationUuid") if isinstance(credentials.get("organizationUuid"), str) else None
+    )
+    organization_uuid = credential_organization_uuid or configured_organization_uuid
+    account_uuid = configured_account_uuid
+    email = configured_email
+    if (
+        credential_organization_uuid
+        and configured_organization_uuid
+        and credential_organization_uuid != configured_organization_uuid
+    ):
+        verified = cached_claude_oauth_profile(paths, credential_organization_uuid)
+        account_uuid = verified.get("account_uuid") if verified else None
+        email = verified.get("email") if verified else None
     refresh_token = claude_oauth.get("refreshToken") if isinstance(claude_oauth.get("refreshToken"), str) else None
     access_token = claude_oauth.get("accessToken") if isinstance(claude_oauth.get("accessToken"), str) else None
     if not any([account_uuid, email, organization_uuid, refresh_token, access_token]):
@@ -1374,13 +1486,16 @@ def chat_sort_key(chat: Chat) -> dt.datetime:
         return dt.datetime.min.replace(tzinfo=UTC)
 
 
-def discover_chats(claude_home: Path) -> list[Chat]:
+def discover_chats(claude_home: Path, excluded_session_ids: set[str] | None = None) -> list[Chat]:
     projects = claude_home / "projects"
     if not projects.exists():
         return []
 
     by_session: dict[str, Chat] = {}
+    excluded = excluded_session_ids or set()
     for jsonl_path in projects.glob("**/*.jsonl"):
+        if jsonl_path.stem in excluded:
+            continue
         title: str | None = None
         cwd: str | None = None
         permission_mode: str | None = None
@@ -2330,7 +2445,15 @@ def claude_windows_app_roots(paths: Paths) -> list[Path]:
             paths.windows_home / "AppData" / "Local" / "Claude",
         ]
     )
-    return [path for path in unique_paths(candidates) if path.exists()]
+    return [
+        path
+        for path in unique_paths(candidates)
+        if path.exists()
+        and any(
+            (path / marker).exists()
+            for marker in ("config.json", "claude-code-sessions", "local-agent-mode-sessions", "logs")
+        )
+    ]
 
 
 def file_tail_text(path: Path, max_bytes: int) -> str:
@@ -2357,37 +2480,60 @@ def desktop_account_log_contexts(root: Path) -> list[DesktopAccountContext]:
         log_paths = list((root / "logs").glob("main*.log"))
     except OSError:
         log_paths = []
+    log_stats: dict[Path, os.stat_result] = {}
+    signature: list[str] = []
     for log_path in log_paths:
         try:
-            log_mtime_ns = log_path.stat().st_mtime_ns
+            stat = log_path.stat()
         except OSError:
-            log_mtime_ns = 0
-        for line_number, line in enumerate(
-            file_tail_text(log_path, DESKTOP_ACCOUNT_LOG_TAIL_BYTES).splitlines()
-        ):
+            continue
+        log_stats[log_path] = stat
+        signature.append(f"{str(log_path).casefold()}|{stat.st_mtime_ns}|{stat.st_size}")
+    cache_key = str(root).casefold() if os.name == "nt" or str(root).startswith("/mnt/") else str(root)
+    cache_signature = tuple(sorted(signature))
+    with _DESKTOP_ACCOUNT_LOG_CACHE_LOCK:
+        cached = _DESKTOP_ACCOUNT_LOG_CACHE.get(cache_key)
+        if cached is not None and cached[0] == cache_signature:
+            return list(cached[1])
+    for log_path, stat in log_stats.items():
+        log_mtime_ns = stat.st_mtime_ns
+        for line_number, line in enumerate(file_tail_text(log_path, DESKTOP_ACCOUNT_LOG_TAIL_BYTES).splitlines()):
             match = DESKTOP_ACCOUNT_EVENT_PATTERN.search(line)
-            if match is None:
+            timestamp_match = DESKTOP_LOG_TIMESTAMP_PATTERN.search(line)
+            runtime_match = next(
+                (pattern.search(line) for pattern in DESKTOP_ACCOUNT_RUNTIME_PATTERNS if pattern.search(line)),
+                None,
+            )
+            if match is None and (runtime_match is None or timestamp_match is None):
                 continue
-            changed_at = match.group("timestamp")
+            changed_at = match.group("timestamp") if match is not None else timestamp_match.group("timestamp")
             contexts.append(
                 (
                     changed_at,
                     log_mtime_ns,
                     line_number,
                     DesktopAccountContext(
-                        account_uuid=match.group("account"),
-                        organization_uuid=match.group("organization"),
+                        account_uuid=(match or runtime_match).group("account"),
+                        organization_uuid=(match or runtime_match).group("organization"),
                         changed_at=changed_at,
-                        logged_out=match.group("none") is not None,
+                        logged_out=match is not None and match.group("none") is not None,
                     ),
                 )
             )
     contexts.sort(key=lambda item: (item[0], item[1], item[2]))
-    return [item[3] for item in contexts]
+    result = [item[3] for item in contexts]
+    with _DESKTOP_ACCOUNT_LOG_CACHE_LOCK:
+        if len(_DESKTOP_ACCOUNT_LOG_CACHE) >= 128:
+            _DESKTOP_ACCOUNT_LOG_CACHE.clear()
+        _DESKTOP_ACCOUNT_LOG_CACHE[cache_key] = (cache_signature, list(result))
+    return result
 
 
-def active_desktop_account_context(root: Path) -> DesktopAccountContext:
-    contexts = desktop_account_log_contexts(root)
+def active_desktop_account_context(
+    root: Path,
+    contexts: list[DesktopAccountContext] | None = None,
+) -> DesktopAccountContext:
+    contexts = desktop_account_log_contexts(root) if contexts is None else contexts
     if contexts:
         return contexts[-1]
     value = desktop_config(root).get("lastKnownAccountUuid")
@@ -2442,15 +2588,22 @@ def desktop_config(root: Path) -> dict[str, Any]:
     return load_json_file(root / "config.json")
 
 
-def active_desktop_account_uuid(root: Path) -> str | None:
-    context = active_desktop_account_context(root)
+def active_desktop_account_uuid(
+    root: Path,
+    context: DesktopAccountContext | None = None,
+) -> str | None:
+    context = context or active_desktop_account_context(root)
     return None if context.logged_out else context.account_uuid
 
 
-def active_desktop_workspace_uuid(root: Path, account_uuid: str | None) -> str | None:
+def active_desktop_workspace_uuid(
+    root: Path,
+    account_uuid: str | None,
+    context: DesktopAccountContext | None = None,
+) -> str | None:
     if not account_uuid:
         return None
-    context = active_desktop_account_context(root)
+    context = context or active_desktop_account_context(root)
     if context.account_uuid == account_uuid and context.organization_uuid:
         return context.organization_uuid
     log_path = root / "logs" / "main.log"
@@ -2483,11 +2636,267 @@ def active_desktop_account_key(paths: Paths) -> tuple[str | None, str | None]:
     return None, None
 
 
-def desktop_session_records(paths: Paths, active_only: bool = False) -> list[DesktopSessionRecord]:
-    records: list[DesktopSessionRecord] = []
+def claude_desktop_cached_oauth_tokens(root: Path) -> list[dict[str, Any]]:
+    """Decrypt Claude Desktop's current-user token cache without persisting secrets."""
+
+    if (os.name != "nt" and not is_wsl()) or not (root / "config.json").is_file() or not (root / "Local State").is_file():
+        return []
+    script = r'''
+$ErrorActionPreference = "Stop"
+$ProgressPreference = "SilentlyContinue"
+$InformationPreference = "SilentlyContinue"
+Add-Type -AssemblyName System.Security
+$root = $env:CLAUDE_QUEUE_DESKTOP_ROOT
+$state = Get-Content -LiteralPath (Join-Path $root "Local State") -Raw | ConvertFrom-Json
+$wrapped = [Convert]::FromBase64String([string]$state.os_crypt.encrypted_key)
+if ($wrapped.Length -le 5 -or [Text.Encoding]::ASCII.GetString($wrapped[0..4]) -ne "DPAPI") { throw "unsupported key" }
+$key = [Security.Cryptography.ProtectedData]::Unprotect(
+  $wrapped[5..($wrapped.Length - 1)],
+  $null,
+  [Security.Cryptography.DataProtectionScope]::CurrentUser
+)
+$config = Get-Content -LiteralPath (Join-Path $root "config.json") -Raw | ConvertFrom-Json
+$tokens = @()
+foreach ($cacheName in @("oauth:tokenCacheV2", "oauth:tokenCache")) {
+  $property = $config.PSObject.Properties[$cacheName]
+  if ($null -eq $property -or -not ($property.Value -is [string])) { continue }
+  $blob = [Convert]::FromBase64String($property.Value)
+  if ($blob.Length -le 31 -or [Text.Encoding]::ASCII.GetString($blob[0..2]) -ne "v10") { continue }
+$nonce = [byte[]]$blob[3..14]
+$cipher = [byte[]]$blob[15..($blob.Length - 17)]
+$tag = [byte[]]$blob[($blob.Length - 16)..($blob.Length - 1)]
+  $plain = New-Object byte[] $cipher.Length
+  $aes = [Security.Cryptography.AesGcm]::new($key, 16)
+  try { $aes.Decrypt($nonce, $cipher, $tag, $plain, $null) } finally { $aes.Dispose() }
+  $cache = [Text.Encoding]::UTF8.GetString($plain) | ConvertFrom-Json
+  foreach ($entry in $cache.PSObject.Properties) {
+    $value = $entry.Value
+    if ($value.token -is [string] -and $value.token.Length -gt 0) {
+      $tokens += [pscustomobject]@{
+        token = $value.token
+        expiresAt = $value.expiresAt
+        cacheKey = $entry.Name
+      }
+    }
+  }
+}
+ConvertTo-Json -InputObject @($tokens) -Compress
+'''
+    windows_root = local_to_windows_path(root)
+    script = script.replace(
+        "$root = $env:CLAUDE_QUEUE_DESKTOP_ROOT",
+        f"$root = {powershell_single_quote(windows_root)}",
+    )
+    environment = os.environ.copy()
+    powershell = shutil.which("pwsh.exe") or shutil.which("powershell.exe")
+    if not powershell:
+        return []
+    try:
+        completed = subprocess.run(
+            local_powershell_hidden_command(script, powershell=powershell),
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            timeout=15,
+            check=False,
+            env=environment,
+            **background_process_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError):
+        return []
+    if completed.returncode != 0:
+        return []
+    try:
+        payload = json.loads(completed.stdout.lstrip("\ufeff\r\n "))
+    except json.JSONDecodeError:
+        return []
+    if not isinstance(payload, list):
+        return []
+    return [entry for entry in payload if isinstance(entry, dict) and isinstance(entry.get("token"), str)]
+
+
+def claude_local_oauth_tokens(paths: Paths) -> list[dict[str, Any]]:
+    values: list[dict[str, Any]] = []
+    credentials = load_json_file(paths.claude_home / ".credentials.json")
+    oauth = credentials.get("claudeAiOauth") if isinstance(credentials.get("claudeAiOauth"), dict) else {}
+    token = oauth.get("accessToken")
+    if isinstance(token, str) and token:
+        values.append(
+            {
+                "token": token,
+                "expiresAt": oauth.get("expiresAt"),
+                "cacheKey": f"credentials:{credentials.get('organizationUuid') or ''}",
+            }
+        )
     for root in claude_windows_app_roots(paths):
-        active_account_uuid = active_desktop_account_uuid(root)
-        active_workspace_uuid = active_desktop_workspace_uuid(root, active_account_uuid) if active_only else None
+        values.extend(claude_desktop_cached_oauth_tokens(root))
+    unique: dict[str, dict[str, Any]] = {}
+    for value in values:
+        token_value = value.get("token")
+        if not isinstance(token_value, str) or not token_value:
+            continue
+        digest = hashlib.sha256(token_value.encode("utf-8")).hexdigest()
+        existing = unique.get(digest)
+        if existing is None or "user:file_upload" in str(value.get("cacheKey") or ""):
+            unique[digest] = value
+    return list(unique.values())
+
+
+def claude_api_json(
+    token: str,
+    path: str,
+    *,
+    method: str = "GET",
+    body: dict[str, Any] | None = None,
+    extra_headers: dict[str, str] | None = None,
+    timeout: int = 20,
+) -> dict[str, Any]:
+    payload = None if body is None else json.dumps(body, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "User-Agent": "claude-codex-queue",
+        "Content-Type": "application/json",
+        "Cache-Control": "no-cache",
+        "anthropic-beta": "oauth-2025-04-20",
+        "X-Frame-CP": "go",
+        "X-Frame-Surface": "code",
+        "X-Frame-Platform": "desktop",
+    }
+    headers.update(extra_headers or {})
+    request = urllib_request.Request(
+        f"{CLAUDE_FRAME_API_ORIGIN}{path}",
+        data=payload,
+        headers=headers,
+        method=method,
+    )
+    try:
+        with urllib_request.urlopen(request, timeout=timeout) as response:
+            raw = response.read(CLAUDE_FRAME_MAX_BYTES + 1)
+    except urllib_error.HTTPError as exc:
+        raise RuntimeError(f"Claude API HTTP {exc.code}") from exc
+    except (urllib_error.URLError, TimeoutError, OSError) as exc:
+        raise RuntimeError("Claude API non raggiungibile") from exc
+    if len(raw) > CLAUDE_FRAME_MAX_BYTES:
+        raise RuntimeError("Risposta Claude API troppo grande")
+    if not raw:
+        return {}
+    try:
+        value = json.loads(raw.decode("utf-8"))
+    except (UnicodeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Risposta Claude API non valida") from exc
+    if not isinstance(value, dict):
+        raise RuntimeError("Risposta Claude API inattesa")
+    return value
+
+
+def claude_oauth_profile(token: str) -> dict[str, str]:
+    payload = claude_api_json(token, "/api/oauth/profile", timeout=10)
+    account = payload.get("account") if isinstance(payload.get("account"), dict) else {}
+    organization = payload.get("organization") if isinstance(payload.get("organization"), dict) else {}
+    account_uuid = account.get("uuid")
+    organization_uuid = organization.get("uuid")
+    if not isinstance(account_uuid, str) or not isinstance(organization_uuid, str):
+        raise RuntimeError("Profilo OAuth Claude incompleto")
+    return {
+        "account_uuid": account_uuid,
+        "organization_uuid": organization_uuid,
+        "email": account.get("email") if isinstance(account.get("email"), str) else "",
+    }
+
+
+def claude_oauth_cache_signature(paths: Paths) -> tuple[str, ...]:
+    files = [
+        paths.claude_home / ".credentials.json",
+        paths.windows_home / ".claude.json",
+    ]
+    for root in claude_windows_app_roots(paths):
+        files.extend([root / "config.json", root / "Local State"])
+    signature: list[str] = []
+    for path in unique_paths(files):
+        try:
+            stat = path.stat()
+            signature.append(f"{str(path).casefold()}|{stat.st_mtime_ns}|{stat.st_size}")
+        except OSError:
+            signature.append(f"{str(path).casefold()}|missing")
+    return tuple(sorted(signature))
+
+
+def claude_oauth_sessions(
+    paths: Paths,
+    *,
+    force_refresh: bool = False,
+) -> dict[str, dict[str, str]]:
+    signature = claude_oauth_cache_signature(paths)
+    cache_key = str(paths.state_dir).casefold()
+    now = time.monotonic()
+    with _CLAUDE_OAUTH_SESSION_CACHE_LOCK:
+        cached = _CLAUDE_OAUTH_SESSION_CACHE.get(cache_key)
+        if (
+            not force_refresh
+            and cached is not None
+            and cached[0] == signature
+            and now - cached[1] < CLAUDE_OAUTH_SESSION_CACHE_TTL_SECONDS
+        ):
+            return copy.deepcopy(cached[2])
+
+    sessions: dict[str, dict[str, str]] = {}
+    for entry in claude_local_oauth_tokens(paths):
+        token = entry.get("token")
+        if not isinstance(token, str) or not token:
+            continue
+        expires_at = entry.get("expiresAt")
+        if isinstance(expires_at, (int, float)) and expires_at <= time.time() * 1000 + 60_000:
+            continue
+        try:
+            profile = claude_oauth_profile(token)
+        except RuntimeError:
+            continue
+        candidate = {**profile, "token": token}
+        existing = sessions.get(profile["account_uuid"])
+        if existing is None or "user:file_upload" in str(entry.get("cacheKey") or ""):
+            sessions[profile["account_uuid"]] = candidate
+    with _CLAUDE_OAUTH_SESSION_CACHE_LOCK:
+        _CLAUDE_OAUTH_SESSION_CACHE[cache_key] = (signature, now, copy.deepcopy(sessions))
+    return sessions
+
+
+def cached_desktop_session_json(path: Path, stat: os.stat_result) -> dict[str, Any]:
+    key = str(path).casefold() if os.name == "nt" or str(path).startswith("/mnt/") else str(path)
+    signature = (stat.st_mtime_ns, stat.st_size, stat.st_ctime_ns)
+    with _DESKTOP_SESSION_FILE_CACHE_LOCK:
+        cached = _DESKTOP_SESSION_FILE_CACHE.get(key)
+        if cached is not None and cached[0] == signature:
+            return copy.deepcopy(cached[1])
+    try:
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    with _DESKTOP_SESSION_FILE_CACHE_LOCK:
+        if len(_DESKTOP_SESSION_FILE_CACHE) >= 4096:
+            _DESKTOP_SESSION_FILE_CACHE.clear()
+        _DESKTOP_SESSION_FILE_CACHE[key] = (signature, copy.deepcopy(value))
+    return value
+
+
+def desktop_session_records(
+    paths: Paths,
+    active_only: bool = False,
+    *,
+    roots: list[Path] | None = None,
+    account_contexts: dict[Path, DesktopAccountContext] | None = None,
+) -> list[DesktopSessionRecord]:
+    records: list[DesktopSessionRecord] = []
+    for root in roots if roots is not None else claude_windows_app_roots(paths):
+        context = account_contexts.get(root) if account_contexts is not None else None
+        active_account_uuid = active_desktop_account_uuid(root, context)
+        active_workspace_uuid = (
+            active_desktop_workspace_uuid(root, active_account_uuid, context)
+            if active_only
+            else None
+        )
         sessions_root = root / "claude-code-sessions"
         if not sessions_root.exists():
             continue
@@ -2499,13 +2908,13 @@ def desktop_session_records(paths: Paths, active_only: bool = False) -> list[Des
                 continue
             if active_only and active_workspace_uuid and rel.parts[1] != active_workspace_uuid:
                 continue
-            data = load_json_file(json_path)
+            try:
+                stat = json_path.stat()
+            except OSError:
+                continue
+            data = cached_desktop_session_json(json_path, stat)
             if not data:
                 continue
-            try:
-                mtime_ns = json_path.stat().st_mtime_ns
-            except OSError:
-                mtime_ns = 0
             records.append(
                 DesktopSessionRecord(
                     root=root,
@@ -2514,7 +2923,7 @@ def desktop_session_records(paths: Paths, active_only: bool = False) -> list[Des
                     workspace_uuid=rel.parts[1],
                     path=json_path,
                     data=data,
-                    mtime_ns=mtime_ns,
+                    mtime_ns=stat.st_mtime_ns,
                     active_account_uuid=active_account_uuid,
                 )
             )
@@ -2635,7 +3044,7 @@ def desktop_account_workspace_uuids(
     preferred_workspace_uuid: str | None = None,
 ) -> list[str]:
     account_dir = sessions_root / account_uuid
-    if preferred_workspace_uuid and (account_dir / preferred_workspace_uuid).is_dir():
+    if preferred_workspace_uuid:
         return [preferred_workspace_uuid]
     if account_dir.exists():
         workspaces = [path for path in account_dir.iterdir() if path.is_dir()]
@@ -2700,6 +3109,8 @@ def desktop_artifact_slots(
     records: list[DesktopSessionRecord],
     account_uuids: set[str],
     workspace_uuids_by_account: dict[str, list[str]],
+    account_contexts: list[DesktopAccountContext] | None = None,
+    active_context: DesktopAccountContext | None = None,
 ) -> dict[str, tuple[str, str, Path]]:
     organizations: dict[str, set[str]] = {account_uuid: set() for account_uuid in account_uuids}
     base = root / "local-agent-mode-sessions"
@@ -2715,10 +3126,11 @@ def desktop_artifact_slots(
             )
         except OSError:
             pass
-    for context in desktop_account_log_contexts(root):
+    contexts = desktop_account_log_contexts(root) if account_contexts is None else account_contexts
+    for context in contexts:
         if context.account_uuid and context.organization_uuid:
             organizations.setdefault(context.account_uuid, set()).add(context.organization_uuid)
-    active = active_desktop_account_context(root)
+    active = active_context or active_desktop_account_context(root, contexts)
     if active.account_uuid and active.organization_uuid:
         organizations.setdefault(active.account_uuid, set()).add(active.organization_uuid)
 
@@ -2812,8 +3224,17 @@ def sync_claude_desktop_artifacts(
     state: dict[str, Any],
     root_state: dict[str, Any],
     result: dict[str, Any],
+    account_contexts: list[DesktopAccountContext] | None = None,
+    active_context: DesktopAccountContext | None = None,
 ) -> None:
-    slots = desktop_artifact_slots(root, records, account_uuids, workspace_uuids_by_account)
+    slots = desktop_artifact_slots(
+        root,
+        records,
+        account_uuids,
+        workspace_uuids_by_account,
+        account_contexts,
+        active_context,
+    )
     if not slots:
         return
     manifests: dict[str, dict[str, dict[str, Any]]] = {}
@@ -2943,6 +3364,521 @@ def sync_claude_desktop_artifacts(
         write_desktop_artifact_manifest(manifest_path, entries)
 
 
+def nested_strings(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if isinstance(value, dict):
+        return [text for item in value.values() for text in nested_strings(item)]
+    if isinstance(value, list):
+        return [text for item in value for text in nested_strings(item)]
+    return []
+
+
+def replace_nested_strings(value: Any, replacements: dict[str, str], exact: dict[str, str]) -> Any:
+    if isinstance(value, str):
+        if value in exact:
+            return exact[value]
+        for source, destination in replacements.items():
+            value = value.replace(source, destination)
+        return value
+    if isinstance(value, dict):
+        return {key: replace_nested_strings(item, replacements, exact) for key, item in value.items()}
+    if isinstance(value, list):
+        return [replace_nested_strings(item, replacements, exact) for item in value]
+    return value
+
+
+def claude_artifact_rendered_html(source: str) -> str:
+    return (
+        "<!doctype html><html><head><meta charset=utf8>"
+        '<meta name=viewport content="width=device-width,initial-scale=1">'
+        f"{CLAUDE_FRAME_STYLE}</head><body>\n{source}\n</body></html>"
+    )
+
+
+def claude_written_file_content(transcript_path: Path, source_path: str) -> str | None:
+    markers = ('"name":"Write"', '"name": "Write"')
+    latest = None
+    try:
+        with transcript_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                if not any(marker in line for marker in markers):
+                    continue
+                obj = safe_json_loads(line)
+                if not obj:
+                    continue
+                message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+                blocks = message.get("content") if isinstance(message.get("content"), list) else []
+                for block in blocks:
+                    if not isinstance(block, dict) or block.get("type") != "tool_use" or block.get("name") != "Write":
+                        continue
+                    tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                    if tool_input.get("file_path") == source_path and isinstance(tool_input.get("content"), str):
+                        latest = tool_input["content"]
+    except OSError:
+        return None
+    return latest
+
+
+def discover_claude_code_artifacts(
+    paths: Paths,
+    excluded_session_ids: set[str] | None = None,
+) -> dict[str, dict[str, Any]]:
+    projects = paths.claude_home / "projects"
+    if not projects.exists():
+        return {}
+    excluded = excluded_session_ids or set()
+    discovered: dict[str, dict[str, Any]] = {}
+    for jsonl_path in projects.glob("**/*.jsonl"):
+        default_session_id = jsonl_path.stem
+        if default_session_id in excluded:
+            continue
+        artifact_calls: dict[str, dict[str, Any]] = {}
+        latest_artifact_input: dict[str, Any] = {}
+        session_references: dict[str, dict[str, Any]] = {}
+        session_id = default_session_id
+        try:
+            with jsonl_path.open("r", encoding="utf-8", errors="replace") as handle:
+                for line in handle:
+                    if not any(
+                        marker in line
+                        for marker in (
+                            '"name":"Artifact"',
+                            '"name": "Artifact"',
+                            '"type":"frame-link"',
+                            '"type": "frame-link"',
+                            "claude.ai/code/artifact/",
+                        )
+                    ):
+                        continue
+                    obj = safe_json_loads(line)
+                    if not obj:
+                        continue
+                    if isinstance(obj.get("sessionId"), str):
+                        session_id = obj["sessionId"]
+                    message = obj.get("message") if isinstance(obj.get("message"), dict) else {}
+                    blocks = message.get("content") if isinstance(message.get("content"), list) else []
+                    for block in blocks:
+                        if not isinstance(block, dict):
+                            continue
+                        if block.get("type") == "tool_use" and block.get("name") == "Artifact":
+                            tool_input = block.get("input") if isinstance(block.get("input"), dict) else {}
+                            latest_artifact_input = dict(tool_input)
+                            tool_id = block.get("id")
+                            if isinstance(tool_id, str):
+                                artifact_calls[tool_id] = dict(tool_input)
+                        if block.get("type") == "tool_result":
+                            tool_id = block.get("tool_use_id")
+                            if isinstance(tool_id, str) and tool_id in artifact_calls:
+                                latest_artifact_input = artifact_calls[tool_id]
+
+                    urls: list[tuple[str, str]] = []
+                    if obj.get("type") == "frame-link" and isinstance(obj.get("frameUrl"), str):
+                        match = CLAUDE_ARTIFACT_URL_PATTERN.search(obj["frameUrl"])
+                        if match:
+                            urls.append((match.group("slug"), match.group(0)))
+                    for text_value in nested_strings(obj):
+                        for match in CLAUDE_ARTIFACT_URL_PATTERN.finditer(text_value):
+                            pair = (match.group("slug"), match.group(0))
+                            if pair not in urls:
+                                urls.append(pair)
+                    for slug, frame_url in urls:
+                        reference = session_references.setdefault(
+                            slug,
+                            {
+                                "session_id": session_id,
+                                "transcript_path": canonical_windows_path(jsonl_path),
+                                "frame_url": frame_url,
+                            },
+                        )
+                        if obj.get("type") == "frame-link":
+                            for key in ("title", "timestamp", "path"):
+                                if isinstance(obj.get(key), str):
+                                    reference[key] = obj[key]
+                            reference["has_frame_link"] = True
+                        for key in ("file_path", "description", "favicon", "label", "title"):
+                            value = latest_artifact_input.get(key)
+                            if isinstance(value, str) and value:
+                                reference.setdefault(key, value)
+        except OSError:
+            continue
+
+        if session_id in excluded:
+            continue
+        for slug, reference in session_references.items():
+            reference["session_id"] = session_id
+            source_path_value = reference.get("file_path") or reference.get("path")
+            source_text = None
+            if isinstance(source_path_value, str):
+                source_path = windows_to_local_path(source_path_value)
+                try:
+                    if source_path.is_file() and source_path.stat().st_size <= CLAUDE_FRAME_MAX_BYTES:
+                        source_text = source_path.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    source_text = None
+                if source_text is None:
+                    source_text = claude_written_file_content(jsonl_path, source_path_value)
+            entry = discovered.setdefault(
+                slug,
+                {
+                    "slug": slug,
+                    "frame_url": f"https://claude.ai/code/artifact/{slug}",
+                    "references": {},
+                },
+            )
+            entry["references"][session_id] = reference
+            for key in ("title", "description", "favicon", "label", "file_path"):
+                value = reference.get(key)
+                if isinstance(value, str) and value and not entry.get(key):
+                    entry[key] = value
+            if isinstance(source_text, str) and source_text and not entry.get("source_text"):
+                entry["source_text"] = source_text
+    return discovered
+
+
+def claude_frame_rows(token: str) -> list[dict[str, Any]]:
+    payload = claude_api_json(token, "/api/frame/frames?limit=200")
+    rows = payload.get("frames")
+    return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+def claude_frame_boot(token: str, slug: str, organization_uuid: str) -> dict[str, Any]:
+    return claude_api_json(token, f"/api/frame/{quote(slug)}?org={quote(organization_uuid)}")
+
+
+def deploy_claude_frame_copy(
+    token: str,
+    artifact: dict[str, Any],
+    content: str,
+    *,
+    slug: str | None = None,
+    base_version: str | None = None,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "title": artifact.get("title") or "Claude artifact",
+        "favicon": artifact.get("favicon") or "📄",
+        "content": content,
+        "entrypoint": "claude-desktop",
+    }
+    for key in ("label", "description"):
+        if isinstance(artifact.get(key), str) and artifact[key]:
+            body[key] = artifact[key]
+    if slug:
+        body["slug"] = slug
+    if base_version:
+        body["baseVersion"] = base_version
+    return claude_api_json(token, "/api/frame/deploy/direct", method="POST", body=body, timeout=60)
+
+
+def code_artifact_aliases(root_state: dict[str, Any]) -> dict[str, dict[str, str]]:
+    aliases = root_state.setdefault("code_artifact_aliases", {})
+    if not isinstance(aliases, dict):
+        aliases = {}
+        root_state["code_artifact_aliases"] = aliases
+    return aliases
+
+
+def desktop_logical_session_id(root_state: dict[str, Any], session_id: str) -> str:
+    alias = code_artifact_aliases(root_state).get(session_id)
+    if isinstance(alias, dict) and isinstance(alias.get("logical_session_id"), str):
+        return alias["logical_session_id"]
+    return session_id
+
+
+def desktop_account_session_id(root_state: dict[str, Any], session_id: str, account_uuid: str) -> str:
+    replicas = root_state.get("code_artifact_session_replicas")
+    by_account = replicas.get(session_id) if isinstance(replicas, dict) else None
+    value = by_account.get(account_uuid) if isinstance(by_account, dict) else None
+    return value if isinstance(value, str) and value else session_id
+
+
+def write_claude_artifact_transcript_replica(
+    source_path: Path,
+    destination: Path,
+    logical_session_id: str,
+    replica_session_id: str,
+    replacements: dict[str, str],
+    missing_links: list[dict[str, Any]],
+) -> bool:
+    output: list[str] = []
+    latest_source_timestamp: str | None = None
+    try:
+        with source_path.open("r", encoding="utf-8", errors="replace") as handle:
+            for line in handle:
+                obj = safe_json_loads(line)
+                if obj is None:
+                    continue
+                if isinstance(obj.get("timestamp"), str):
+                    latest_source_timestamp = obj["timestamp"]
+                transformed = replace_nested_strings(
+                    obj,
+                    replacements,
+                    {logical_session_id: replica_session_id},
+                )
+                output.append(json.dumps(transformed, ensure_ascii=False, separators=(",", ":")))
+    except OSError:
+        return False
+    for link in missing_links:
+        output.append(
+            json.dumps(
+                {
+                    "type": "frame-link",
+                    "sessionId": replica_session_id,
+                    "path": canonical_windows_path(link["path"])
+                    if isinstance(link.get("path"), str) and link["path"]
+                    else "",
+                    "frameUrl": link["frame_url"],
+                    "title": link.get("title") or "Claude artifact",
+                    "timestamp": link.get("timestamp") or latest_source_timestamp or "1970-01-01T00:00:00Z",
+                },
+                ensure_ascii=False,
+                separators=(",", ":"),
+            )
+        )
+    payload = "\n".join(output) + "\n"
+    try:
+        if destination.is_file() and destination.read_text(encoding="utf-8", errors="replace") == payload:
+            return False
+    except OSError:
+        pass
+    atomic_write_utf8(destination, payload)
+    return True
+
+
+def sync_claude_code_artifacts(
+    paths: Paths,
+    root: Path,
+    account_uuids: set[str],
+    root_state: dict[str, Any],
+    result: dict[str, Any],
+    *,
+    scan_transcripts: bool,
+) -> None:
+    artifact_state = root_state.setdefault("code_artifacts", {})
+    if not isinstance(artifact_state, dict):
+        artifact_state = {}
+        root_state["code_artifacts"] = artifact_state
+    aliases = code_artifact_aliases(root_state)
+    discovered = (
+        discover_claude_code_artifacts(paths, set(aliases))
+        if scan_transcripts
+        else {}
+    )
+    cache_root = paths.state_dir / "claude-code-artifacts"
+    for slug, item in discovered.items():
+        state_entry = artifact_state.get(slug) if isinstance(artifact_state.get(slug), dict) else {}
+        references = item.get("references") if isinstance(item.get("references"), dict) else {}
+        state_entry.update(
+            {
+                "slug": slug,
+                "frame_url": item["frame_url"],
+                "title": item.get("title") or state_entry.get("title") or "Claude artifact",
+                "description": item.get("description") or state_entry.get("description"),
+                "favicon": item.get("favicon") or state_entry.get("favicon") or "📄",
+                "label": item.get("label") or state_entry.get("label"),
+                "references": references,
+                "last_scanned_at": now_utc(),
+            }
+        )
+        source_text = item.get("source_text")
+        cache_path = cache_root / slug / "index.html"
+        if isinstance(source_text, str) and source_text:
+            rendered = claude_artifact_rendered_html(source_text)
+            if len(rendered.encode("utf-8")) <= CLAUDE_FRAME_MAX_BYTES:
+                atomic_write_utf8(cache_path, rendered)
+                state_entry["content_sha256"] = hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+                state_entry["cache_path"] = canonical_windows_path(cache_path)
+        state_entry.setdefault("accounts", {})
+        artifact_state[slug] = state_entry
+
+    if not artifact_state:
+        return
+    result["code_artifacts"] += len(artifact_state)
+    sessions = claude_oauth_sessions(paths, force_refresh=scan_transcripts)
+    profiles = root_state.setdefault("oauth_account_profiles", {})
+    if not isinstance(profiles, dict):
+        profiles = {}
+        root_state["oauth_account_profiles"] = profiles
+    for account_uuid, session in sessions.items():
+        profiles[account_uuid] = {
+            "account_uuid": account_uuid,
+            "organization_uuid": session.get("organization_uuid"),
+            "email": session.get("email") or "",
+            "last_seen_at": now_utc(),
+        }
+    frame_rows_by_account: dict[str, list[dict[str, Any]]] = {}
+    if scan_transcripts:
+        for account_uuid, session in sessions.items():
+            try:
+                frame_rows_by_account[account_uuid] = claude_frame_rows(session["token"])
+            except RuntimeError as exc:
+                result["code_artifact_errors"].append(f"{account_uuid[:8]}: {exc}")
+                frame_rows_by_account[account_uuid] = []
+
+    for slug, state_entry in artifact_state.items():
+        if not isinstance(state_entry, dict):
+            continue
+        accounts = state_entry.setdefault("accounts", {})
+        if not isinstance(accounts, dict):
+            accounts = {}
+            state_entry["accounts"] = accounts
+        owner_account = state_entry.get("owner_account")
+        for account_uuid, rows in frame_rows_by_account.items():
+            row = next((row for row in rows if row.get("slug") == slug), None)
+            row_owner = row.get("owner_account") if isinstance(row, dict) else None
+            if isinstance(row_owner, str) and row_owner:
+                owner_account = row_owner
+                state_entry["owner_account"] = row_owner
+            if row is not None and row.get("rel") == "mine" and row_owner == account_uuid:
+                accounts[account_uuid] = {
+                    "slug": slug,
+                    "organization_uuid": sessions[account_uuid]["organization_uuid"],
+                    "content_sha256": state_entry.get("content_sha256"),
+                    "updated_at": now_utc(),
+                }
+        if not isinstance(owner_account, str) or not owner_account:
+            result["code_artifact_pending_accounts"] += len(account_uuids)
+            continue
+        content_path_value = state_entry.get("cache_path")
+        content_path = windows_to_local_path(content_path_value) if isinstance(content_path_value, str) else None
+        try:
+            content = content_path.read_text(encoding="utf-8") if content_path and content_path.is_file() else None
+        except OSError:
+            content = None
+        for account_uuid in sorted(account_uuids):
+            mapping = accounts.get(account_uuid) if isinstance(accounts.get(account_uuid), dict) else None
+            if account_uuid == owner_account:
+                continue
+            oauth = sessions.get(account_uuid)
+            if oauth is None or content is None:
+                if mapping is None:
+                    result["code_artifact_pending_accounts"] += 1
+                continue
+            digest = state_entry.get("content_sha256")
+            if mapping is not None and mapping.get("content_sha256") == digest:
+                continue
+            mapped_slug = mapping.get("slug") if mapping is not None else None
+            base_version = None
+            if isinstance(mapped_slug, str) and mapped_slug:
+                try:
+                    boot = claude_frame_boot(oauth["token"], mapped_slug, oauth["organization_uuid"])
+                    base_version = boot.get("live") if isinstance(boot.get("live"), str) else None
+                except RuntimeError:
+                    mapped_slug = None
+            try:
+                deployed = deploy_claude_frame_copy(
+                    oauth["token"],
+                    state_entry,
+                    content,
+                    slug=mapped_slug if isinstance(mapped_slug, str) else None,
+                    base_version=base_version,
+                )
+            except RuntimeError as exc:
+                result["code_artifact_errors"].append(f"{account_uuid[:8]}: {exc}")
+                result["code_artifact_pending_accounts"] += 1
+                continue
+            deployed_slug = deployed.get("slug")
+            if not isinstance(deployed_slug, str) or not deployed_slug:
+                result["code_artifact_errors"].append(f"{account_uuid[:8]}: deploy incompleto")
+                result["code_artifact_pending_accounts"] += 1
+                continue
+            accounts[account_uuid] = {
+                "slug": deployed_slug,
+                "organization_uuid": oauth["organization_uuid"],
+                "content_sha256": digest,
+                "version": deployed.get("version"),
+                "updated_at": now_utc(),
+            }
+            result["code_artifact_copies_created"] += 1
+
+    replacements_by_session: dict[str, dict[str, dict[str, str]]] = {}
+    links_by_session: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    for slug, state_entry in artifact_state.items():
+        if not isinstance(state_entry, dict):
+            continue
+        accounts = state_entry.get("accounts") if isinstance(state_entry.get("accounts"), dict) else {}
+        references = state_entry.get("references") if isinstance(state_entry.get("references"), dict) else {}
+        original_url = state_entry.get("frame_url")
+        for logical_session_id, reference in references.items():
+            if not isinstance(logical_session_id, str) or not isinstance(reference, dict):
+                continue
+            for account_uuid, mapping in accounts.items():
+                if not isinstance(account_uuid, str) or not isinstance(mapping, dict):
+                    continue
+                mapped_slug = mapping.get("slug")
+                if not isinstance(mapped_slug, str) or not isinstance(original_url, str):
+                    continue
+                mapped_url = f"https://claude.ai/code/artifact/{mapped_slug}"
+                if mapped_url == original_url:
+                    continue
+                replacements_by_session.setdefault(logical_session_id, {}).setdefault(account_uuid, {})[
+                    original_url
+                ] = mapped_url
+                if reference.get("has_frame_link") is not True:
+                    links_by_session.setdefault(logical_session_id, {}).setdefault(account_uuid, []).append(
+                        {
+                            "frame_url": mapped_url,
+                            "title": reference.get("title") or state_entry.get("title"),
+                            "timestamp": reference.get("timestamp"),
+                            "path": state_entry.get("cache_path"),
+                        }
+                    )
+
+    replicas = root_state.setdefault("code_artifact_session_replicas", {})
+    if not isinstance(replicas, dict):
+        replicas = {}
+        root_state["code_artifact_session_replicas"] = replicas
+    for logical_session_id, by_account in replacements_by_session.items():
+        reference_path = next(
+            (
+                windows_to_local_path(reference["transcript_path"])
+                for artifact in artifact_state.values()
+                if isinstance(artifact, dict)
+                for session_id, reference in (
+                    artifact.get("references", {}).items()
+                    if isinstance(artifact.get("references"), dict)
+                    else []
+                )
+                if session_id == logical_session_id
+                and isinstance(reference, dict)
+                and isinstance(reference.get("transcript_path"), str)
+            ),
+            None,
+        )
+        if reference_path is None or not reference_path.is_file():
+            continue
+        account_replicas = replicas.setdefault(logical_session_id, {})
+        if not isinstance(account_replicas, dict):
+            account_replicas = {}
+            replicas[logical_session_id] = account_replicas
+        for account_uuid, replacements in by_account.items():
+            replica_session_id = account_replicas.get(account_uuid)
+            if not isinstance(replica_session_id, str) or not replica_session_id:
+                replica_session_id = str(
+                    uuid.uuid5(
+                        uuid.NAMESPACE_URL,
+                        f"claude-codex-queue:artifact:{logical_session_id}:{account_uuid}",
+                    )
+                )
+                account_replicas[account_uuid] = replica_session_id
+            destination = reference_path.with_name(f"{replica_session_id}.jsonl")
+            changed = write_claude_artifact_transcript_replica(
+                reference_path,
+                destination,
+                logical_session_id,
+                replica_session_id,
+                replacements,
+                links_by_session.get(logical_session_id, {}).get(account_uuid, []),
+            )
+            aliases[replica_session_id] = {
+                "logical_session_id": logical_session_id,
+                "account_uuid": account_uuid,
+                "transcript_path": canonical_windows_path(destination),
+            }
+            if changed:
+                result["code_artifact_transcripts_created"] += 1
+
+
 def desktop_sync_state_path(paths: Paths) -> Path:
     return paths.state_dir / DESKTOP_SYNC_STATE_FILE_NAME
 
@@ -2973,12 +3909,193 @@ def save_desktop_sync_state(paths: Paths, state: dict[str, Any]) -> None:
         atomic_replace_with_retry(temp_path, path)
 
 
-def desktop_sync_root_key(root: Path) -> str:
+def desktop_sync_root_identity(root: str | Path) -> str:
+    raw = normalize_windows_path(str(root).strip().strip('"'))
+    windows_match = re.match(r"^([a-zA-Z]):[\\/](.*)$", raw)
+    if windows_match:
+        drive = windows_match.group(1).casefold()
+        rest = windows_match.group(2).replace("\\", "/").strip("/")
+        return f"{drive}:/{rest}".rstrip("/").casefold()
+
+    wsl_match = re.match(r"^/mnt/([a-zA-Z])/(.*)$", raw)
+    if wsl_match:
+        drive = wsl_match.group(1).casefold()
+        rest = wsl_match.group(2).replace("\\", "/").strip("/")
+        return f"{drive}:/{rest}".rstrip("/").casefold()
+
+    path = Path(raw)
     try:
-        normalized = str(root.resolve()).casefold()
+        path = path.resolve()
     except OSError:
-        normalized = str(root.absolute()).casefold()
-    return hash_text(normalized) or normalized
+        path = path.absolute()
+    normalized = local_to_windows_path(path).replace("\\", "/").rstrip("/")
+    return normalized.casefold()
+
+
+def desktop_sync_root_key(root: Path) -> str:
+    identity = desktop_sync_root_identity(root)
+    return hash_text(identity) or identity
+
+
+def desktop_legacy_sync_root_keys(root: Path) -> list[str]:
+    candidates: list[str] = []
+    for resolver in (Path.resolve, Path.absolute):
+        try:
+            candidates.append(str(resolver(root)).casefold())
+        except OSError:
+            continue
+
+    identity = desktop_sync_root_identity(root)
+    drive_match = re.match(r"^([a-z]):/(.*)$", identity)
+    if drive_match:
+        drive = drive_match.group(1)
+        rest = drive_match.group(2)
+        windows_rest = rest.replace("/", "\\")
+        candidates.extend(
+            [
+                f"{drive}:\\{windows_rest}",
+                f"/mnt/{drive}/{rest}",
+            ]
+        )
+
+    canonical = desktop_sync_root_key(root)
+    keys: list[str] = []
+    for candidate in candidates:
+        key = hash_text(candidate.casefold()) or candidate.casefold()
+        if key != canonical and key not in keys:
+            keys.append(key)
+    return keys
+
+
+def desktop_session_entry_score(entry: dict[str, Any]) -> int:
+    score = int(entry.get("state_changed_at_ns") or 0)
+    replicas = entry.get("replicas") if isinstance(entry.get("replicas"), dict) else {}
+    for snapshot in replicas.values():
+        if isinstance(snapshot, dict):
+            score = max(score, int(snapshot.get("mtime_ns") or 0))
+    return score
+
+
+def desktop_session_entry_has_workspace_transition(entry: dict[str, Any]) -> bool:
+    replicas = entry.get("replicas") if isinstance(entry.get("replicas"), dict) else {}
+    present: dict[str, set[str]] = {}
+    missing: dict[str, set[str]] = {}
+    for slot, snapshot in replicas.items():
+        if not isinstance(snapshot, dict):
+            continue
+        account_uuid = snapshot.get("account_uuid")
+        workspace_uuid = snapshot.get("workspace_uuid")
+        if not isinstance(account_uuid, str) or not isinstance(workspace_uuid, str):
+            if isinstance(slot, str) and "/" in slot:
+                account_uuid, workspace_uuid = slot.split("/", 1)
+            else:
+                continue
+        if snapshot.get("present") is True:
+            present.setdefault(account_uuid, set()).add(workspace_uuid)
+        elif int(snapshot.get("missing_scans") or 0) > 0:
+            missing.setdefault(account_uuid, set()).add(workspace_uuid)
+    return any(
+        any(old_workspace != new_workspace for old_workspace in missing[account_uuid] for new_workspace in present[account_uuid])
+        for account_uuid in present.keys() & missing.keys()
+    )
+
+
+def merge_desktop_session_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
+    values = [entry for entry in entries if isinstance(entry, dict)]
+    if not values:
+        return {}
+    non_deleted = [entry for entry in values if entry.get("state") != DESKTOP_STATE_DELETED]
+    hard_deleted = [
+        entry
+        for entry in values
+        if entry.get("state") == DESKTOP_STATE_DELETED
+        and not desktop_session_entry_has_workspace_transition(entry)
+    ]
+    if hard_deleted:
+        selected = max(hard_deleted, key=desktop_session_entry_score)
+    elif non_deleted:
+        selected = max(non_deleted, key=desktop_session_entry_score)
+    else:
+        selected = max(values, key=desktop_session_entry_score)
+
+    merged = copy.deepcopy(selected)
+    recovering_workspace_transition = bool(
+        non_deleted
+        and not hard_deleted
+        and any(
+            entry.get("state") == DESKTOP_STATE_DELETED
+            and desktop_session_entry_has_workspace_transition(entry)
+            for entry in values
+        )
+    )
+    if recovering_workspace_transition:
+        merged["replicas"] = {}
+    else:
+        replicas = merged.setdefault("replicas", {})
+        if not isinstance(replicas, dict):
+            replicas = {}
+            merged["replicas"] = replicas
+        for entry in values:
+            source_replicas = entry.get("replicas") if isinstance(entry.get("replicas"), dict) else {}
+            for slot, snapshot in source_replicas.items():
+                if not isinstance(snapshot, dict):
+                    continue
+                current = replicas.get(slot)
+                current_score = int(current.get("mtime_ns") or 0) if isinstance(current, dict) else -1
+                snapshot_score = int(snapshot.get("mtime_ns") or 0)
+                if current is None or snapshot_score > current_score:
+                    replicas[slot] = copy.deepcopy(snapshot)
+
+    bridge_owners = merged.setdefault("bridge_owners", {})
+    if not isinstance(bridge_owners, dict):
+        bridge_owners = {}
+        merged["bridge_owners"] = bridge_owners
+    for entry in values:
+        source_owners = entry.get("bridge_owners") if isinstance(entry.get("bridge_owners"), dict) else {}
+        for bridge_id, account_uuid in source_owners.items():
+            bridge_owners.setdefault(bridge_id, account_uuid)
+    return merged
+
+
+def merge_desktop_root_states(root_states: list[dict[str, Any]]) -> dict[str, Any]:
+    values = [root_state for root_state in root_states if isinstance(root_state, dict)]
+    if not values:
+        return {"sessions": {}}
+
+    def merge_missing(target: dict[str, Any], source: dict[str, Any]) -> None:
+        for key, value in source.items():
+            if key == "sessions":
+                continue
+            if key not in target:
+                target[key] = copy.deepcopy(value)
+            elif isinstance(target[key], dict) and isinstance(value, dict):
+                merge_missing(target[key], value)
+
+    merged: dict[str, Any] = {}
+    for root_state in values:
+        merge_missing(merged, root_state)
+    session_ids = {
+        session_id
+        for root_state in values
+        for session_id in (
+            root_state.get("sessions", {}).keys()
+            if isinstance(root_state.get("sessions"), dict)
+            else []
+        )
+        if isinstance(session_id, str)
+    }
+    merged["sessions"] = {
+        session_id: merge_desktop_session_entries(
+            [
+                root_state["sessions"][session_id]
+                for root_state in values
+                if isinstance(root_state.get("sessions"), dict)
+                and isinstance(root_state["sessions"].get(session_id), dict)
+            ]
+        )
+        for session_id in session_ids
+    }
+    return merged
 
 
 def desktop_replica_slot(account_uuid: str, workspace_uuid: str) -> str:
@@ -3013,12 +4130,17 @@ def desktop_record_snapshot(record: DesktopSessionRecord) -> dict[str, Any]:
     }
 
 
-def desktop_primary_records(records: list[DesktopSessionRecord]) -> dict[tuple[str, str], DesktopSessionRecord]:
+def desktop_primary_records(
+    records: list[DesktopSessionRecord],
+    root_state: dict[str, Any] | None = None,
+) -> dict[tuple[str, str], DesktopSessionRecord]:
     primary: dict[tuple[str, str], DesktopSessionRecord] = {}
     for record in records:
         session_id = desktop_record_cli_session_id(record)
         if not session_id:
             continue
+        if root_state is not None:
+            session_id = desktop_logical_session_id(root_state, session_id)
         key = (session_id, desktop_record_slot(record))
         existing = primary.get(key)
         if existing is None or desktop_record_mtime_ns(record) >= desktop_record_mtime_ns(existing):
@@ -3029,22 +4151,93 @@ def desktop_primary_records(records: list[DesktopSessionRecord]) -> dict[tuple[s
 def desktop_sync_root_state(state: dict[str, Any], root: Path) -> dict[str, Any]:
     roots = state.setdefault("roots", {})
     key = desktop_sync_root_key(root)
-    root_state = roots.get(key) if isinstance(roots.get(key), dict) else {}
+    candidate_keys = [key, *desktop_legacy_sync_root_keys(root)]
+    root_state = merge_desktop_root_states(
+        [roots[candidate_key] for candidate_key in candidate_keys if isinstance(roots.get(candidate_key), dict)]
+    )
     root_state.setdefault("sessions", {})
     if not isinstance(root_state["sessions"], dict):
         root_state["sessions"] = {}
+    for candidate_key in candidate_keys:
+        roots.pop(candidate_key, None)
     roots[key] = root_state
     return root_state
 
 
-def refresh_desktop_sync_snapshots(paths: Paths, state: dict[str, Any]) -> None:
-    records_by_root: dict[Path, list[DesktopSessionRecord]] = {}
-    for record in desktop_session_records(paths):
-        records_by_root.setdefault(record.root, []).append(record)
+def desktop_existing_root_state(state: dict[str, Any], root: Path) -> dict[str, Any]:
+    roots = state.get("roots") if isinstance(state.get("roots"), dict) else {}
+    candidate_keys = [desktop_sync_root_key(root), *desktop_legacy_sync_root_keys(root)]
+    return merge_desktop_root_states(
+        [roots[candidate_key] for candidate_key in candidate_keys if isinstance(roots.get(candidate_key), dict)]
+    )
+
+
+def desktop_artifact_alias_session_ids(paths: Paths) -> set[str]:
+    state = load_desktop_sync_state(paths)
+    aliases: set[str] = set()
     for root in claude_windows_app_roots(paths):
+        root_state = desktop_existing_root_state(state, root)
+        values = root_state.get("code_artifact_aliases")
+        if isinstance(values, dict):
+            aliases.update(session_id for session_id in values if isinstance(session_id, str))
+    return aliases
+
+
+def cached_claude_oauth_profile(paths: Paths, organization_uuid: str) -> dict[str, str] | None:
+    state = load_desktop_sync_state(paths)
+    for root in claude_windows_app_roots(paths):
+        root_state = desktop_existing_root_state(state, root)
+        profiles = root_state.get("oauth_account_profiles")
+        if not isinstance(profiles, dict):
+            continue
+        for account_uuid, profile in profiles.items():
+            if (
+                isinstance(account_uuid, str)
+                and isinstance(profile, dict)
+                and profile.get("organization_uuid") == organization_uuid
+            ):
+                return {
+                    "account_uuid": account_uuid,
+                    "organization_uuid": organization_uuid,
+                    "email": profile.get("email") if isinstance(profile.get("email"), str) else "",
+                }
+    return None
+
+
+def active_desktop_account_public(paths: Paths) -> dict[str, Any] | None:
+    state = load_desktop_sync_state(paths)
+    for root in claude_windows_app_roots(paths):
+        context = active_desktop_account_context(root)
+        if context.logged_out or not context.account_uuid:
+            continue
+        root_state = desktop_existing_root_state(state, root)
+        profiles = root_state.get("oauth_account_profiles")
+        profile = profiles.get(context.account_uuid) if isinstance(profiles, dict) else None
+        email = profile.get("email") if isinstance(profile, dict) else None
+        return {
+            "key": f"claude-app:{context.account_uuid}",
+            "short_key": context.account_uuid[:8],
+            "label": mask_email(email) if isinstance(email, str) and email else f"Claude app {context.account_uuid[:8]}",
+            "account_uuid_hash": short_hash(context.account_uuid),
+            "organization_uuid_hash": short_hash(context.organization_uuid),
+            "source_changed_at": context.changed_at,
+        }
+    return None
+
+
+def refresh_desktop_sync_snapshots(
+    paths: Paths,
+    state: dict[str, Any],
+    records: list[DesktopSessionRecord] | None = None,
+    roots: list[Path] | None = None,
+) -> None:
+    records_by_root: dict[Path, list[DesktopSessionRecord]] = {}
+    for record in records if records is not None else desktop_session_records(paths):
+        records_by_root.setdefault(record.root, []).append(record)
+    for root in roots if roots is not None else claude_windows_app_roots(paths):
         root_state = desktop_sync_root_state(state, root)
         sessions = root_state["sessions"]
-        primary = desktop_primary_records(records_by_root.get(root, []))
+        primary = desktop_primary_records(records_by_root.get(root, []), root_state)
         by_session: dict[str, dict[str, DesktopSessionRecord]] = {}
         for (session_id, slot), record in primary.items():
             by_session.setdefault(session_id, {})[slot] = record
@@ -3077,6 +4270,7 @@ def suppress_desktop_replica(paths: Paths, record: DesktopSessionRecord) -> None
         session_id = desktop_record_cli_session_id(record)
         if not session_id:
             return
+        session_id = desktop_logical_session_id(root_state, session_id)
         entry = sessions.get(session_id) if isinstance(sessions.get(session_id), dict) else {
             "state": desktop_record_state(record),
             "state_changed_at_ns": desktop_record_mtime_ns(record),
@@ -3093,10 +4287,8 @@ def suppress_desktop_replica(paths: Paths, record: DesktopSessionRecord) -> None
 def desktop_tombstoned_session_ids(paths: Paths) -> set[str]:
     state = load_desktop_sync_state(paths)
     tombstones: set[str] = set()
-    roots = state.get("roots") if isinstance(state.get("roots"), dict) else {}
-    for root_state in roots.values():
-        if not isinstance(root_state, dict):
-            continue
+    for root in claude_windows_app_roots(paths):
+        root_state = desktop_existing_root_state(state, root)
         sessions = root_state.get("sessions") if isinstance(root_state.get("sessions"), dict) else {}
         tombstones.update(
             session_id
@@ -3138,21 +4330,39 @@ def sync_claude_desktop_accounts(
         "pending_artifact_deletions": 0,
         "artifact_missing_files": 0,
         "artifact_backups": [],
+        "code_artifacts": 0,
+        "code_artifact_copies_created": 0,
+        "code_artifact_transcripts_created": 0,
+        "code_artifact_pending_accounts": 0,
+        "code_artifact_errors": [],
         "transcripts_scanned": include_transcripts,
     }
 
-    transcript_chats = (
-        {
-            chat.session_id: chat
-            for chat in discover_chats(paths.claude_home)
+    available_transcript_chats = (
+        [
+            chat
+            for chat in discover_chats(paths.claude_home, desktop_artifact_alias_session_ids(paths))
             if chat.session_id and chat.cwd and chat.can_queue
-        }
+        ]
         if include_transcripts
-        else {}
+        else []
     )
+    roots = claude_windows_app_roots(paths)
+    log_contexts_by_root = {
+        root: desktop_account_log_contexts(root)
+        for root in roots
+    }
+    active_context_by_root = {
+        root: active_desktop_account_context(root, log_contexts_by_root[root])
+        for root in roots
+    }
     with desktop_sync_lock(paths):
         state = load_desktop_sync_state(paths)
-        records = desktop_session_records(paths)
+        records = desktop_session_records(
+            paths,
+            roots=roots,
+            account_contexts=active_context_by_root,
+        )
         for record in records:
             sanitized = sanitize_desktop_session_data(record.data)
             if sanitized != record.data:
@@ -3161,19 +4371,36 @@ def sync_claude_desktop_accounts(
                 write_desktop_session_json(record.path, sanitized)
                 result["repaired"] += 1
         if result["repaired"]:
-            records = desktop_session_records(paths)
+            records = desktop_session_records(
+                paths,
+                roots=roots,
+                account_contexts=active_context_by_root,
+            )
 
         records_by_root: dict[Path, list[DesktopSessionRecord]] = {}
         for record in records:
             records_by_root.setdefault(record.root, []).append(record)
 
-        for root in claude_windows_app_roots(paths):
+        artifact_jobs: list[
+            tuple[
+                Path,
+                set[str],
+                dict[str, list[str]],
+                dict[str, Any],
+            ]
+        ] = []
+        for root in roots:
             root_records = records_by_root.get(root, [])
             sessions_root = root / "claude-code-sessions"
             root_state = desktop_sync_root_state(state, root)
             session_state = root_state["sessions"]
-            active_account_uuid = active_desktop_account_uuid(root)
-            active_workspace_uuid = active_desktop_workspace_uuid(root, active_account_uuid)
+            active_context = active_context_by_root[root]
+            active_account_uuid = active_desktop_account_uuid(root, active_context)
+            active_workspace_uuid = active_desktop_workspace_uuid(
+                root,
+                active_account_uuid,
+                active_context,
+            )
 
             account_uuids = {record.account_uuid for record in root_records if record.account_uuid}
             if sessions_root.exists():
@@ -3200,15 +4427,30 @@ def sync_claude_desktop_accounts(
                     account_uuid,
                     (active_workspace_uuid or fallback_workspace_uuid)
                     if account_uuid == active_account_uuid
-                    else fallback_workspace_uuid,
+                    else None,
                 )
                 for account_uuid in account_uuids
+            }
+
+            sync_claude_code_artifacts(
+                paths,
+                root,
+                account_uuids,
+                root_state,
+                result,
+                scan_transcripts=include_transcripts,
+            )
+            transcript_chats = {
+                chat.session_id: chat
+                for chat in available_transcript_chats
+                if desktop_logical_session_id(root_state, chat.session_id) == chat.session_id
             }
 
             records_by_session: dict[str, list[DesktopSessionRecord]] = {}
             for record in root_records:
                 session_id = desktop_record_cli_session_id(record)
                 if session_id:
+                    session_id = desktop_logical_session_id(root_state, session_id)
                     records_by_session.setdefault(session_id, []).append(record)
 
             # Keep one metadata file per logical session/account workspace. Every removal is backed up.
@@ -3236,7 +4478,7 @@ def sync_claude_desktop_accounts(
             result["sessions"] += len(all_session_ids)
 
             for session_id in sorted(all_session_ids):
-                session_records = [record for record in records_by_session.get(session_id, []) if record.path.exists()]
+                session_records = list(records_by_session.get(session_id, []))
                 entry = session_state.get(session_id) if isinstance(session_state.get(session_id), dict) else {}
                 stored_bridge_owners = entry.get("bridge_owners") if isinstance(entry.get("bridge_owners"), dict) else {}
                 bridge_owners: dict[str, str] = {
@@ -3264,6 +4506,16 @@ def sync_claude_desktop_accounts(
                     DESKTOP_STATE_DELETED,
                 } else None
                 previous_replicas = entry.get("replicas") if isinstance(entry.get("replicas"), dict) else {}
+                if (
+                    previous_state == DESKTOP_STATE_DELETED
+                    and desktop_session_entry_has_workspace_transition(entry)
+                    and (session_records or session_id in transcript_chats)
+                ):
+                    previous_state = None
+                    previous_replicas = {}
+                    entry["state"] = DESKTOP_STATE_ACTIVE
+                    entry["replicas"] = previous_replicas
+                    result["repaired"] += 1
                 current_by_slot = {
                     desktop_record_slot(record): record
                     for record in session_records
@@ -3287,6 +4539,16 @@ def sync_claude_desktop_accounts(
                             continue
 
                         account_uuid = previous.get("account_uuid")
+                        if isinstance(account_uuid, str) and any(
+                            record.account_uuid == account_uuid
+                            for record in current_by_slot.values()
+                        ):
+                            # The account moved to a new organization/workspace directory.
+                            # Its current replica proves that the missing old slot is not a delete.
+                            previous["missing_scans"] = 0
+                            previous["present"] = False
+                            previous["scan_blocked"] = False
+                            continue
                         relative_path = previous.get("path")
                         previous_path = sessions_root / str(relative_path) if isinstance(relative_path, str) else None
                         parent_readable = previous_path is not None and previous_path.parent.is_dir()
@@ -3389,7 +4651,6 @@ def sync_claude_desktop_accounts(
                             for record in session_records
                             if record.account_uuid == account_uuid
                             and record.workspace_uuid == workspace_uuid
-                            and record.path.exists()
                         ]
                         if not target_records and (
                             previous.get("scan_blocked")
@@ -3403,7 +4664,7 @@ def sync_claude_desktop_accounts(
                                 base_data = primary.data
                             data = desktop_session_data_for_path(
                                 base_data,
-                                session_id,
+                                desktop_account_session_id(root_state, session_id, account_uuid),
                                 primary.path,
                                 archived=canonical_state == DESKTOP_STATE_ARCHIVED,
                             )
@@ -3433,7 +4694,7 @@ def sync_claude_desktop_accounts(
                         )
                         data = desktop_session_data_for_path(
                             source_data,
-                            session_id,
+                            desktop_account_session_id(root_state, session_id, account_uuid),
                             destination,
                             archived=canonical_state == DESKTOP_STATE_ARCHIVED,
                         )
@@ -3458,8 +4719,7 @@ def sync_claude_desktop_accounts(
                 # account's chosen workspace replica, with a backup for every removal.
                 by_account: dict[str, list[DesktopSessionRecord]] = {}
                 for record in session_records:
-                    if record.path.exists():
-                        by_account.setdefault(record.account_uuid, []).append(record)
+                    by_account.setdefault(record.account_uuid, []).append(record)
                 for account_uuid, account_records in by_account.items():
                     preferred = set(workspace_uuids_by_account.get(account_uuid, []))
                     preferred_records = [record for record in account_records if record.workspace_uuid in preferred]
@@ -3472,23 +4732,46 @@ def sync_claude_desktop_accounts(
                         duplicate.path.unlink()
                         result["deduped"] += 1
 
-            current_root_records = [
-                record
-                for record in desktop_session_records(paths)
-                if record.root == root
-            ]
+            artifact_jobs.append(
+                (
+                    root,
+                    account_uuids,
+                    workspace_uuids_by_account,
+                    root_state,
+                )
+            )
+
+        session_files_changed = any(
+            int(result[key] or 0) > 0
+            for key in ("created", "updated", "repaired", "deduped", "removed")
+        )
+        current_records = (
+            desktop_session_records(
+                paths,
+                roots=roots,
+                account_contexts=active_context_by_root,
+            )
+            if session_files_changed
+            else records
+        )
+        current_records_by_root: dict[Path, list[DesktopSessionRecord]] = {}
+        for record in current_records:
+            current_records_by_root.setdefault(record.root, []).append(record)
+        for root, account_uuids, workspace_uuids_by_account, root_state in artifact_jobs:
             sync_claude_desktop_artifacts(
                 paths,
                 root,
-                current_root_records,
+                current_records_by_root.get(root, []),
                 account_uuids,
                 workspace_uuids_by_account,
                 state,
                 root_state,
                 result,
+                log_contexts_by_root[root],
+                active_context_by_root[root],
             )
 
-        refresh_desktop_sync_snapshots(paths, state)
+        refresh_desktop_sync_snapshots(paths, state, current_records, roots)
         save_desktop_sync_state(paths, state)
     return result
 
@@ -3574,7 +4857,17 @@ def transfer_chat_to_active_desktop_account(paths: Paths, chat: Chat, move: bool
         raise ValueError("La chat non ha una cwd: non posso creare un metadato Claude app affidabile.")
 
     records = desktop_session_records(paths)
-    source_records = [record for record in records if desktop_record_cli_session_id(record) == chat.session_id]
+    sync_state = load_desktop_sync_state(paths)
+    source_records = [
+        record
+        for record in records
+        if desktop_record_cli_session_id(record)
+        and desktop_logical_session_id(
+            desktop_existing_root_state(sync_state, record.root),
+            desktop_record_cli_session_id(record) or "",
+        )
+        == chat.session_id
+    ]
     source_record = next((record for record in source_records if record.account_uuid != record.active_account_uuid), None)
     if source_record is None and source_records:
         source_record = source_records[0]
@@ -3585,7 +4878,13 @@ def transfer_chat_to_active_desktop_account(paths: Paths, chat: Chat, move: bool
     active_records = [
         record
         for record in records
-        if record.account_uuid == active_account_uuid and desktop_record_cli_session_id(record) == chat.session_id
+        if record.account_uuid == active_account_uuid
+        and desktop_record_cli_session_id(record)
+        and desktop_logical_session_id(
+            desktop_existing_root_state(sync_state, record.root),
+            desktop_record_cli_session_id(record) or "",
+        )
+        == chat.session_id
     ]
     if source_record is not None and source_record.account_uuid == active_account_uuid:
         source_record = next((record for record in source_records if record.account_uuid != active_account_uuid), source_record)
@@ -3620,6 +4919,11 @@ def transfer_chat_to_active_desktop_account(paths: Paths, chat: Chat, move: bool
                     "artifacts_deleted",
                     "artifacts_removed",
                     "artifact_missing_files",
+                    "code_artifacts",
+                    "code_artifact_copies_created",
+                    "code_artifact_transcripts_created",
+                    "code_artifact_pending_accounts",
+                    "code_artifact_errors",
                 ]
             },
         }
@@ -3665,6 +4969,11 @@ def transfer_chat_to_active_desktop_account(paths: Paths, chat: Chat, move: bool
                 "artifacts_deleted",
                 "artifacts_removed",
                 "artifact_missing_files",
+                "code_artifacts",
+                "code_artifact_copies_created",
+                "code_artifact_transcripts_created",
+                "code_artifact_pending_accounts",
+                "code_artifact_errors",
             ]
         },
     }
@@ -3833,6 +5142,7 @@ def discover_claude_windows_app_sessions(
     if sync_accounts:
         sync_claude_desktop_accounts(paths)
     discovered: list[Chat] = []
+    sync_state = load_desktop_sync_state(paths)
     for record in desktop_session_records(paths, active_only=active_only):
         data = record.data
         if data.get("isArchived") is True:
@@ -3843,6 +5153,10 @@ def discover_claude_windows_app_sessions(
             if not isinstance(app_session_id, str) or not app_session_id:
                 continue
             cli_session_id = app_session_id.removeprefix("local_")
+        cli_session_id = desktop_logical_session_id(
+            desktop_existing_root_state(sync_state, record.root),
+            cli_session_id,
+        )
         title = data.get("title") if isinstance(data.get("title"), str) else None
         cwd = data.get("cwd") if isinstance(data.get("cwd"), str) else None
         if not cwd and isinstance(data.get("originCwd"), str):
@@ -4452,7 +5766,10 @@ def discover_claude_chats(
         sync_accounts=sync_desktop_accounts,
         active_only=active_desktop_only,
     )
-    transcript_chats = discover_chats(paths.claude_home) + discover_remote_ssh_chats(paths, agent_chats)
+    transcript_chats = discover_chats(
+        paths.claude_home,
+        desktop_artifact_alias_session_ids(paths),
+    ) + discover_remote_ssh_chats(paths, agent_chats)
     tombstones = desktop_tombstoned_session_ids(paths)
     merged = merge_claude_chat_sources(transcript_chats, agent_chats + desktop_chats)
     return annotate_chats_with_accounts(
@@ -5544,7 +6861,7 @@ def item_account_fields(item: dict[str, Any]) -> dict[str, Any]:
 
 
 def build_claude_command(claude_exe: Path, item: dict[str, Any], use_ide: bool) -> list[str]:
-    return [str(claude_exe)] + build_claude_arguments(item, use_ide)
+    return local_executable_command(claude_exe, build_claude_arguments(item, use_ide))
 
 
 def cwd_for_subprocess(cwd: str | None, fallback: str | None = None) -> Path:
@@ -5679,9 +6996,13 @@ for name in payload.get("clear_env", []):
     os.environ.pop(name, None)
 
 try:
+    command = payload.get("command")
+    if not isinstance(command, list) or not command:
+        command = [payload["exe"], *payload.get("args", [])]
     proc = subprocess.run(
-        [payload["exe"], *payload["args"], payload["prompt"]],
+        command,
         cwd=payload["cwd"],
+        input=payload["prompt"].encode("utf-8"),
         capture_output=True,
         timeout=payload["timeout"],
     )
@@ -5721,8 +7042,9 @@ def run_claude_local_windows(
             json.dumps(
                 {
                     "exe": local_to_windows_path(claude_exe),
-                    "cwd": cwd,
                     "args": build_claude_arguments(item, use_ide),
+                    "command": windows_executable_command(claude_exe, build_claude_arguments(item, use_ide)),
+                    "cwd": cwd,
                     "prompt": item["prompt"],
                     "timeout": timeout,
                     "clear_env": sorted(CLAUDE_EXTERNAL_AUTH_ENV_VARS),
@@ -5818,7 +7140,7 @@ def run_codex(
         )
     else:
         proc = subprocess.run(
-            [str(codex_exe), *arguments],
+            local_executable_command(codex_exe, arguments),
             input=prompt,
             text=True,
             cwd=cwd_for_subprocess(cwd),
@@ -6490,7 +7812,7 @@ def chat_execution_fields(chat: Chat) -> dict[str, Any]:
 
 def command_doctor(args: argparse.Namespace) -> int:
     paths = resolve_paths(args.windows_home, args.state_dir)
-    local_chats = discover_chats(paths.claude_home)
+    local_chats = discover_chats(paths.claude_home, desktop_artifact_alias_session_ids(paths))
     vscode_chats = discover_claude_agent_sessions(paths)
     codex_chats = discover_codex_app_sessions(paths)
     all_chats = discover_agent_chats(paths)
@@ -6511,20 +7833,34 @@ def command_doctor(args: argparse.Namespace) -> int:
                 version_command,
                 text=True,
                 capture_output=True,
-                timeout=15,
+                timeout=30,
                 **background_process_kwargs(),
             )
             print(f"Versione:     {result.stdout.strip() or result.stderr.strip()}")
-        except (OSError, subprocess.SubprocessError) as exc:
-            print(f"Versione:     errore: {exc}")
+        except subprocess.TimeoutExpired:
+            print("Versione:     verifica non disponibile")
+        except (OSError, subprocess.SubprocessError):
+            print("Versione:     verifica non riuscita")
     if codex_exe:
         try:
-            version_result = run_codex_cli_command(codex_exe, ["--version"], codex_home=paths.codex_home)
-            login_result = run_codex_cli_command(codex_exe, ["login", "status"], codex_home=paths.codex_home)
+            version_result = run_codex_cli_command(
+                codex_exe,
+                ["--version"],
+                timeout=30,
+                codex_home=paths.codex_home,
+            )
+            login_result = run_codex_cli_command(
+                codex_exe,
+                ["login", "status"],
+                timeout=30,
+                codex_home=paths.codex_home,
+            )
             print(f"Codex ver.:   {(version_result.stdout or version_result.stderr).strip()}")
             print(f"Codex auth:   {(login_result.stdout or login_result.stderr).strip()}")
-        except (OSError, subprocess.SubprocessError) as exc:
-            print(f"Codex stato:  errore: {exc}")
+        except subprocess.TimeoutExpired:
+            print("Codex stato:  verifica non disponibile")
+        except (OSError, subprocess.SubprocessError):
+            print("Codex stato:  verifica non riuscita")
     print(f"Chat Claude Code locali:     {len(local_chats)}")
     print(f"Chat Claude Code VS Code:    {len(vscode_chats)}")
     print(f"Task Codex App:              {len(codex_chats)}")

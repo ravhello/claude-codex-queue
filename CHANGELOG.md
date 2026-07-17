@@ -2,6 +2,26 @@
 
 ## Unreleased
 
+## 0.2.5 - 2026-07-18
+
+- Added private Claude Code artifact replication: each Claude account receives its own server-side artifact and an account-specific derived transcript while the provider transcript remains unchanged.
+- Read Claude Desktop's encrypted OAuth cache from native Windows or WSL through hidden PowerShell 7, kept tokens only in memory and verified each token through `/api/oauth/profile` before use.
+- Blocked mixed-account CLI authentication when `.claude.json` and the effective OAuth credential refer to different organizations.
+- Kept unavailable artifact copies pending until the matching account credential appears instead of retrying with another account's token.
+- Ran a complete transcript and artifact scan on the monitor's first startup cycle, then continued with lightweight ten-second checks and full minute checks.
+- Unified Claude app journal identities across Windows and WSL and migrated legacy entries, preventing stale cross-platform tombstones from hiding chats.
+- Distinguished account workspace changes from real chat deletion so login switches cannot turn moved replicas into global tombstones.
+- Cached verified OAuth sessions only in process memory between fast checks and skipped frame-list network calls outside full scans; credential-file changes invalidate the cache immediately.
+- Reused unchanged Claude session metadata and parsed account logs in memory, reducing steady WSL synchronization from roughly fifteen seconds to about three seconds on the tested profile.
+- Detected active Claude accounts from runtime session and skills-plugin log paths, so a stale logout event no longer hides current chats.
+- Populated a newly selected account's organization directory immediately even before its first Claude Code activity.
+- Unified Claude prompt transport over standard input on native Windows and WSL, and normalized WSL drive paths consistently in native Windows helpers.
+- Rendered chat discovery as soon as it completes instead of waiting for the slower account and artifact diagnostics request.
+- Added persistent artifact status to the web UI and reduced real transcript artifact scanning from tens of seconds to a few seconds.
+- Made account-specific artifact transcripts byte-stable after the first replication, preventing needless rewrites and repeated background discovery invalidation.
+- Used the indexed `lastPrompt` as the immediate chat-preview fallback so a transient empty preview cannot hide the latest real message.
+- Verified metadata discovery and synchronization without Claude Desktop, Codex or VS Code processes running.
+
 ## 0.2.4 - 2026-07-17
 
 - Synchronized Claude Cowork artifact manifests across accounts, remapped their session links and preserved account-local connector/share state.

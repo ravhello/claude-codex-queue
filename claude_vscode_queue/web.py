@@ -43,6 +43,7 @@ def split_messages(raw: str) -> list[str]:
 
 
 def chat_to_dict(chat: app.Chat) -> dict[str, Any]:
+    last_user_message = chat.last_user_message or chat.last_prompt
     return {
         "provider": chat.provider,
         "session_id": chat.session_id,
@@ -59,8 +60,8 @@ def chat_to_dict(chat: app.Chat) -> dict[str, Any]:
         "last_timestamp": chat.last_timestamp,
         "message_count": chat.message_count,
         "last_prompt": chat.last_prompt,
-        "last_user_message": chat.last_user_message,
-        "last_user_message_loaded": chat.last_user_message is not None,
+        "last_user_message": last_user_message,
+        "last_user_message_loaded": last_user_message is not None,
         "jsonl_path": str(chat.jsonl_path),
         "source": chat.source,
         "source_key": chat.source_key,
@@ -130,6 +131,7 @@ class WebState:
         self._account_sync_cycle_started_at: str | None = None
         self._account_sync_last_duration_seconds: float | None = None
         self._account_sync_last_error: str | None = None
+        self._account_sync_last_result: dict[str, Any] = {}
         self._runner_monitor_stop = threading.Event()
         self._runner_monitor_thread: threading.Thread | None = None
         self._runner_monitor_poll_seconds = 5.0
@@ -381,12 +383,14 @@ class WebState:
                 cwd=PROJECT_ROOT,
                 text=True,
                 capture_output=True,
-                timeout=5,
+                timeout=30,
                 **app.background_process_kwargs(),
             )
             version = (result.stdout or result.stderr).strip()
-        except subprocess.SubprocessError as exc:
-            version = f"errore: {exc}"
+        except subprocess.TimeoutExpired:
+            version = "verifica versione non disponibile"
+        except (OSError, subprocess.SubprocessError):
+            version = "verifica versione non riuscita"
         with self.lock:
             self._version_cache = version
             self._version_cache_at = now
@@ -400,10 +404,12 @@ class WebState:
             if self._codex_version_cache is not None and now - self._codex_version_cache_at < max_age_seconds:
                 return self._codex_version_cache
         try:
-            result = app.run_codex_cli_command(self.codex_exe, ["--version"], timeout=8)
+            result = app.run_codex_cli_command(self.codex_exe, ["--version"], timeout=30)
             version = (result.stdout or result.stderr).strip()
-        except (OSError, subprocess.SubprocessError) as exc:
-            version = f"errore: {exc}"
+        except subprocess.TimeoutExpired:
+            version = "verifica versione non disponibile"
+        except (OSError, subprocess.SubprocessError):
+            version = "verifica versione non riuscita"
         with self.lock:
             self._codex_version_cache = version
             self._codex_version_cache_at = now
@@ -438,8 +444,11 @@ class WebState:
                     "artifacts_updated",
                     "artifacts_deleted",
                     "artifacts_removed",
+                    "code_artifact_copies_created",
+                    "code_artifact_transcripts_created",
                 ]
             )
+            errors.extend(str(error) for error in claude.get("code_artifact_errors", []) if error)
         except Exception as exc:
             errors.append(f"Claude: {exc}")
         try:
@@ -457,6 +466,7 @@ class WebState:
             self._account_sync_cycle_started_at = None
             self._account_sync_last_duration_seconds = round(time.monotonic() - started, 3)
             self._account_sync_last_error = " | ".join(errors) if errors else None
+            self._account_sync_last_result = results
         if changed:
             self.invalidate_chats()
         return {
@@ -479,6 +489,7 @@ class WebState:
                 "in_progress": self._account_sync_cycle_started_at is not None,
                 "last_duration_seconds": self._account_sync_last_duration_seconds,
                 "last_error": self._account_sync_last_error,
+                "last_result": self._account_sync_last_result,
             }
 
     def wait_for_account_sync_trigger(
@@ -514,7 +525,7 @@ class WebState:
             self._account_sync_stop.clear()
 
             def worker() -> None:
-                next_full_at = time.monotonic() + self._account_sync_full_poll_seconds
+                next_full_at = 0.0
                 signature = app.claude_desktop_change_signature(self.paths)
                 while not self._account_sync_stop.is_set():
                     cycle_started = time.monotonic()
@@ -807,7 +818,8 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             "queueable_chat_count": len([chat for chat in chats if chat.can_queue]),
             "sources": sorted({chat.source for chat in chats}),
             "local_time": app.now_utc(),
-            "active_account": app.account_public_dict(app.active_claude_account(self.state.paths)),
+            "active_account": app.active_desktop_account_public(self.state.paths),
+            "active_claude_code_account": app.account_public_dict(app.active_claude_account(self.state.paths)),
             "active_codex_account": app.account_public_dict(app.active_codex_account(self.state.paths)),
             "account_index": app.account_index_public(self.state.paths),
             "account_sync": self.state.account_sync_status(),
@@ -1340,10 +1352,12 @@ HTML = r"""<!doctype html>
       font-size: 12px;
     }
     .empty { color: var(--muted); padding: 18px 0; text-align: center; }
+    @media (max-width: 1100px) {
+      .settings-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
+    }
     @media (max-width: 900px) {
       main { grid-template-columns: 1fr; }
       header { height: auto; padding: 12px 14px; align-items: flex-start; }
-      .settings-grid { grid-template-columns: repeat(2, minmax(120px, 1fr)); }
     }
   </style>
 </head>
@@ -1415,7 +1429,7 @@ HTML = r"""<!doctype html>
     </div>
   </main>
   <script>
-    const state = { chats: [], selected: null, queue: [], autoContinues: [], runner: {}, autoBusy: false, autoBusyAction: null, settingsSession: null, transferBusy: false, refreshBusy: false, messagePreviews: {}, previewRequests: {} };
+    const state = { chats: [], selected: null, queue: [], autoContinues: [], runner: {}, autoBusy: false, autoBusyAction: null, settingsSession: null, transferBusy: false, refreshBusy: false, doctorBusy: false, messagePreviews: {}, previewRequests: {} };
     let chatPreviewObserver = null;
     const $ = (id) => document.getElementById(id);
     const CLAUDE_MODEL_OPTIONS = ["opus", "sonnet", "haiku", "claude-opus-4-8", "claude-sonnet-4-5"];
@@ -1457,9 +1471,19 @@ HTML = r"""<!doctype html>
 
     function renderDoctor(data) {
       const account = data.active_account;
+      const claudeCodeAccount = data.active_claude_code_account;
       const codexAccount = data.active_codex_account;
       const accounts = data.account_index && Array.isArray(data.account_index.accounts) ? data.account_index.accounts : [];
       const accountSync = data.account_sync || {};
+      const claudeSync = accountSync.last_result && accountSync.last_result.claude
+        ? accountSync.last_result.claude
+        : {};
+      const codeArtifacts = Number(claudeSync.code_artifacts || 0);
+      const pendingArtifactAccounts = Number(claudeSync.code_artifact_pending_accounts || 0);
+      const artifactStatus = codeArtifacts > 0
+        ? `${codeArtifacts} · copie private create: ${Number(claudeSync.code_artifact_copies_created || 0)}`
+          + (pendingArtifactAccounts > 0 ? ` · in attesa di autenticazione: ${pendingArtifactAccounts}` : " · sincronizzati")
+        : "nessuno rilevato";
       const syncStatus = accountSync.running
         ? (accountSync.last_error
           ? `attiva, errore: ${accountSync.last_error}`
@@ -1469,12 +1493,14 @@ HTML = r"""<!doctype html>
         `<b>Ora PC</b>: ${escapeHtml(formatDateTime(data.local_time || new Date().toISOString()))}`,
         `<b>Versione app</b>: ${escapeHtml(data.app_version || "")}`,
         `<b>Claude</b>: ${escapeHtml(data.claude_version || "non trovato")}`,
-        `<b>Account Claude</b>: ${escapeHtml(account ? account.label : "non rilevato")}`,
+        `<b>Account app Claude</b>: ${escapeHtml(account ? account.label : "non rilevato")}`,
+        `<b>Account CLI Claude Code</b>: ${escapeHtml(claudeCodeAccount ? claudeCodeAccount.label : "non rilevato")}`,
         `<b>Codex</b>: ${escapeHtml(data.codex_version || "non trovato")}`,
         `<b>Account Codex</b>: ${escapeHtml(codexAccount ? codexAccount.label : "non rilevato")}`,
         `<b>Account registrati</b>: ${escapeHtml(String(accounts.length))}`,
         `<b>Sync account</b>: ${escapeHtml(syncStatus)}${accountSync.last_check_at ? ` · ${escapeHtml(formatDateTime(accountSync.last_check_at))}` : ""}`,
         accountSync.last_full_check_at ? `<b>Scansione completa</b>: ${escapeHtml(formatDateTime(accountSync.last_full_check_at))}` : "",
+        `<b>Artefatti Claude Code</b>: ${escapeHtml(artifactStatus)}`,
         `<b>Chat Claude</b>: ${data.claude_chat_count || 0}`,
         `<b>Task Codex</b>: ${data.codex_chat_count || 0}`,
         `<b>Accodabili</b>: ${data.queueable_chat_count}`,
@@ -1521,7 +1547,7 @@ HTML = r"""<!doctype html>
     function hydrateChatPreviews(chats) {
       for (const chat of chats) {
         const cached = state.messagePreviews[chat.session_id];
-        if (cached && cached.key === chatPreviewKey(chat)) {
+        if (cached && cached.text && cached.key === chatPreviewKey(chat)) {
           chat.last_user_message = cached.text;
           chat.last_user_message_loaded = true;
         }
@@ -1539,10 +1565,10 @@ HTML = r"""<!doctype html>
         const result = await api(`/api/chat-preview?session_id=${encodeURIComponent(sessionId)}`);
         const current = state.chats.find((item) => item.session_id === sessionId);
         if (!current || chatPreviewKey(current) !== key) return;
-        const text = result.last_user_message || "";
+        const text = result.last_user_message || current.last_prompt || "";
         current.last_user_message = text;
         current.last_user_message_loaded = true;
-        state.messagePreviews[sessionId] = { key, text };
+        if (text) state.messagePreviews[sessionId] = { key, text };
         renderChats();
       } catch (err) {
         const current = state.chats.find((item) => item.session_id === sessionId);
@@ -1769,7 +1795,7 @@ HTML = r"""<!doctype html>
         btn.className = "chat" + (state.selected === chat.session_id ? " active" : "") + (!chat.can_queue ? " view-only" : "");
         const location = chat.remote_cwd ? `${chat.remote_host || "ssh"}:${chat.remote_cwd}` : (chat.cwd || "");
         const accountBadge = accountText(chat);
-        const lastMessage = chat.last_user_message || "";
+        const lastMessage = chat.last_user_message || chat.last_prompt || "";
         const lastMessageLoaded = !!(chat.last_user_message_loaded || lastMessage);
         const lastMessageText = lastMessage || (lastMessageLoaded ? "non disponibile" : "caricamento...");
         btn.innerHTML = `
@@ -1885,25 +1911,31 @@ HTML = r"""<!doctype html>
       $("queue").innerHTML = autoBoxes + recoveryBox + `<table><thead><tr><th>Stato</th><th>ID</th><th>Elemento</th><th>Azioni</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
+    async function refreshDoctor() {
+      if (state.doctorBusy) return;
+      state.doctorBusy = true;
+      try {
+        renderDoctor(await api("/api/doctor"));
+      } catch (err) {
+        appendLog("Errore ambiente: " + err.message);
+      } finally {
+        state.doctorBusy = false;
+      }
+    }
+
     async function refreshAll() {
       if (state.refreshBusy) return;
       state.refreshBusy = true;
+      void refreshDoctor();
       try {
-        const queue = await api("/api/queue");
-        renderQueue(queue);
-        const [doctorResult, chatsResult] = await Promise.allSettled([
-          api("/api/doctor"),
-          api("/api/chats"),
-        ]);
-        if (doctorResult.status === "fulfilled") {
-          renderDoctor(doctorResult.value);
-        } else {
-          appendLog("Errore ambiente: " + doctorResult.reason.message);
-        }
-        if (chatsResult.status === "fulfilled") {
-          state.chats = hydrateChatPreviews(chatsResult.value.chats || []);
+        const queueTask = api("/api/queue").then((queue) => renderQueue(queue));
+        const chatsTask = api("/api/chats").then((chats) => {
+          state.chats = hydrateChatPreviews(chats.chats || []);
           renderChats();
-        } else {
+        });
+        const [queueResult, chatsResult] = await Promise.allSettled([queueTask, chatsTask]);
+        if (queueResult.status === "rejected") appendLog("Errore coda: " + queueResult.reason.message);
+        if (chatsResult.status === "rejected") {
           appendLog("Errore chat: " + chatsResult.reason.message);
         }
       } catch (err) {
@@ -1998,10 +2030,18 @@ HTML = r"""<!doctype html>
           "artifacts_deleted",
           "artifacts_removed",
         ].reduce((total, key) => total + Number(artifactSync[key] || 0), 0);
-        const artifactText = isCodex ? "" : ` · artefatti: ${artifactChanges}`;
+        const codeArtifactChanges = Number(artifactSync.code_artifact_copies_created || 0)
+          + Number(artifactSync.code_artifact_transcripts_created || 0);
+        const artifactText = isCodex ? "" : ` · artefatti: ${artifactChanges + codeArtifactChanges}`;
         appendLog(`Import completato: ${transfer.status || "ok"} · ${transfer.title || selected.title || state.selected}${artifactText}`);
         if (Number(artifactSync.artifact_missing_files || 0) > 0) {
           appendLog(`Attenzione: ${artifactSync.artifact_missing_files} artefatti hanno il manifesto ma manca il file locale.`);
+        }
+        if (Number(artifactSync.code_artifact_pending_accounts || 0) > 0) {
+          appendLog(`Artefatti Claude Code in attesa: ${artifactSync.code_artifact_pending_accounts} account non ha ancora una credenziale valida in cache.`);
+        }
+        for (const error of (artifactSync.code_artifact_errors || [])) {
+          appendLog(`Errore artefatto Claude Code: ${error}`);
         }
         renderChats();
         await refreshAll();

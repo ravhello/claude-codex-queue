@@ -120,6 +120,61 @@ class AccountSyncTests(unittest.TestCase):
         return transcript
 
     @staticmethod
+    def _write_artifact_transcript(
+        paths: app.Paths,
+        session_id: str,
+        cwd: Path,
+        source_file: Path,
+        slug: str,
+    ) -> Path:
+        project = paths.claude_home / "projects" / "fixture"
+        project.mkdir(parents=True, exist_ok=True)
+        transcript = project / f"{session_id}.jsonl"
+        rows = [
+            {
+                "type": "assistant",
+                "sessionId": session_id,
+                "timestamp": "2026-07-17T10:00:00Z",
+                "cwd": str(cwd),
+                "message": {
+                    "role": "assistant",
+                    "model": "claude-test",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "artifact-call",
+                            "name": "Artifact",
+                            "input": {
+                                "file_path": str(source_file),
+                                "description": "Test artifact",
+                                "favicon": "T",
+                                "label": "Test",
+                            },
+                        }
+                    ],
+                },
+            },
+            {
+                "type": "frame-link",
+                "sessionId": session_id,
+                "path": str(source_file),
+                "frameUrl": f"https://claude.ai/code/artifact/{slug}",
+                "title": "Account-safe artifact",
+                "timestamp": "2026-07-17T10:00:01Z",
+            },
+            {
+                "type": "last-prompt",
+                "sessionId": session_id,
+                "lastPrompt": "continue the artifact work",
+            },
+        ]
+        transcript.write_text(
+            "".join(json.dumps(row) + "\n" for row in rows),
+            encoding="utf-8",
+        )
+        return transcript
+
+    @staticmethod
     def _codex_rollout(codex_home: Path, session_id: str, *, archived: bool = False) -> Path:
         root = codex_home / ("archived_sessions" if archived else "sessions") / "2026" / "07" / "12"
         root.mkdir(parents=True, exist_ok=True)
@@ -190,6 +245,161 @@ class AccountSyncTests(unittest.TestCase):
             self.assertEqual(destination.read_text(encoding="utf-8"), "new")
             self.assertFalse(source.exists())
             sleep.assert_called_once_with(app.ATOMIC_REPLACE_RETRY_DELAYS[0])
+
+    def test_desktop_root_identity_is_equal_for_windows_and_wsl_paths(self) -> None:
+        windows = r"C:\Users\Example\AppData\Local\Packages\Claude_test\LocalCache\Roaming\Claude"
+        wsl = "/mnt/c/Users/Example/AppData/Local/Packages/Claude_test/LocalCache/Roaming/Claude"
+
+        self.assertEqual(
+            app.desktop_sync_root_identity(windows),
+            app.desktop_sync_root_identity(wsl),
+        )
+
+    @unittest.skipUnless(os.name == "nt", "Windows path conversion")
+    def test_windows_to_local_path_accepts_a_wsl_mount_path_on_windows(self) -> None:
+        self.assertEqual(
+            app.windows_to_local_path("/mnt/c/Users/Example/file.jsonl"),
+            Path(r"C:\Users\Example\file.jsonl"),
+        )
+
+    def test_web_claude_version_timeout_is_concise_and_allows_hidden_proxy_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = web.WebState(self._paths(Path(tmp)), Path("claude.exe"))
+            error = web.subprocess.TimeoutExpired(
+                cmd=["powershell.exe", "-EncodedCommand", "secret-command"],
+                timeout=30,
+            )
+
+            with patch.object(web.subprocess, "run", side_effect=error) as run:
+                version = state.claude_version()
+
+            self.assertEqual(version, "verifica versione non disponibile")
+            self.assertEqual(run.call_args.kwargs["timeout"], 30)
+            self.assertNotIn("EncodedCommand", version)
+
+    def test_web_codex_version_timeout_is_concise_and_allows_hidden_proxy_startup(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = web.WebState(self._paths(Path(tmp)), None, Path("codex.exe"))
+            error = web.subprocess.TimeoutExpired(
+                cmd=["powershell.exe", "-EncodedCommand", "secret-command"],
+                timeout=30,
+            )
+
+            with patch.object(app, "run_codex_cli_command", side_effect=error) as run:
+                version = state.codex_version()
+
+            self.assertEqual(version, "verifica versione non disponibile")
+            self.assertEqual(run.call_args.kwargs["timeout"], 30)
+            self.assertNotIn("EncodedCommand", version)
+
+    def test_desktop_root_state_migration_repairs_workspace_tombstone_only(self) -> None:
+        moved_session = "10101010-1010-4010-8010-101010101010"
+        deleted_session = "20202020-2020-4020-8020-202020202020"
+        active = {
+            "state": app.DESKTOP_STATE_ACTIVE,
+            "replicas": {
+                "account-a/workspace-old": {
+                    "account_uuid": "account-a",
+                    "workspace_uuid": "workspace-old",
+                    "present": True,
+                    "missing_scans": 0,
+                    "mtime_ns": 10,
+                }
+            },
+        }
+        moved_tombstone = {
+            "state": app.DESKTOP_STATE_DELETED,
+            "state_changed_at_ns": 30,
+            "replicas": {
+                "account-a/workspace-old": {
+                    "account_uuid": "account-a",
+                    "workspace_uuid": "workspace-old",
+                    "present": False,
+                    "missing_scans": 2,
+                    "mtime_ns": 10,
+                },
+                "account-a/workspace-new": {
+                    "account_uuid": "account-a",
+                    "workspace_uuid": "workspace-new",
+                    "present": True,
+                    "missing_scans": 0,
+                    "mtime_ns": 20,
+                },
+            },
+        }
+        hard_tombstone = {
+            "state": app.DESKTOP_STATE_DELETED,
+            "state_changed_at_ns": 40,
+            "replicas": {
+                "account-a/workspace-old": {
+                    "account_uuid": "account-a",
+                    "workspace_uuid": "workspace-old",
+                    "present": False,
+                    "missing_scans": 2,
+                    "mtime_ns": 10,
+                },
+                "account-b/workspace-old": {
+                    "account_uuid": "account-b",
+                    "workspace_uuid": "workspace-old",
+                    "present": True,
+                    "missing_scans": 0,
+                    "mtime_ns": 20,
+                },
+            },
+        }
+        state = {
+            "roots": {
+                "legacy-windows": {
+                    "sessions": {
+                        moved_session: active,
+                        deleted_session: active,
+                    }
+                },
+                "legacy-wsl": {
+                    "sessions": {
+                        moved_session: moved_tombstone,
+                        deleted_session: hard_tombstone,
+                    }
+                },
+            }
+        }
+
+        with (
+            patch.object(app, "desktop_sync_root_key", return_value="canonical"),
+            patch.object(
+                app,
+                "desktop_legacy_sync_root_keys",
+                return_value=["legacy-windows", "legacy-wsl"],
+            ),
+        ):
+            migrated = app.desktop_sync_root_state(state, Path("unused"))
+
+        self.assertEqual(set(state["roots"]), {"canonical"})
+        self.assertEqual(migrated["sessions"][moved_session]["state"], app.DESKTOP_STATE_ACTIVE)
+        self.assertEqual(migrated["sessions"][moved_session]["replicas"], {})
+        self.assertEqual(migrated["sessions"][deleted_session]["state"], app.DESKTOP_STATE_DELETED)
+
+    def test_stale_unrelated_root_tombstone_is_not_globally_applied(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, app_root, _, _ = self._claude_fixture(root)
+            session_id = "30303030-3030-4030-8030-303030303030"
+            app.save_desktop_sync_state(
+                paths,
+                {
+                    "version": app.DESKTOP_SYNC_STATE_VERSION,
+                    "roots": {
+                        app.desktop_sync_root_key(app_root): {
+                            "sessions": {session_id: {"state": app.DESKTOP_STATE_ACTIVE}}
+                        },
+                        "unrelated-stale-root": {
+                            "sessions": {session_id: {"state": app.DESKTOP_STATE_DELETED}}
+                        },
+                    },
+                },
+            )
+
+            self.assertNotIn(session_id, app.desktop_tombstoned_session_ids(paths))
 
     def test_claude_archive_propagates_from_account_a_to_b(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -296,6 +506,32 @@ class AccountSyncTests(unittest.TestCase):
                 for chat in app.discover_claude_chats(paths, sync_desktop_accounts=False)
             }
             self.assertNotIn(session_id, visible_ids)
+
+    def test_claude_workspace_relocation_is_not_treated_as_chat_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, _, account_a, _ = self._claude_fixture(root)
+            session_id = "31313131-3131-4131-8131-313131313131"
+            source = self._write_claude_session(account_a / "local_shared.json", session_id, root)
+            self._write_transcript(paths, session_id, root)
+            app.sync_claude_desktop_accounts(paths)
+            relocated_dir = account_a.parent / "workspace-new"
+            relocated_dir.mkdir()
+            relocated = relocated_dir / source.name
+            source.rename(relocated)
+
+            first = app.sync_claude_desktop_accounts(paths)
+            second = app.sync_claude_desktop_accounts(paths)
+
+            self.assertEqual(first["pending_deletions"], 0)
+            self.assertEqual(second["deleted"], 0)
+            records = [
+                record
+                for record in app.desktop_session_records(paths)
+                if app.desktop_record_cli_session_id(record) == session_id
+            ]
+            self.assertEqual({record.account_uuid for record in records}, {"account-a", "account-b"})
+            self.assertNotIn(session_id, app.desktop_tombstoned_session_ids(paths))
 
     def test_claude_corrupt_journal_blocks_sync_without_recreating_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -473,6 +709,226 @@ class AccountSyncTests(unittest.TestCase):
 
             self.assertIsNone(app.active_desktop_account_uuid(app_root))
             self.assertNotEqual(signature_before_logout, app.claude_desktop_change_signature(paths))
+
+    def test_claude_runtime_evidence_supersedes_an_old_logout_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            account = "11111111-1111-4111-8111-111111111111"
+            organization = "22222222-2222-4222-8222-222222222222"
+            _, app_root, _, _ = self._claude_fixture(root, active_account=account)
+            logs = app_root / "logs"
+            logs.mkdir()
+            (logs / "main.log").write_text(
+                "2026-07-17 12:52:38 [sessions-bridge] account-change reevaluate: "
+                f"{organization}:{account} -> <none>\n"
+                "2026-07-17 19:55:09 [info] [CCD] Using skills plugin at: "
+                f"C:\\Claude\\local-agent-mode-sessions\\skills-plugin\\{organization}\\{account}\n",
+                encoding="utf-8",
+            )
+
+            context = app.active_desktop_account_context(app_root)
+
+            self.assertFalse(context.logged_out)
+            self.assertEqual(context.account_uuid, account)
+            self.assertEqual(context.organization_uuid, organization)
+
+    def test_claude_oauth_session_cache_refreshes_when_credentials_change(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, app_root, _, _ = self._claude_fixture(root)
+            profile = {
+                "account_uuid": "account-a",
+                "organization_uuid": "organization-a",
+                "email": "account-a@example.com",
+            }
+            tokens = [{"token": "token-a", "cacheKey": "cache-a"}]
+
+            with (
+                patch.object(app, "claude_local_oauth_tokens", return_value=tokens) as token_reader,
+                patch.object(app, "claude_oauth_profile", return_value=profile) as profile_reader,
+            ):
+                first = app.claude_oauth_sessions(paths)
+                second = app.claude_oauth_sessions(paths)
+                config = app_root / "config.json"
+                previous_mtime = config.stat().st_mtime_ns
+                config.write_text('{"lastKnownAccountUuid":"account-a","changed":true}', encoding="utf-8")
+                changed_mtime = max(time.time_ns(), previous_mtime + 10_000_000)
+                os.utime(config, ns=(changed_mtime, changed_mtime))
+                third = app.claude_oauth_sessions(paths)
+
+            self.assertEqual(first, second)
+            self.assertEqual(second, third)
+            self.assertEqual(token_reader.call_count, 2)
+            self.assertEqual(profile_reader.call_count, 2)
+
+    def test_claude_desktop_oauth_cache_is_read_through_hidden_powershell_in_wsl(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            _, app_root, _, _ = self._claude_fixture(root)
+            (app_root / "Local State").write_text("{}", encoding="utf-8")
+            completed = app.subprocess.CompletedProcess(
+                args=["powershell.exe"],
+                returncode=0,
+                stdout='[{"token":"test-token","cacheKey":"test-cache"}]',
+                stderr="",
+            )
+
+            with (
+                patch.object(app, "is_wsl", return_value=True),
+                patch.object(app, "local_to_windows_path", return_value=r"C:\Claude") as convert,
+                patch.object(app.shutil, "which", side_effect=lambda name: "pwsh.exe" if name == "pwsh.exe" else None),
+                patch.object(app, "local_powershell_hidden_command", return_value=["pwsh.exe"]) as hidden,
+                patch.object(app.subprocess, "run", return_value=completed) as run,
+            ):
+                tokens = app.claude_desktop_cached_oauth_tokens(app_root)
+
+            self.assertEqual(tokens, [{"token": "test-token", "cacheKey": "test-cache"}])
+            convert.assert_called_once_with(app_root)
+            hidden.assert_called_once()
+            self.assertEqual(hidden.call_args.kwargs["powershell"], "pwsh.exe")
+            self.assertIn(r"$root = 'C:\Claude'", hidden.call_args.args[0])
+            self.assertEqual(run.call_args.args[0], ["pwsh.exe"])
+
+    def test_claude_code_artifact_gets_a_private_account_copy_and_transcript_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, _, account_a_dir, account_b_dir = self._claude_fixture(root)
+            session_id = "99999999-9999-4999-8999-999999999999"
+            artifact_slug = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+            target_slug = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb"
+            source_file = root / "artifact.html"
+            source_file.write_text("<main>private artifact</main>", encoding="utf-8")
+            source_transcript = self._write_artifact_transcript(
+                paths,
+                session_id,
+                root,
+                source_file,
+                artifact_slug,
+            )
+            source_metadata = self._write_claude_session(
+                account_a_dir / "local_source.json",
+                session_id,
+                root,
+            )
+            target_metadata = self._write_claude_session(
+                account_b_dir / "local_target.json",
+                session_id,
+                root,
+            )
+            oauth_sessions = {
+                "account-a": {
+                    "account_uuid": "account-a",
+                    "organization_uuid": "org-a",
+                    "email": "a@example.test",
+                    "token": "token-a",
+                },
+                "account-b": {
+                    "account_uuid": "account-b",
+                    "organization_uuid": "org-b",
+                    "email": "b@example.test",
+                    "token": "token-b",
+                },
+            }
+
+            def frame_rows(token: str) -> list[dict[str, object]]:
+                if token == "token-a":
+                    return [
+                        {
+                            "slug": artifact_slug,
+                            "owner_account": "account-a",
+                            "rel": "mine",
+                        }
+                    ]
+                return []
+
+            with (
+                patch.object(app, "claude_oauth_sessions", return_value=oauth_sessions),
+                patch.object(app, "claude_frame_rows", side_effect=frame_rows),
+                patch.object(
+                    app,
+                    "deploy_claude_frame_copy",
+                    return_value={"slug": target_slug, "version": "1"},
+                ) as deploy,
+            ):
+                result = app.sync_claude_desktop_accounts(paths)
+
+            state = app.load_desktop_sync_state(paths)
+            root_state = next(iter(state["roots"].values()))
+            replica_id = root_state["code_artifact_session_replicas"][session_id]["account-b"]
+            replica_transcript = source_transcript.with_name(f"{replica_id}.jsonl")
+            replica_text = replica_transcript.read_text(encoding="utf-8")
+            cache_path = paths.state_dir / "claude-code-artifacts" / artifact_slug / "index.html"
+
+            self.assertEqual(result["code_artifact_copies_created"], 1)
+            self.assertEqual(result["code_artifact_pending_accounts"], 0)
+            self.assertEqual(result["code_artifact_errors"], [])
+            self.assertTrue(replica_transcript.exists())
+            self.assertIn(f"https://claude.ai/code/artifact/{target_slug}", replica_text)
+            self.assertNotIn(f"https://claude.ai/code/artifact/{artifact_slug}", replica_text)
+            self.assertIn(f'"sessionId":"{replica_id}"', replica_text)
+            self.assertEqual(
+                root_state["code_artifact_aliases"][replica_id]["transcript_path"],
+                app.canonical_windows_path(replica_transcript),
+            )
+            self.assertEqual(
+                root_state["code_artifacts"][artifact_slug]["cache_path"],
+                app.canonical_windows_path(cache_path),
+            )
+            self.assertEqual(self._read(source_metadata)["cliSessionId"], session_id)
+            self.assertEqual(self._read(target_metadata)["cliSessionId"], replica_id)
+            self.assertIn(f"https://claude.ai/code/artifact/{artifact_slug}", source_transcript.read_text())
+            self.assertEqual(
+                [chat.session_id for chat in app.discover_chats(paths.claude_home, {replica_id})],
+                [session_id],
+            )
+            deploy.assert_called_once()
+
+    def test_artifact_transcript_replica_without_link_timestamp_is_idempotent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "source.jsonl"
+            destination = root / "replica.jsonl"
+            source.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": "source-session",
+                        "timestamp": "2026-07-17T20:15:00Z",
+                        "message": {"role": "user", "content": "continue"},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            links = [
+                {
+                    "frame_url": "https://claude.ai/code/artifact/copied",
+                    "title": "Copy",
+                    "path": "/mnt/c/Users/Example/.claude-vscode-queue/artifact/index.html",
+                }
+            ]
+
+            first = app.write_claude_artifact_transcript_replica(
+                source,
+                destination,
+                "source-session",
+                "replica-session",
+                {},
+                links,
+            )
+            links[0]["path"] = r"C:\Users\Example\.claude-vscode-queue\artifact\index.html"
+            second = app.write_claude_artifact_transcript_replica(
+                source,
+                destination,
+                "source-session",
+                "replica-session",
+                {},
+                links,
+            )
+
+            self.assertTrue(first)
+            self.assertFalse(second)
+            self.assertIn('"timestamp":"2026-07-17T20:15:00Z"', destination.read_text(encoding="utf-8"))
 
     def test_claude_artifacts_sync_session_links_and_propagate_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1271,7 +1727,7 @@ class AccountSyncTests(unittest.TestCase):
             self.assertTrue(started["running"])
             self.assertFalse(stopped["running"])
 
-    def test_web_account_sync_monitor_starts_fast_before_full_scan_interval(self) -> None:
+    def test_web_account_sync_monitor_starts_with_full_scan_then_uses_fast_scans(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = self._paths(Path(tmp))
             state = web.WebState(paths, None, None)
@@ -1289,7 +1745,7 @@ class AccountSyncTests(unittest.TestCase):
                 self.assertTrue(observed.wait(timeout=3))
                 state.stop_account_sync_monitor()
 
-            self.assertEqual(scans[:2], [False, False])
+            self.assertEqual(scans[:2], [True, False])
 
     def test_web_account_sync_monitor_wakes_when_desktop_sessions_change(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

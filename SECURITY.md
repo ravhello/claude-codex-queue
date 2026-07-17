@@ -41,8 +41,17 @@ overrides are removed from the child process so the official CLI uses its local
 ChatGPT authentication. Authentication files are only used to derive a hashed,
 masked account identity and are never copied into queue state or logs.
 
-`desktop-sync-state.json` contains replica paths, lifecycle state and durable
-deletion tombstones, but no transcript contents or credentials. Claude metadata
+Claude Code artifact replication may decrypt Claude Desktop's current-user OAuth
+cache in a consoleless child process. Each token is verified against
+`/api/oauth/profile`, used only in memory for Claude's frame API and never stored
+in state, backups or logs. Verified sessions may remain in process memory until
+the next full check; credential-file changes invalidate them immediately. A
+profile mismatch blocks the operation.
+
+`desktop-sync-state.json` contains replica paths, artifact mappings, lifecycle
+state and durable deletion tombstones, but no transcript contents or
+credentials. Rendered Claude Code artifact content is cached separately under
+the local application state directory and must be treated as private. Claude metadata
 changed by replication is copied to `account-transfer-backups/` before it is
 overwritten or removed. Treat those backups as private because titles and local
 working-directory paths may be present.
