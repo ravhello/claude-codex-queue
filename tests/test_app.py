@@ -40,7 +40,7 @@ class QueueAppTests(unittest.TestCase):
         self.assertNotIn("Promise.allSettled([doctorTask, chatsTask])", web.HTML)
 
     def test_public_version_and_legacy_state_compatibility(self) -> None:
-        self.assertEqual(claude_codex_queue.__version__, "0.2.5")
+        self.assertEqual(claude_codex_queue.__version__, "0.2.6")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             legacy = root / app.LEGACY_APP_DIR_NAME

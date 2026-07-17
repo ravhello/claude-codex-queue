@@ -273,6 +273,44 @@ class WebState:
             ]
         return sorted(claude_chats + codex_chats, key=app.chat_sort_key, reverse=True)
 
+    def merge_cached_and_quick_chats(
+        self,
+        cached: list[app.Chat],
+        quick: list[app.Chat],
+    ) -> list[app.Chat]:
+        try:
+            tombstones = app.desktop_tombstoned_session_ids(self.paths)
+        except app.StateFileError:
+            tombstones = set()
+        cached_claude = [
+            chat
+            for chat in cached
+            if chat.provider == app.PROVIDER_CLAUDE and chat.session_id not in tombstones
+        ]
+        quick_claude = [
+            chat
+            for chat in quick
+            if chat.provider == app.PROVIDER_CLAUDE and chat.session_id not in tombstones
+        ]
+        merged_claude = app.merge_claude_chat_sources(cached_claude, quick_claude)
+        codex_by_session = {
+            chat.session_id: chat
+            for chat in cached
+            if chat.provider == app.PROVIDER_CODEX
+        }
+        codex_by_session.update(
+            {
+                chat.session_id: chat
+                for chat in quick
+                if chat.provider == app.PROVIDER_CODEX
+            }
+        )
+        return sorted(
+            merged_claude + list(codex_by_session.values()),
+            key=app.chat_sort_key,
+            reverse=True,
+        )
+
     def refresh_chats_background(self) -> None:
         now = time.monotonic()
         started_signature = app.claude_desktop_change_signature(self.paths)
@@ -300,7 +338,6 @@ class WebState:
                 if finished_signature != started_signature:
                     self._chats_generation += 1
                     self._chats_desktop_signature = finished_signature
-                    self._chats_cache = []
                     self._chats_cache_at = 0.0
                     retry = True
                 elif chats:
@@ -321,9 +358,6 @@ class WebState:
                 signature_changed = True
                 self._chats_generation += 1
                 self._chats_desktop_signature = signature
-                self._chats_cache = [
-                    chat for chat in self._chats_cache if chat.provider == app.PROVIDER_CODEX
-                ]
                 self._chats_cache_at = 0.0
                 self._chats_refreshing = False
                 self._chats_refresh_started_at = 0.0
@@ -336,7 +370,21 @@ class WebState:
                 return list(self._chats_cache)
             cached = list(self._chats_cache)
             refreshing = self._chats_refreshing
-        if cached and not signature_changed:
+            cache_invalidated = bool(cached) and self._chats_cache_at <= 0.0
+        if cached:
+            quick_merged = False
+            if signature_changed or cache_invalidated:
+                try:
+                    quick = self.quick_chats()
+                    cached = self.merge_cached_and_quick_chats(cached, quick)
+                    quick_merged = True
+                except Exception:
+                    pass
+                with self.lock:
+                    if generation == self._chats_generation:
+                        self._chats_cache = cached
+                        if quick_merged:
+                            self._chats_cache_at = now
             if not refreshing:
                 self.refresh_chats_background()
             return cached
@@ -360,7 +408,6 @@ class WebState:
         with self.lock:
             self._chats_generation += 1
             self._chats_desktop_signature = signature
-            self._chats_cache = []
             self._chats_cache_at = 0.0
             self._chats_refreshing = False
             self._chats_refresh_started_at = 0.0

@@ -1013,24 +1013,81 @@ class AccountSyncTests(unittest.TestCase):
             self.assertTrue(any(chat.session_id == codex_session for chat in codex_chats))
             self.assertTrue(any(account_b.glob("*.json")))
 
-    def test_web_chat_cache_refreshes_immediately_when_claude_account_changes(self) -> None:
+    def test_web_chat_cache_keeps_complete_list_and_adds_new_account_chats(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = self._paths(Path(tmp))
             state = web.WebState(paths, None, None)
-            old_chat = SimpleNamespace(provider=app.PROVIDER_CLAUDE)
-            new_chat = SimpleNamespace(provider=app.PROVIDER_CLAUDE)
-            state._chats_cache = [old_chat]  # type: ignore[list-item]
+            old_chat = app.Chat(
+                session_id="old-session",
+                title="Old",
+                cwd=str(paths.windows_home),
+                permission_mode=None,
+                model="opus",
+                jsonl_path=paths.claude_home / "old-session.jsonl",
+                last_timestamp="2026-07-17T10:00:00Z",
+                message_count=10,
+                last_prompt="old prompt",
+                last_user_message="old preview",
+            )
+            new_chat = app.Chat(
+                session_id="new-session",
+                title="New",
+                cwd=str(paths.windows_home),
+                permission_mode=None,
+                model="opus",
+                jsonl_path=paths.claude_home / "new-session.jsonl",
+                last_timestamp="2026-07-17T11:00:00Z",
+                message_count=1,
+                last_prompt=None,
+                source="Claude Windows App",
+                source_key="claude_windows_app",
+            )
+            state._chats_cache = [old_chat]
             state._chats_cache_at = time.monotonic()
 
             with (
                 patch.object(app, "claude_desktop_change_signature", return_value=("new-account",)),
-                patch.object(state, "quick_chats", return_value=[new_chat]),  # type: ignore[list-item]
+                patch.object(app, "desktop_tombstoned_session_ids", return_value=set()),
+                patch.object(state, "quick_chats", return_value=[new_chat]),
                 patch.object(state, "refresh_chats_background") as refresh,
             ):
                 chats = state.chats()
 
-            self.assertEqual(chats, [new_chat])
+            self.assertEqual([chat.session_id for chat in chats], ["new-session", "old-session"])
+            self.assertEqual(chats[1].last_user_message, "old preview")
             refresh.assert_called_once()
+
+    def test_web_chat_cache_removes_confirmed_tombstones_without_dropping_other_chats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            state = web.WebState(paths, None, None)
+            chats = [
+                app.Chat(
+                    session_id=session_id,
+                    title=session_id,
+                    cwd=str(paths.windows_home),
+                    permission_mode=None,
+                    model=None,
+                    jsonl_path=paths.claude_home / f"{session_id}.jsonl",
+                    last_timestamp=f"2026-07-17T1{index}:00:00Z",
+                    message_count=1,
+                    last_prompt=session_id,
+                )
+                for index, session_id in enumerate(("deleted", "retained"))
+            ]
+            state._chats_cache = chats
+            state._chats_desktop_signature = ("stable",)
+
+            with (
+                patch.object(app, "claude_desktop_change_signature", return_value=("stable",)),
+                patch.object(app, "desktop_tombstoned_session_ids", return_value={"deleted"}),
+                patch.object(state, "quick_chats", return_value=[]),
+                patch.object(state, "refresh_chats_background"),
+            ):
+                state.invalidate_chats()
+                merged = state.chats()
+
+            self.assertEqual([chat.session_id for chat in merged], ["retained"])
 
     def test_account_identity_is_stable_when_email_claim_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1645,6 +1702,8 @@ class AccountSyncTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             paths = self._paths(Path(tmp))
             state = web.WebState(paths, None, None)
+            cached_chat = SimpleNamespace(session_id="cached")
+            state._chats_cache = [cached_chat]  # type: ignore[list-item]
             state._chats_cache_at = 123.0
 
             with (
@@ -1660,6 +1719,7 @@ class AccountSyncTests(unittest.TestCase):
             self.assertTrue(result["changed"])
             self.assertFalse(result["errors"])
             self.assertEqual(state._chats_cache_at, 0.0)
+            self.assertEqual(state._chats_cache, [cached_chat])
             status = state.account_sync_status()
             self.assertIsNotNone(status["last_check_at"])
             self.assertIsNotNone(status["last_full_check_at"])

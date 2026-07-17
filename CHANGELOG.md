@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+## 0.2.6 - 2026-07-18
+
+- Kept the last complete Claude and Codex chat list visible while account changes trigger a background refresh, merged newly discovered chats immediately and removed only confirmed Claude tombstones.
+
 ## 0.2.5 - 2026-07-18
 
 - Added private Claude Code artifact replication: each Claude account receives its own server-side artifact and an account-specific derived transcript while the provider transcript remains unchanged.

@@ -95,6 +95,9 @@ The web process owns a ten-second account lifecycle monitor. It invokes both
 provider synchronizers independently of browser polling and invalidates the
 chat cache whenever a replica changes. Its first cycle is a complete transcript
 and artifact scan; subsequent fast metadata checks run between minute scans.
+The web cache keeps the last complete provider union visible during invalidation,
+merges newly discovered metadata rows immediately and replaces the union only
+after a stable background discovery finishes.
 Unchanged session JSON and parsed account logs are reused in process memory;
 file timestamps, sizes and credential signatures invalidate those caches.
 Discovery and lifecycle replication are filesystem operations and do not depend
