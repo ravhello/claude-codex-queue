@@ -308,6 +308,8 @@ class Chat:
     account_label: str | None = None
     account_status: str = "unknown"
     account_copies: tuple[str, ...] = ()
+    logical_session_id: str | None = None
+    session_aliases: tuple[str, ...] = ()
     provider: str = PROVIDER_CLAUDE
     sandbox_mode: str | None = None
     approval_policy: str | None = None
@@ -4373,6 +4375,71 @@ def refresh_desktop_sync_snapshots(
             sessions[session_id] = entry
 
 
+def desktop_replica_inventory(
+    root_state: dict[str, Any],
+    records: list[DesktopSessionRecord],
+    account_uuids: set[str],
+) -> dict[str, Any]:
+    sessions = root_state.get("sessions") if isinstance(root_state.get("sessions"), dict) else {}
+    by_account: dict[str, dict[str, list[DesktopSessionRecord]]] = {
+        account_uuid: {} for account_uuid in account_uuids
+    }
+    logical_session_ids: set[str] = set()
+    for record in records:
+        raw_session_id = desktop_record_cli_session_id(record)
+        if not raw_session_id:
+            continue
+        session_id = desktop_logical_session_id(root_state, raw_session_id)
+        entry = sessions.get(session_id) if isinstance(sessions.get(session_id), dict) else {}
+        if entry.get("state") == DESKTOP_STATE_DELETED:
+            continue
+        logical_session_ids.add(session_id)
+        by_account.setdefault(record.account_uuid, {}).setdefault(session_id, []).append(record)
+
+    missing: list[dict[str, str]] = []
+    duplicates: list[dict[str, Any]] = []
+    counts: dict[str, int] = {}
+    for account_uuid in sorted(by_account):
+        account_sessions = by_account[account_uuid]
+        counts[short_hash(account_uuid) or account_uuid[:8]] = len(account_sessions)
+        for session_id in sorted(logical_session_ids):
+            entry = sessions.get(session_id) if isinstance(sessions.get(session_id), dict) else {}
+            replicas = entry.get("replicas") if isinstance(entry.get("replicas"), dict) else {}
+            excluded = any(
+                isinstance(snapshot, dict)
+                and snapshot.get("account_uuid") == account_uuid
+                and snapshot.get("excluded") is True
+                for snapshot in replicas.values()
+            )
+            copies = account_sessions.get(session_id, [])
+            if not copies and not excluded:
+                missing.append(
+                    {
+                        "account": short_hash(account_uuid) or account_uuid[:8],
+                        "session_id": session_id,
+                    }
+                )
+            elif len(copies) > 1:
+                duplicates.append(
+                    {
+                        "account": short_hash(account_uuid) or account_uuid[:8],
+                        "session_id": session_id,
+                        "copies": len(copies),
+                    }
+                )
+
+    digest_payload = "\n".join(sorted(logical_session_ids)).encode("utf-8")
+    return {
+        "accounts": len(by_account),
+        "logical_sessions": len(logical_session_ids),
+        "digest": hashlib.sha256(digest_payload).hexdigest(),
+        "counts": counts,
+        "missing": missing,
+        "duplicates": duplicates,
+        "consistent": not missing and not duplicates,
+    }
+
+
 def suppress_desktop_replica(paths: Paths, record: DesktopSessionRecord) -> None:
     with desktop_sync_lock(paths):
         state = load_desktop_sync_state(paths)
@@ -4424,6 +4491,7 @@ def sync_claude_desktop_accounts(
         "transcripts_created": 0,
         "updated": 0,
         "repaired": 0,
+        "path_reuses_repaired": 0,
         "deduped": 0,
         "archived": 0,
         "unarchived": 0,
@@ -4446,6 +4514,9 @@ def sync_claude_desktop_accounts(
         "code_artifact_transcripts_created": 0,
         "code_artifact_pending_accounts": 0,
         "code_artifact_errors": [],
+        "inventory_consistent": True,
+        "inventory_errors": [],
+        "inventories": [],
         "transcripts_scanned": include_transcripts,
     }
 
@@ -4558,11 +4629,13 @@ def sync_claude_desktop_accounts(
             }
 
             records_by_session: dict[str, list[DesktopSessionRecord]] = {}
+            record_session_by_path: dict[Path, str] = {}
             for record in root_records:
                 session_id = desktop_record_cli_session_id(record)
                 if session_id:
                     session_id = desktop_logical_session_id(root_state, session_id)
                     records_by_session.setdefault(session_id, []).append(record)
+                    record_session_by_path[record.path] = session_id
 
             # Keep one metadata file per logical session/account workspace. Every removal is backed up.
             for session_id, session_records in records_by_session.items():
@@ -4662,6 +4735,17 @@ def sync_claude_desktop_accounts(
                             continue
                         relative_path = previous.get("path")
                         previous_path = sessions_root / str(relative_path) if isinstance(relative_path, str) else None
+                        reused_by_session = record_session_by_path.get(previous_path) if previous_path is not None else None
+                        if reused_by_session is not None and reused_by_session != session_id:
+                            # Claude can reuse a metadata filename for another chat after an
+                            # account switch. The old replica is missing, not unreadable or deleted.
+                            previous["missing_scans"] = 0
+                            previous["present"] = False
+                            previous["scan_blocked"] = False
+                            previous["path_reused_by"] = reused_by_session
+                            result["repaired"] += 1
+                            result["path_reuses_repaired"] += 1
+                            continue
                         parent_readable = previous_path is not None and previous_path.parent.is_dir()
                         file_is_really_missing = previous_path is not None and not previous_path.exists()
                         if parent_readable and file_is_really_missing:
@@ -4883,6 +4967,27 @@ def sync_claude_desktop_accounts(
             )
 
         refresh_desktop_sync_snapshots(paths, state, current_records, roots)
+        for root, account_uuids, _, root_state in artifact_jobs:
+            inventory = desktop_replica_inventory(
+                root_state,
+                current_records_by_root.get(root, []),
+                account_uuids,
+            )
+            result["inventories"].append(inventory)
+            if inventory["consistent"]:
+                continue
+            result["inventory_consistent"] = False
+            for missing in inventory["missing"]:
+                result["inventory_errors"].append(
+                    "Account Claude "
+                    f"{missing['account']}: sessione {missing['session_id'][:8]} assente dopo la sincronizzazione."
+                )
+            for duplicate in inventory["duplicates"]:
+                result["inventory_errors"].append(
+                    "Account Claude "
+                    f"{duplicate['account']}: sessione {duplicate['session_id'][:8]} presente "
+                    f"{duplicate['copies']} volte dopo la deduplicazione."
+                )
         save_desktop_sync_state(paths, state)
     return result
 
@@ -5726,6 +5831,73 @@ def merge_claude_chat_sources(local_chats: list[Chat], vscode_chats: list[Chat])
     return sorted(by_session.values(), key=chat_sort_key, reverse=True)
 
 
+def merge_codex_linked_chats(paths: Paths, chats: list[Chat]) -> list[Chat]:
+    index = load_account_index(paths)
+    links = index.get("codex_links") if isinstance(index.get("codex_links"), dict) else {}
+    if not links:
+        return sorted(chats, key=chat_sort_key, reverse=True)
+
+    by_session = {chat.session_id: chat for chat in chats}
+    consumed: set[str] = set()
+    merged: list[Chat] = []
+    for group_id, group in links.items():
+        if not isinstance(group, dict):
+            continue
+        threads = group.get("threads") if isinstance(group.get("threads"), dict) else {}
+        linked_ids = tuple(
+            session_id
+            for session_id in threads
+            if isinstance(session_id, str) and session_id
+        )
+        if group.get("state") == DESKTOP_STATE_DELETED:
+            consumed.update(linked_ids)
+            continue
+        linked_chats = [by_session[session_id] for session_id in linked_ids if session_id in by_session]
+        if not linked_chats:
+            continue
+
+        active = [chat for chat in linked_chats if chat.account_status == "active"]
+        usable = [chat for chat in active if chat.can_queue and not chat.archived]
+        preferred = max(usable or active or linked_chats, key=chat_sort_key)
+        newest = max(linked_chats, key=chat_sort_key)
+        aliases: list[str] = []
+        for session_id in linked_ids:
+            if session_id != preferred.session_id and session_id not in aliases:
+                aliases.append(session_id)
+        for linked_chat in linked_chats:
+            for alias in linked_chat.session_aliases:
+                if alias != preferred.session_id and alias not in aliases:
+                    aliases.append(alias)
+        logical_session_id = group.get("source_session_id")
+        if not isinstance(logical_session_id, str) or not logical_session_id:
+            logical_session_id = str(group_id)
+        last_message_chat = next(
+            (
+                candidate
+                for candidate in sorted(linked_chats, key=chat_sort_key, reverse=True)
+                if candidate.last_user_message or candidate.last_prompt
+            ),
+            newest,
+        )
+        merged.append(
+            dataclasses.replace(
+                preferred,
+                title=newest.title or preferred.title,
+                last_timestamp=newest.last_timestamp or preferred.last_timestamp,
+                message_count=max(chat.message_count for chat in linked_chats),
+                last_prompt=last_message_chat.last_prompt,
+                last_user_message=last_message_chat.last_user_message,
+                account_copies=merged_chat_account_copies(*linked_chats),
+                logical_session_id=logical_session_id,
+                session_aliases=tuple(aliases),
+            )
+        )
+        consumed.update(linked_ids)
+
+    merged.extend(chat for chat in chats if chat.session_id not in consumed)
+    return sorted(merged, key=chat_sort_key, reverse=True)
+
+
 def _annotate_chats_with_accounts_unlocked(paths: Paths, chats: list[Chat]) -> list[Chat]:
     index = load_account_index(paths)
     active = register_active_account(paths, index)
@@ -5895,7 +6067,10 @@ def discover_agent_chats(
     active_desktop_only: bool = False,
 ) -> list[Chat]:
     claude_chats = discover_claude_chats(paths, sync_desktop_accounts, active_desktop_only)
-    codex_chats = annotate_codex_chats_with_accounts(paths, discover_codex_app_sessions(paths))
+    codex_chats = merge_codex_linked_chats(
+        paths,
+        annotate_codex_chats_with_accounts(paths, discover_codex_app_sessions(paths)),
+    )
     return sorted(claude_chats + codex_chats, key=chat_sort_key, reverse=True)
 
 
@@ -6076,7 +6251,8 @@ def codex_settings_fingerprint(paths: Paths, chat: Chat) -> dict[str, Any]:
     return {
         "created_at": now_utc(),
         "provider": PROVIDER_CODEX,
-        "session_id": chat.session_id,
+        "session_id": chat.logical_session_id or chat.session_id,
+        "physical_session_id": chat.session_id,
         "cwd": chat.cwd,
         "jsonl_path": str(chat.jsonl_path),
         "account": {
@@ -7870,7 +8046,11 @@ def complete_recovery(queue: dict[str, Any], recovery: dict[str, Any]) -> None:
 
 def find_chat_by_session(chats: list[Chat], session_id: str) -> Chat | None:
     for chat in chats:
-        if chat.session_id == session_id:
+        if (
+            chat.session_id == session_id
+            or chat.logical_session_id == session_id
+            or session_id in chat.session_aliases
+        ):
             return chat
     return None
 
@@ -7893,7 +8073,11 @@ def find_chat_for_item(chats: list[Chat], item: dict[str, Any]) -> Chat | None:
     remote_cwd = item.get("remote_cwd")
     if remote_kind or remote_host or remote_cwd:
         for chat in chats:
-            if chat.session_id != session_id or chat.provider != provider:
+            if (
+                chat.provider != provider
+                or session_id
+                not in {chat.session_id, chat.logical_session_id, *chat.session_aliases}
+            ):
                 continue
             if (
                 same_optional_text(chat.remote_kind, remote_kind)
@@ -7903,7 +8087,10 @@ def find_chat_for_item(chats: list[Chat], item: dict[str, Any]) -> Chat | None:
                 return chat
         return None
     for chat in chats:
-        if chat.session_id == session_id and chat.provider == provider:
+        if (
+            chat.provider == provider
+            and session_id in {chat.session_id, chat.logical_session_id, *chat.session_aliases}
+        ):
             return chat
     return None
 

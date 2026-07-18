@@ -289,7 +289,7 @@ reproducible defects belong in
 
 ## Project status
 
-Current release: **v0.2.7**. The project is alpha software tested on Windows/WSL
+Current release: **v0.2.8**. The project is alpha software tested on Windows/WSL
 with local Claude Code and Codex App workflows. Upstream desktop metadata is not
 a public compatibility contract and may change between provider releases.
 

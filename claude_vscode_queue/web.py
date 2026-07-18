@@ -44,10 +44,13 @@ def split_messages(raw: str) -> list[str]:
 
 def chat_to_dict(chat: app.Chat) -> dict[str, Any]:
     last_user_message = chat.last_user_message or chat.last_prompt
+    logical_session_id = chat.logical_session_id or chat.session_id
     return {
         "provider": chat.provider,
         "session_id": chat.session_id,
-        "short_id": chat.session_id[:8],
+        "logical_session_id": logical_session_id,
+        "session_aliases": list(chat.session_aliases),
+        "short_id": logical_session_id[:8],
         "title": chat.title,
         "cwd": chat.cwd,
         "permission_mode": chat.permission_mode,
@@ -498,6 +501,11 @@ class WebState:
             errors.extend(
                 app.public_error_message(error, "Replica artefatto Claude non riuscita.")
                 for error in claude.get("code_artifact_errors", [])
+                if error
+            )
+            errors.extend(
+                app.public_error_message(error, "Inventario account Claude non coerente.")
+                for error in claude.get("inventory_errors", [])
                 if error
             )
         except Exception as exc:
@@ -1585,12 +1593,23 @@ HTML = r"""<!doctype html>
       if (runner.log_tail) log(runner.log_tail);
     }
 
+    function chatMatchesSession(chat, sessionId) {
+      if (!chat || !sessionId) return false;
+      return chat.session_id === sessionId
+        || chat.logical_session_id === sessionId
+        || (Array.isArray(chat.session_aliases) && chat.session_aliases.includes(sessionId));
+    }
+
     function selectedChat() {
-      return state.chats.find((chat) => chat.session_id === state.selected) || null;
+      return state.chats.find((chat) => chatMatchesSession(chat, state.selected)) || null;
     }
 
     function autoContinueForSession(sessionId) {
-      return state.autoContinues.find((auto) => auto.session_id === sessionId) || null;
+      const chat = state.chats.find((candidate) => chatMatchesSession(candidate, sessionId));
+      const linkedIds = chat
+        ? [chat.session_id, chat.logical_session_id, ...(chat.session_aliases || [])].filter(Boolean)
+        : [sessionId];
+      return state.autoContinues.find((auto) => linkedIds.includes(auto.session_id)) || null;
     }
 
     function selectedAutoContinue() {
@@ -1839,7 +1858,7 @@ HTML = r"""<!doctype html>
           }, { root: list, rootMargin: "160px 0px" });
       let previewFallbackCount = 0;
       const chats = state.chats.filter((chat) => {
-        const hay = [chat.title, chat.cwd, chat.session_id, chat.last_prompt, chat.last_user_message, chat.source, chat.provider, ...(chat.account_copies || [])].join(" ").toLowerCase();
+        const hay = [chat.title, chat.cwd, chat.session_id, chat.logical_session_id, ...(chat.session_aliases || []), chat.last_prompt, chat.last_user_message, chat.source, chat.provider, ...(chat.account_copies || [])].join(" ").toLowerCase();
         return (!provider || chat.provider === provider) && hay.includes(filter);
       }).sort((a, b) => Date.parse(b.last_timestamp || 0) - Date.parse(a.last_timestamp || 0));
       list.innerHTML = "";
@@ -1853,7 +1872,7 @@ HTML = r"""<!doctype html>
       }
       for (const chat of chats) {
         const btn = document.createElement("button");
-        btn.className = "chat" + (state.selected === chat.session_id ? " active" : "") + (!chat.can_queue ? " view-only" : "");
+        btn.className = "chat" + (chatMatchesSession(chat, state.selected) ? " active" : "") + (!chat.can_queue ? " view-only" : "");
         const location = chat.remote_cwd ? `${chat.remote_host || "ssh"}:${chat.remote_cwd}` : (chat.cwd || "");
         const accountBadge = accountText(chat);
         const lastMessage = chat.last_user_message || chat.last_prompt || "";
@@ -1992,6 +2011,8 @@ HTML = r"""<!doctype html>
         const queueTask = api("/api/queue").then((queue) => renderQueue(queue));
         const chatsTask = api("/api/chats").then((chats) => {
           state.chats = hydrateChatPreviews(chats.chats || []);
+          const selected = state.chats.find((chat) => chatMatchesSession(chat, state.selected));
+          if (selected) state.selected = selected.session_id;
           renderChats();
         });
         const [queueResult, chatsResult] = await Promise.allSettled([queueTask, chatsTask]);
@@ -2008,7 +2029,7 @@ HTML = r"""<!doctype html>
 
     async function addMessages() {
       try {
-        const selected = state.chats.find((chat) => chat.session_id === state.selected);
+        const selected = selectedChat();
         if (selected && selected.account_status === "other") throw new Error("Questa chat/task appartiene a un altro account: cambia account o associala prima di inviare.");
         if (selected && !selected.can_queue) throw new Error("Questa chat/task e' solo visibile e non e' accodabile.");
         const result = await api("/api/add", {

@@ -612,6 +612,64 @@ class AccountSyncTests(unittest.TestCase):
             self.assertEqual(confirmed["deleted"], 1)
             self.assertFalse(replica.exists())
 
+    def test_claude_reused_metadata_path_preserves_identical_account_inventories(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, app_root, account_a, account_b = self._claude_fixture(root)
+            original_id = "39393939-3939-4939-8939-393939393939"
+            replacement_id = "40404040-4040-4040-8040-404040404040"
+            self._write_claude_session(account_a / "local_shared.json", original_id, root)
+
+            first = app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+            self.assertEqual(first["created"], 1)
+            self.assertTrue(first["inventory_consistent"])
+
+            # Claude reuses the same filename after an account switch, replacing
+            # the old logical chat with a new one in that account only.
+            self._write_claude_session(account_b / "local_shared.json", replacement_id, root)
+            repaired = app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+
+            self.assertEqual(repaired["path_reuses_repaired"], 1)
+            self.assertEqual(repaired["created"], 2)
+            self.assertTrue(repaired["inventory_consistent"])
+            self.assertEqual(repaired["inventory_errors"], [])
+            self.assertEqual(len(repaired["inventories"]), 1)
+            self.assertEqual(
+                sorted(repaired["inventories"][0]["counts"].values()),
+                [2, 2],
+            )
+
+            records = app.desktop_session_records(paths)
+            by_account: dict[str, list[str]] = {}
+            for record in records:
+                session_id = app.desktop_record_cli_session_id(record)
+                if session_id:
+                    by_account.setdefault(record.account_uuid, []).append(session_id)
+            expected = [original_id, replacement_id]
+            self.assertEqual(sorted(by_account["account-a"]), expected)
+            self.assertEqual(sorted(by_account["account-b"]), expected)
+
+            before_switch = {
+                chat.session_id
+                for chat in app.discover_claude_windows_app_sessions(paths, sync_accounts=False)
+            }
+            (app_root / "config.json").write_text(
+                json.dumps({"lastKnownAccountUuid": "account-b"}),
+                encoding="utf-8",
+            )
+            after_switch_sync = app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+            after_switch = {
+                chat.session_id
+                for chat in app.discover_claude_windows_app_sessions(paths, sync_accounts=False)
+            }
+
+            self.assertEqual(before_switch, set(expected))
+            self.assertEqual(after_switch, before_switch)
+            self.assertEqual(after_switch_sync["created"], 0)
+            self.assertEqual(after_switch_sync["deduped"], 0)
+            self.assertEqual(after_switch_sync["path_reuses_repaired"], 0)
+            self.assertTrue(after_switch_sync["inventory_consistent"])
+
     def test_claude_delete_from_non_active_account_still_propagates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1080,6 +1138,85 @@ class AccountSyncTests(unittest.TestCase):
             self.assertEqual([chat.session_id for chat in chats], ["new-session", "old-session"])
             self.assertEqual(chats[1].last_user_message, "old preview")
             refresh.assert_called_once()
+
+    def test_codex_linked_account_copies_are_one_logical_chat_after_account_switch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            source_id = "51515151-5151-4151-8151-515151515151"
+            replica_id = "52525252-5252-4252-8252-525252525252"
+            app.save_account_index(
+                paths,
+                {
+                    "version": 1,
+                    "accounts": {},
+                    "sessions": {},
+                    "codex_links": {
+                        "logical-group": {
+                            "provider": app.PROVIDER_CODEX,
+                            "source_session_id": source_id,
+                            "state": app.DESKTOP_STATE_ACTIVE,
+                            "threads": {
+                                source_id: {"account_key": "codex:a", "last_state": app.DESKTOP_STATE_ACTIVE},
+                                replica_id: {"account_key": "codex:b", "last_state": app.DESKTOP_STATE_ACTIVE},
+                            },
+                        }
+                    },
+                },
+            )
+            source = app.Chat(
+                session_id=source_id,
+                title="Shared Codex task",
+                cwd=str(paths.windows_home),
+                permission_mode="danger-full-access",
+                model="gpt-5",
+                jsonl_path=paths.codex_home / "source.jsonl",
+                last_timestamp="2026-07-18T01:00:00Z",
+                message_count=-1,
+                last_prompt="original prompt",
+                provider=app.PROVIDER_CODEX,
+                account_key="codex:a",
+                account_label="Account A",
+                account_status="active",
+                account_copies=("Account A",),
+                can_queue=True,
+            )
+            replica = app.dataclasses.replace(
+                source,
+                session_id=replica_id,
+                jsonl_path=paths.codex_home / "replica.jsonl",
+                account_key="codex:b",
+                account_label="Account B",
+                account_status="other",
+                account_copies=("Account B",),
+                can_queue=False,
+            )
+
+            account_a = app.merge_codex_linked_chats(paths, [source, replica])
+            account_b = app.merge_codex_linked_chats(
+                paths,
+                [
+                    app.dataclasses.replace(source, account_status="other", can_queue=False),
+                    app.dataclasses.replace(replica, account_status="active", can_queue=True),
+                ],
+            )
+
+            self.assertEqual(len(account_a), 1)
+            self.assertEqual(len(account_b), 1)
+            self.assertEqual(account_a[0].logical_session_id, source_id)
+            self.assertEqual(account_b[0].logical_session_id, source_id)
+            self.assertEqual(account_a[0].session_id, source_id)
+            self.assertEqual(account_b[0].session_id, replica_id)
+            self.assertEqual(set(account_a[0].account_copies), {"Account A", "Account B"})
+            self.assertEqual(set(account_b[0].account_copies), {"Account A", "Account B"})
+            self.assertIs(app.find_chat_by_session(account_b, source_id), account_b[0])
+            self.assertIs(app.find_chat_by_session(account_a, replica_id), account_a[0])
+            self.assertEqual(web.chat_to_dict(account_a[0])["short_id"], source_id[:8])
+            self.assertEqual(web.chat_to_dict(account_b[0])["short_id"], source_id[:8])
+
+            index = app.load_account_index(paths)
+            index["codex_links"]["logical-group"]["state"] = app.DESKTOP_STATE_DELETED
+            app.save_account_index(paths, index)
+            self.assertEqual(app.merge_codex_linked_chats(paths, [source, replica]), [])
 
     def test_web_chat_cache_removes_confirmed_tombstones_without_dropping_other_chats(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

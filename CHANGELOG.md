@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.8 - 2026-07-18
+
+- Detected when Claude reuses an account metadata filename for another session and restored the displaced logical chat to a unique path without treating it as deleted.
+- Audited every Claude account synchronization for exactly one physical copy of each non-excluded logical chat per account, with stable inventory counts and digests.
+- Kept Claude account switches idempotent: a completed synchronization followed by another switch creates, removes and deduplicates zero chat records.
+- Collapsed explicitly linked ChatGPT/Codex account copies into one logical task, selected the active account's runnable copy and retained aliases for the other physical thread IDs.
+
 ## 0.2.7 - 2026-07-18
 
 - Replaced inline WSL-to-Windows PowerShell `EncodedCommand` payloads with atomic, content-addressed scripts in the private state cache, keeping hidden CLI command lines short and stable.
