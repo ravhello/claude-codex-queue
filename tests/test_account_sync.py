@@ -292,6 +292,30 @@ class AccountSyncTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs["timeout"], 30)
             self.assertNotIn("EncodedCommand", version)
 
+    def test_web_account_sync_timeout_never_exposes_the_subprocess_command(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = web.WebState(self._paths(Path(tmp)), None, Path("codex.exe"))
+            error = web.subprocess.TimeoutExpired(
+                cmd=["powershell.exe", "-EncodedCommand", "secret-command" * 500],
+                timeout=30,
+            )
+
+            with patch.object(app, "sync_claude_desktop_accounts", return_value={}), patch.object(
+                app,
+                "sync_codex_linked_threads",
+                side_effect=error,
+            ):
+                result = state.sync_linked_accounts_once()
+
+            status = state.account_sync_status()
+            self.assertEqual(
+                status["last_error"],
+                "Codex: Operazione temporaneamente lenta; nuovo tentativo automatico.",
+            )
+            self.assertEqual(result["errors"], [status["last_error"]])
+            self.assertNotIn("EncodedCommand", json.dumps(status))
+            self.assertNotIn("secret-command", json.dumps(status))
+
     def test_desktop_root_state_migration_repairs_workspace_tombstone_only(self) -> None:
         moved_session = "10101010-1010-4010-8010-101010101010"
         deleted_session = "20202020-2020-4020-8020-202020202020"
@@ -1398,6 +1422,44 @@ class AccountSyncTests(unittest.TestCase):
             self.assertEqual(group["state"], app.DESKTOP_STATE_ARCHIVED)
             self.assertEqual(group["threads"][source_id]["last_state"], app.DESKTOP_STATE_ARCHIVED)
             self.assertEqual(group["threads"][destination_id]["last_state"], app.DESKTOP_STATE_ARCHIVED)
+
+    def test_codex_linked_timeout_stays_pending_without_a_raw_error(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            source_id = "13131313-8888-4888-8888-131313131313"
+            destination_id = "35353535-9999-4999-8999-353535353535"
+            app.save_account_index(paths, self._linked_index(source_id, destination_id))
+            states = {
+                source_id: app.DESKTOP_STATE_ARCHIVED,
+                destination_id: app.DESKTOP_STATE_ACTIVE,
+            }
+            timeout = app.subprocess.TimeoutExpired(
+                ["powershell.exe", "-EncodedCommand", "secret-command"],
+                60,
+            )
+
+            with (
+                patch.object(app, "find_codex_executable", return_value=root / "codex"),
+                patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
+                patch.object(app, "run_codex_cli_command", side_effect=timeout) as cli,
+                patch.object(
+                    app,
+                    "active_codex_account",
+                    return_value=app.AccountInfo("codex:destination", "destination", None, None, None, None),
+                ),
+            ):
+                result = app.sync_codex_linked_threads(paths)
+
+            self.assertGreaterEqual(result["pending"], 1)
+            self.assertFalse(result["errors"])
+            self.assertEqual(cli.call_args.kwargs["timeout"], 60)
+            group = app.load_account_index(paths)["codex_links"]["group-1"]
+            self.assertEqual(
+                group["threads"][destination_id]["pending_state"],
+                app.DESKTOP_STATE_ARCHIVED,
+            )
+            self.assertIsNone(group["last_error"])
 
     def test_codex_linked_lifecycle_waits_until_destination_account_is_active(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

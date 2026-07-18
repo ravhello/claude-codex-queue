@@ -154,6 +154,10 @@ local PowerShell and Windows CLI calls use hidden windows under WSL and
 `CREATE_NO_WINDOW` under native Windows Python. The WSL proxy forwards standard
 input/output and owns each Windows child in a kill-on-close Job Object, so
 timeouts and shutdowns cannot leave detached console processes behind.
+PowerShell source is written atomically to a content-addressed script in the
+user's private state cache and invoked with `-File`; it is never embedded in a
+large local `EncodedCommand`. All exception text crosses a central public-error
+filter before it can enter JSON responses or persisted queue status.
 
 ## Safety invariants
 

@@ -495,16 +495,24 @@ class WebState:
                     "code_artifact_transcripts_created",
                 ]
             )
-            errors.extend(str(error) for error in claude.get("code_artifact_errors", []) if error)
+            errors.extend(
+                app.public_error_message(error, "Replica artefatto Claude non riuscita.")
+                for error in claude.get("code_artifact_errors", [])
+                if error
+            )
         except Exception as exc:
-            errors.append(f"Claude: {exc}")
+            errors.append(f"Claude: {app.public_error_message(exc, 'Sincronizzazione non riuscita.')}")
         try:
             codex = app.sync_codex_linked_threads(self.paths)
             results["codex"] = codex
             changed = changed or int(codex.get("updated") or 0) > 0 or int(codex.get("deleted") or 0) > 0
-            errors.extend(str(error) for error in codex.get("errors", []) if error)
+            errors.extend(
+                app.public_error_message(error, "Sincronizzazione Codex non riuscita.")
+                for error in codex.get("errors", [])
+                if error
+            )
         except Exception as exc:
-            errors.append(f"Codex: {exc}")
+            errors.append(f"Codex: {app.public_error_message(exc, 'Sincronizzazione non riuscita.')}")
 
         with self.lock:
             self._account_sync_last_check_at = app.now_utc()
@@ -655,7 +663,7 @@ class WebState:
                     error = f"Runner terminato con codice {status['exit_code']}"
         except Exception as exc:
             status = self.runner_status()
-            error = str(exc)
+            error = app.public_error_message(exc, "Controllo runner non riuscito.")
         with self.lock:
             self._runner_monitor_last_check_at = app.now_utc()
             self._runner_monitor_last_error = error
@@ -764,7 +772,10 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
         except Exception as exc:
-            self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.send_json(
+                {"error": app.public_error_message(exc, "Richiesta non riuscita.")},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def do_POST(self) -> None:
         parsed = urlparse(self.path)
@@ -791,7 +802,10 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             else:
                 self.send_error(HTTPStatus.NOT_FOUND)
         except Exception as exc:
-            self.send_json({"error": str(exc)}, HTTPStatus.INTERNAL_SERVER_ERROR)
+            self.send_json(
+                {"error": app.public_error_message(exc, "Richiesta non riuscita.")},
+                HTTPStatus.INTERNAL_SERVER_ERROR,
+            )
 
     def read_json(self) -> dict[str, Any]:
         length = int(self.headers.get("content-length") or 0)

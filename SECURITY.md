@@ -41,6 +41,12 @@ overrides are removed from the child process so the official CLI uses its local
 ChatGPT authentication. Authentication files are only used to derive a hashed,
 masked account identity and are never copied into queue state or logs.
 
+WSL-to-Windows PowerShell source is cached as content-addressed files below the
+private local state directory instead of being carried in command-line
+`EncodedCommand` values. Subprocess commands, encoded payloads, CLIXML and
+credential-shaped values are filtered before an error reaches the web API or a
+persisted queue status.
+
 Claude Code artifact replication may decrypt Claude Desktop's current-user OAuth
 cache in a consoleless child process. Each token is verified against
 `/api/oauth/profile`, used only in memory for Claude's frame API and never stored

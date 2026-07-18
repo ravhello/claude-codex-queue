@@ -40,7 +40,7 @@ class QueueAppTests(unittest.TestCase):
         self.assertNotIn("Promise.allSettled([doctorTask, chatsTask])", web.HTML)
 
     def test_public_version_and_legacy_state_compatibility(self) -> None:
-        self.assertEqual(claude_codex_queue.__version__, "0.2.6")
+        self.assertEqual(claude_codex_queue.__version__, "0.2.7")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             legacy = root / app.LEGACY_APP_DIR_NAME
@@ -70,9 +70,15 @@ class QueueAppTests(unittest.TestCase):
             self.assertEqual(found, command)
 
     def test_windows_cli_commands_use_hidden_powershell_inside_wsl(self) -> None:
+        scripts: list[str] = []
+
+        def cache_script(script: str) -> Path:
+            scripts.append(script)
+            return Path("/mnt/c/Users/test/.claude-vscode-queue/tmp/powershell/proxy.ps1")
+
         with patch.object(app, "is_wsl", return_value=True), patch.object(
             app.shutil, "which", return_value="/mnt/c/Windows/System32/WindowsPowerShell/v1.0/powershell.exe"
-        ):
+        ), patch.object(app, "cached_powershell_script", side_effect=cache_script):
             command = app.codex_cli_command(
                 Path("/mnt/c/Users/test/AppData/Local/npm/codex.cmd"),
                 ["--version"],
@@ -80,14 +86,53 @@ class QueueAppTests(unittest.TestCase):
 
         self.assertIn("-WindowStyle", command)
         self.assertIn("Hidden", command)
-        encoded = command[command.index("-EncodedCommand") + 1]
-        script = base64.b64decode(encoded).decode("utf-16-le")
+        self.assertIn("-File", command)
+        self.assertNotIn("-EncodedCommand", command)
+        self.assertLess(len(" ".join(command)), 1024)
+        script = scripts[0]
         self.assertIn("C:\\Users\\test\\AppData\\Local\\npm\\codex.cmd", script)
         self.assertIn("--version", script)
         self.assertIn("HiddenProcessProxy", script)
         self.assertIn("Add-Type", script)
         self.assertIn("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE", app.WINDOWS_HIDDEN_PROXY_CSHARP)
         self.assertIn("destination.Flush()", app.WINDOWS_HIDDEN_PROXY_CSHARP)
+
+    def test_powershell_scripts_are_cached_atomically_without_command_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.object(
+            app,
+            "powershell_script_cache_dir",
+            return_value=Path(tmp),
+        ):
+            first = app.cached_powershell_script("Write-Output 'ok'")
+            second = app.cached_powershell_script("Write-Output 'ok'\r\n")
+            first.write_text("corrupted", encoding="utf-8")
+            repaired = app.cached_powershell_script("Write-Output 'ok'")
+
+            self.assertEqual(first, second)
+            self.assertEqual(first, repaired)
+            self.assertTrue(repaired.read_bytes().startswith(b"\xef\xbb\xbf"))
+            self.assertEqual(repaired.read_text(encoding="utf-8-sig"), "Write-Output 'ok'\n")
+            self.assertEqual(list(Path(tmp).glob("script-*.ps1")), [repaired])
+
+    def test_public_error_message_never_exposes_process_commands_or_credentials(self) -> None:
+        timeout = app.subprocess.TimeoutExpired(
+            cmd=["powershell.exe", "-EncodedCommand", "A" * 4000],
+            timeout=30,
+        )
+        process_error = app.subprocess.CalledProcessError(
+            1,
+            ["powershell.exe", "-File", "C:/private/internal.ps1"],
+        )
+
+        timeout_message = app.public_error_message(timeout)
+        process_message = app.public_error_message(process_error, "Comando non riuscito.")
+        credential_message = app.public_error_message("api_key=sk-example-secret-value-123456789")
+
+        self.assertEqual(timeout_message, "Operazione temporaneamente lenta; nuovo tentativo automatico.")
+        self.assertEqual(process_message, "Comando non riuscito.")
+        self.assertNotIn("EncodedCommand", timeout_message)
+        self.assertNotIn("internal.ps1", process_message)
+        self.assertNotIn("sk-example", credential_message)
 
     def test_auto_continue_monitor_does_not_send_without_active_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -895,12 +940,17 @@ class QueueAppTests(unittest.TestCase):
         }
         clixml = '#< CLIXML\n<Objs><S S="Error">CLAUDE_TRY_AGAIN_NOT_FOUND</S></Objs>'
         completed = app.subprocess.CompletedProcess([], 1, "", clixml)
+        captured_scripts: list[str] = []
 
         with patch.object(
             app,
             "claude_desktop_local_session_id",
             return_value="local_5aa69d88-defb-4fe6-934b-ece6692d1480",
         ), patch.object(app.shutil, "which", return_value="powershell.exe"), patch.object(
+            app,
+            "cached_powershell_script",
+            side_effect=lambda script: captured_scripts.append(script) or Path("C:/temp/try-again.ps1"),
+        ), patch.object(
             app.subprocess,
             "run",
             return_value=completed,
@@ -910,8 +960,9 @@ class QueueAppTests(unittest.TestCase):
         self.assertEqual(result.returncode, app.CLAUDE_DESKTOP_TRY_AGAIN_EXIT)
         self.assertEqual(result.stderr, "CLAUDE_TRY_AGAIN_NOT_FOUND")
         command = run.call_args.args[0]
-        encoded = command[command.index("-EncodedCommand") + 1]
-        script = base64.b64decode(encoded).decode("utf-16-le")
+        self.assertIn("-File", command)
+        self.assertNotIn("-EncodedCommand", command)
+        script = captured_scripts[0]
         self.assertIn('$ProgressPreference = "SilentlyContinue"', script)
         self.assertIn('[Console]::Error.WriteLine("CLAUDE_TRY_AGAIN_NOT_FOUND")', script)
         self.assertNotIn('Write-Error "CLAUDE_TRY_AGAIN_NOT_FOUND"', script)

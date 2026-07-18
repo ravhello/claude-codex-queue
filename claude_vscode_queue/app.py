@@ -142,6 +142,7 @@ _ACCOUNT_INDEX_LOCK = threading.RLock()
 _CLAUDE_OAUTH_SESSION_CACHE_LOCK = threading.RLock()
 _DESKTOP_SESSION_FILE_CACHE_LOCK = threading.RLock()
 _DESKTOP_ACCOUNT_LOG_CACHE_LOCK = threading.RLock()
+_POWERSHELL_SCRIPT_CACHE_LOCK = threading.RLock()
 _CLAUDE_OAUTH_SESSION_CACHE: dict[
     str,
     tuple[tuple[str, ...], float, dict[str, dict[str, str]]],
@@ -545,9 +546,84 @@ def background_process_kwargs() -> dict[str, int]:
     return {"creationflags": creation_flags} if creation_flags else {}
 
 
+def powershell_script_cache_dir() -> Path | None:
+    explicit_state = os.environ.get("CLAUDE_CODEX_QUEUE_STATE") or os.environ.get("CLAUDE_VSCODE_QUEUE_STATE")
+    if explicit_state:
+        state = windows_to_local_path(explicit_state)
+        if os.name == "nt" or is_windows_path(explicit_state) or re.match(r"^/mnt/[a-zA-Z]/", str(state)):
+            return state / "tmp" / "powershell"
+
+    if os.name == "nt":
+        local_app_data = os.environ.get("LOCALAPPDATA")
+        if local_app_data:
+            return Path(local_app_data) / "ClaudeCodexQueue" / "PowerShell"
+        return Path.home() / APP_DIR_NAME / "tmp" / "powershell"
+
+    home = current_windows_user_home_from_cwd()
+    if home is None:
+        module_path = Path(__file__).resolve()
+        match = re.match(r"^/mnt/([a-zA-Z])/Users/([^/]+)(?:/|$)", module_path.as_posix(), re.IGNORECASE)
+        if match:
+            home = Path("/mnt") / match.group(1).lower() / "Users" / match.group(2)
+    if home is None:
+        users_root = Path("/mnt/c/Users")
+        try:
+            candidates = list(users_root.iterdir())
+        except OSError:
+            candidates = []
+        home = next(
+            (
+                candidate
+                for candidate in candidates
+                if candidate.is_dir()
+                and any(
+                    (candidate / marker).exists()
+                    for marker in (APP_DIR_NAME, LEGACY_APP_DIR_NAME, ".claude", ".codex")
+                )
+            ),
+            None,
+        )
+    if home is None:
+        return None
+    preferred = home / APP_DIR_NAME
+    legacy = home / LEGACY_APP_DIR_NAME
+    state = preferred if preferred.exists() or not legacy.exists() else legacy
+    return state / "tmp" / "powershell"
+
+
+def cached_powershell_script(script: str) -> Path:
+    cache_dir = powershell_script_cache_dir()
+    if cache_dir is None:
+        raise OSError("Cache Windows PowerShell non disponibile.")
+    normalized = script.replace("\r\n", "\n").replace("\r", "\n").rstrip("\n") + "\n"
+    payload = b"\xef\xbb\xbf" + normalized.encode("utf-8")
+    digest = hashlib.sha256(payload).hexdigest()
+    path = cache_dir / f"script-{digest}.ps1"
+    with _POWERSHELL_SCRIPT_CACHE_LOCK:
+        try:
+            if path.read_bytes() == payload:
+                return path
+        except OSError:
+            pass
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        with tempfile.NamedTemporaryFile("wb", dir=cache_dir, delete=False) as handle:
+            handle.write(payload)
+            temporary = Path(handle.name)
+        try:
+            if os.name != "nt":
+                temporary.chmod(0o600)
+            atomic_replace_with_retry(temporary, path)
+        finally:
+            try:
+                temporary.unlink(missing_ok=True)
+            except OSError:
+                pass
+    return path
+
+
 def local_powershell_hidden_command(script: str, powershell: str | None = None) -> list[str]:
     executable = powershell or shutil.which("powershell.exe") or "powershell.exe"
-    encoded = base64.b64encode(script.encode("utf-16-le")).decode("ascii")
+    script_path = cached_powershell_script(script)
     return [
         executable,
         "-NoLogo",
@@ -557,8 +633,8 @@ def local_powershell_hidden_command(script: str, powershell: str | None = None) 
         "Hidden",
         "-ExecutionPolicy",
         "Bypass",
-        "-EncodedCommand",
-        encoded,
+        "-File",
+        local_to_windows_path(script_path),
     ]
 
 
@@ -1152,6 +1228,30 @@ def truncate(value: str | None, length: int = 90) -> str:
     if len(compact) <= length:
         return compact
     return compact[: length - 1] + "..."
+
+
+def public_error_message(
+    error: BaseException | str,
+    fallback: str = "Operazione non riuscita.",
+    *,
+    timeout_message: str = "Operazione temporaneamente lenta; nuovo tentativo automatico.",
+) -> str:
+    if isinstance(error, subprocess.TimeoutExpired):
+        return timeout_message
+    text = str(error or "").strip()
+    if not text:
+        return fallback
+    if "#< CLIXML" in text:
+        return fallback
+    if re.search(r"(?i)Command\s+['\"]?\[", text) or re.search(r"(?i)-EncodedCommand\b", text):
+        return fallback
+    text = re.sub(
+        r"(?i)(?:Bearer\s+|(?:api[-_ ]?key|token)\s*[:=]\s*)[A-Za-z0-9._~+/=-]{12,}",
+        "<credenziale rimossa>",
+        text,
+    )
+    text = re.sub(r"\b[A-Za-z0-9+/]{160,}={0,2}\b", "<dettaglio rimosso>", text)
+    return truncate(text, 320) or fallback
 
 
 def message_preview(value: str | None, length: int = 240) -> str | None:
@@ -2115,7 +2215,7 @@ def run_codex_lifecycle(
     result = run_codex_cli_command(
         codex_exe,
         arguments,
-        timeout=30,
+        timeout=60,
         codex_home=paths.codex_home,
     )
     if result.returncode != 0:
@@ -2230,8 +2330,15 @@ def sync_codex_linked_threads(paths: Paths) -> dict[str, Any]:
                         else:
                             result["updated"] += 1
                             states[session_id] = canonical
+                    except subprocess.TimeoutExpired:
+                        if isinstance(thread_record, dict):
+                            thread_record["pending_state"] = canonical
+                        result["pending"] += 1
+                        changed = True
                     except (OSError, subprocess.SubprocessError, ValueError) as exc:
-                        result["errors"].append(str(exc))
+                        result["errors"].append(
+                            public_error_message(exc, "Operazione Codex non riuscita; verra' ritentata.")
+                        )
 
             for session_id, record in threads.items():
                 if not isinstance(record, dict):
@@ -3712,7 +3819,9 @@ def sync_claude_code_artifacts(
             try:
                 frame_rows_by_account[account_uuid] = claude_frame_rows(session["token"])
             except RuntimeError as exc:
-                result["code_artifact_errors"].append(f"{account_uuid[:8]}: {exc}")
+                result["code_artifact_errors"].append(
+                    f"{account_uuid[:8]}: {public_error_message(exc, 'Replica artefatto non riuscita.')}"
+                )
                 frame_rows_by_account[account_uuid] = []
 
     for slug, state_entry in artifact_state.items():
@@ -3774,7 +3883,9 @@ def sync_claude_code_artifacts(
                     base_version=base_version,
                 )
             except RuntimeError as exc:
-                result["code_artifact_errors"].append(f"{account_uuid[:8]}: {exc}")
+                result["code_artifact_errors"].append(
+                    f"{account_uuid[:8]}: {public_error_message(exc, 'Replica transcript artefatto non riuscita.')}"
+                )
                 result["code_artifact_pending_accounts"] += 1
                 continue
             deployed_slug = deployed.get("slug")
@@ -7535,7 +7646,9 @@ def retry_time_after_limit(result: ClaudeRunResult, poll_seconds: int) -> str:
 def update_auto_continue_state(auto_continue: dict[str, Any], status: str | None = None, **fields: Any) -> None:
     if status is not None:
         auto_continue["status"] = status
-    auto_continue["updated_at"] = now_utc()
+    # Internal merge revisions need sub-second precision; the UI still renders
+    # these timestamps using the machine locale at whole-second precision.
+    auto_continue["updated_at"] = dt.datetime.now().astimezone().isoformat(timespec="microseconds")
     for key, value in fields.items():
         auto_continue[key] = value
 
@@ -8125,10 +8238,11 @@ def command_run(args: argparse.Namespace) -> int:
                 try:
                     prepare_codex_recovery_state(paths, codex_exe, queue, recovery)
                 except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                    error = public_error_message(exc, "Preparazione recovery Codex non riuscita.")
                     recovery["blocked"] = True
-                    recovery["last_error"] = str(exc)
+                    recovery["last_error"] = error
                     save_queue(paths.queue_file, queue)
-                    print(f"Recovery Codex bloccata: {exc}")
+                    print(f"Recovery Codex bloccata: {error}")
                     return 1
 
             item = recovery_as_item(recovery)
@@ -8175,7 +8289,7 @@ def command_run(args: argparse.Namespace) -> int:
                 return 1
             except (OSError, SystemExit) as exc:
                 recovery["blocked"] = True
-                recovery["last_error"] = str(exc)
+                recovery["last_error"] = public_error_message(exc, "Recovery non riuscita.")
                 save_queue(paths.queue_file, queue)
                 return 1
 
@@ -8196,7 +8310,10 @@ def command_run(args: argparse.Namespace) -> int:
                 continue
 
             if result.rate_limited:
-                recovery["last_error"] = truncate(result.stderr or result.stdout, 500)
+                recovery["last_error"] = public_error_message(
+                    result.stderr or result.stdout,
+                    "Recovery non confermata dal provider.",
+                )
                 recovery["not_before"] = retry_time_after_limit(result, args.poll_seconds)
                 if recovery.get("provider") == PROVIDER_CODEX:
                     recovery["retry_needs_rollback"] = True
@@ -8208,7 +8325,10 @@ def command_run(args: argparse.Namespace) -> int:
                 continue
 
             recovery["blocked"] = True
-            recovery["last_error"] = truncate(result.stderr or result.stdout, 1000)
+            recovery["last_error"] = public_error_message(
+                result.stderr or result.stdout,
+                "Recovery non riuscita.",
+            )
             source_item_id = recovery.get("source_item_id")
             for queued_item in queue.get("items", []):
                 if queued_item.get("id") == source_item_id:
@@ -8349,14 +8469,15 @@ def command_run(args: argparse.Namespace) -> int:
                         return 0
                     continue
                 except (OSError, subprocess.SubprocessError, ValueError) as exc:
+                    error = public_error_message(exc, "Preparazione auto-continua Codex non riuscita.")
                     update_auto_continue_state(
                         auto_continue,
                         "blocked",
                         enabled=False,
-                        last_error=str(exc),
+                        last_error=error,
                     )
                     save_queue(paths.queue_file, queue)
-                    print(f"Auto-continua Codex bloccato: {exc}")
+                    print(f"Auto-continua Codex bloccato: {error}")
                     if args.once:
                         return 1
                     continue
@@ -8425,7 +8546,12 @@ def command_run(args: argparse.Namespace) -> int:
                     return 1
                 continue
             except (OSError, SystemExit) as exc:
-                update_auto_continue_state(auto_continue, "failed", enabled=False, last_error=str(exc))
+                update_auto_continue_state(
+                    auto_continue,
+                    "failed",
+                    enabled=False,
+                    last_error=public_error_message(exc, "Auto-continua non riuscita."),
+                )
                 save_queue(paths.queue_file, queue)
                 if args.once:
                     return 1
@@ -8458,7 +8584,10 @@ def command_run(args: argparse.Namespace) -> int:
                         auto_continue,
                         "blocked_permission",
                         enabled=False,
-                        last_error=truncate(combined_output, 1000),
+                        last_error=public_error_message(
+                            combined_output,
+                            "Auto-continua non confermata dal provider.",
+                        ),
                         sending_started_at=None,
                         next_check_in_seconds=None,
                     )
@@ -8530,7 +8659,10 @@ def command_run(args: argparse.Namespace) -> int:
                 update_auto_continue_state(
                     auto_continue,
                     "waiting_limit",
-                    last_error=truncate(result.stderr or result.stdout, 500),
+                    last_error=public_error_message(
+                        result.stderr or result.stdout,
+                        "Auto-continua non confermata dal provider.",
+                    ),
                     not_before=retry_time_after_limit(result, args.poll_seconds),
                     sending_started_at=None,
                     next_check_in_seconds=None,
@@ -8547,7 +8679,10 @@ def command_run(args: argparse.Namespace) -> int:
                 auto_continue,
                 "failed",
                 enabled=False,
-                last_error=truncate(result.stderr or result.stdout, 1000),
+                last_error=public_error_message(
+                    result.stderr or result.stdout,
+                    "Auto-continua non riuscita.",
+                ),
                 sending_started_at=None,
             )
             save_queue(paths.queue_file, queue)
@@ -8619,7 +8754,7 @@ def command_run(args: argparse.Namespace) -> int:
             return 1
         except (OSError, SystemExit) as exc:
             item["status"] = STATUS_FAILED
-            item["last_error"] = str(exc)
+            item["last_error"] = public_error_message(exc, "Invio non riuscito.")
             save_queue(paths.queue_file, queue)
             return 1
 
@@ -8655,7 +8790,10 @@ def command_run(args: argparse.Namespace) -> int:
             continue
 
         item["status"] = STATUS_FAILED
-        item["last_error"] = truncate(result.stderr or result.stdout, 1000)
+        item["last_error"] = public_error_message(
+            result.stderr or result.stdout,
+            "Invio non riuscito.",
+        )
         save_queue(paths.queue_file, queue)
         print(f"Errore provider su {item['id']}. Log: {item['last_log']}")
         return result.returncode or 1

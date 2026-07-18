@@ -153,6 +153,9 @@ server and opens [http://127.0.0.1:8765/](http://127.0.0.1:8765/). Both the
 Desktop and Startup shortcuts use the windowless Windows Script Host; WSL,
 PowerShell, Claude and Codex child processes are launched with hidden/no-window
 settings, so the app does not create terminal windows in normal operation.
+Under WSL, PowerShell scripts are stored atomically in the current user's
+private queue cache and invoked by file; large encoded scripts and raw child
+commands are never returned by the web diagnostics.
 
 The installer also registers the app in the current Windows user's Startup
 folder. At login it starts the server in the background and opens the browser
@@ -286,7 +289,7 @@ reproducible defects belong in
 
 ## Project status
 
-Current release: **v0.2.6**. The project is alpha software tested on Windows/WSL
+Current release: **v0.2.7**. The project is alpha software tested on Windows/WSL
 with local Claude Code and Codex App workflows. Upstream desktop metadata is not
 a public compatibility contract and may change between provider releases.
 

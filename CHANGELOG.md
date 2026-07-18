@@ -2,6 +2,13 @@
 
 ## Unreleased
 
+## 0.2.7 - 2026-07-18
+
+- Replaced inline WSL-to-Windows PowerShell `EncodedCommand` payloads with atomic, content-addressed scripts in the private state cache, keeping hidden CLI command lines short and stable.
+- Redacted subprocess commands, encoded payloads, CLIXML and credential-shaped values from every web, queue, recovery and auto-continue error surface.
+- Kept timed-out Codex account lifecycle changes pending for an automatic retry instead of exposing the internal command or marking synchronization as permanently failed.
+- Gave auto-continue merge revisions sub-second precision so a same-second background save cannot restore an older status.
+
 ## 0.2.6 - 2026-07-18
 
 - Kept the last complete Claude and Codex chat list visible while account changes trigger a background refresh, merged newly discovered chats immediately and removed only confirmed Claude tombstones.
