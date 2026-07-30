@@ -13,7 +13,9 @@ elif command -v powershell.exe >/dev/null 2>&1 && command -v wslpath >/dev/null 
   WIN_HOME_RAW="$(powershell.exe -NoLogo -NoProfile -NonInteractive -WindowStyle Hidden -Command '[Environment]::GetFolderPath("UserProfile")' 2>/dev/null | tr -d '\r' || true)"
   if [ -n "$WIN_HOME_RAW" ]; then
     WIN_HOME="$(wslpath -u "$WIN_HOME_RAW")"
-    if [ -d "$WIN_HOME/.claude-codex-queue" ] || [ ! -d "$WIN_HOME/.claude-vscode-queue" ]; then
+    if [ -f "$WIN_HOME/.claude-vscode-queue/queue.json" ] && [ ! -f "$WIN_HOME/.claude-codex-queue/queue.json" ]; then
+      STATE="$WIN_HOME/.claude-vscode-queue"
+    elif [ -d "$WIN_HOME/.claude-codex-queue" ] || [ ! -d "$WIN_HOME/.claude-vscode-queue" ]; then
       STATE="$WIN_HOME/.claude-codex-queue"
     else
       STATE="$WIN_HOME/.claude-vscode-queue"
@@ -60,7 +62,7 @@ if is_alive; then
 fi
 
 stop_stale
-setsid -f python3 -m claude_codex_queue.web --host "$HOST" --port "$PORT" > "$LOG" 2>&1 < /dev/null
+setsid -f python3 -m claude_codex_queue.web --host "$HOST" --port "$PORT" --state-dir "$STATE" > "$LOG" 2>&1 < /dev/null
 
 for _ in $(seq 1 30); do
   if is_alive; then

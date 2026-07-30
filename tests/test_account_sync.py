@@ -292,6 +292,50 @@ class AccountSyncTests(unittest.TestCase):
             self.assertEqual(run.call_args.kwargs["timeout"], 30)
             self.assertNotIn("EncodedCommand", version)
 
+    def test_api_doctor_uses_account_snapshot_during_background_sync(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            expected_limits = {
+                "accounts": [{"key": "account-a"}],
+                "first_reset": {"reset_at": "2026-07-18T08:10:00+02:00"},
+            }
+            expected_index = {"accounts": [{"key": "account-a"}]}
+            with patch.object(app, "active_desktop_account_public", return_value={"key": "account-a"}), patch.object(
+                app,
+                "active_claude_account",
+                return_value=None,
+            ), patch.object(app, "active_codex_account", return_value=None), patch.object(
+                app,
+                "account_index_public",
+                return_value=expected_index,
+            ), patch.object(app, "account_limit_overview", return_value=expected_limits):
+                state = web.WebState(self._paths(Path(tmp)), None, None)
+
+            handler = object.__new__(web.QueueRequestHandler)
+            handler.state = state
+            blocked = AssertionError("dashboard tried to read locked account state")
+            with patch.object(state, "cached_chats", return_value=[]), patch.object(
+                state,
+                "chats",
+                return_value=[],
+            ), patch.object(state, "claude_version", return_value="not found"), patch.object(
+                state,
+                "codex_version",
+                return_value="not found",
+            ), patch.object(app, "active_desktop_account_public", side_effect=blocked), patch.object(
+                app,
+                "active_claude_account",
+                side_effect=blocked,
+            ), patch.object(app, "active_codex_account", side_effect=blocked), patch.object(
+                app,
+                "account_index_public",
+                side_effect=blocked,
+            ), patch.object(app, "account_limit_overview", side_effect=blocked):
+                payload = handler.api_doctor()
+
+            self.assertEqual(payload["active_account"], {"key": "account-a"})
+            self.assertEqual(payload["account_index"], expected_index)
+            self.assertEqual(payload["account_limits"], expected_limits)
+
     def test_web_account_sync_timeout_never_exposes_the_subprocess_command(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             state = web.WebState(self._paths(Path(tmp)), None, Path("codex.exe"))
@@ -531,6 +575,61 @@ class AccountSyncTests(unittest.TestCase):
             }
             self.assertNotIn(session_id, visible_ids)
 
+    def test_claude_authoritative_tombstone_removes_a_stale_workspace_rewrite(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, _, account_a, account_b = self._claude_fixture(root)
+            session_id = "34343434-3434-4434-8434-343434343434"
+            source = self._write_claude_session(account_a / "local_shared.json", session_id, root)
+            stale_data = self._read(source)
+            app.sync_claude_desktop_accounts(paths)
+
+            source.unlink()
+            app.sync_claude_desktop_accounts(paths)
+            confirmed = app.sync_claude_desktop_accounts(paths)
+            self.assertEqual(confirmed["deleted"], 1)
+            self.assertFalse(list(account_a.glob("*.json")))
+            self.assertFalse(list(account_b.glob("*.json")))
+
+            state = app.load_desktop_sync_state(paths)
+            root_state = next(
+                value
+                for value in state["roots"].values()
+                if session_id in value.get("sessions", {})
+            )
+            entry = root_state["sessions"][session_id]
+            self.assertTrue(entry["tombstone_authoritative"])
+            entry["replicas"]["account-a/workspace-old"] = {
+                "account_uuid": "account-a",
+                "workspace_uuid": "workspace-old",
+                "path": "account-a/workspace-old/local_shared.json",
+                "present": False,
+                "missing_scans": 2,
+            }
+            entry["replicas"]["account-a/workspace-new"] = {
+                "account_uuid": "account-a",
+                "workspace_uuid": "workspace-new",
+                "path": "account-a/workspace-new/local_shared.json",
+                "present": True,
+                "missing_scans": 0,
+            }
+            app.save_desktop_sync_state(paths, state)
+            stale_workspace = account_a.parent / "workspace-new"
+            stale_workspace.mkdir()
+            stale_copy = stale_workspace / "local_shared.json"
+            stale_copy.write_text(json.dumps(stale_data), encoding="utf-8")
+
+            swept = app.sync_claude_desktop_accounts(paths)
+
+            self.assertEqual(swept["created"], 0)
+            self.assertGreaterEqual(swept["tombstone_skips"], 1)
+            self.assertFalse(stale_copy.exists())
+            visible_ids = {
+                chat.session_id
+                for chat in app.discover_claude_chats(paths, sync_desktop_accounts=False)
+            }
+            self.assertNotIn(session_id, visible_ids)
+
     def test_claude_workspace_relocation_is_not_treated_as_chat_deletion(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -669,6 +768,180 @@ class AccountSyncTests(unittest.TestCase):
             self.assertEqual(after_switch_sync["deduped"], 0)
             self.assertEqual(after_switch_sync["path_reuses_repaired"], 0)
             self.assertTrue(after_switch_sync["inventory_consistent"])
+
+    def test_claude_archive_event_converges_every_account_on_newest_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, app_root, account_a, account_b = self._claude_fixture(root)
+            session_id = "41414141-4141-4141-8141-414141414141"
+            source = self._write_claude_session(account_a / "local_shared.json", session_id, root)
+            app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+            replica = next(account_b.glob("*.json"))
+
+            newest = self._read(source)
+            newest["title"] = "Newest shared content"
+            newest["lastActivityAt"] = 1_900_000_000_000
+            newest["sessionSettings"] = {"model": "opus", "effort": "xhigh"}
+            app.write_desktop_session_json(source, newest)
+            source_mtime = source.stat().st_mtime_ns
+
+            self._set_archived(replica, True)
+            archived_mtime = max(time.time_ns(), source_mtime + 20_000_000)
+            os.utime(replica, ns=(archived_mtime, archived_mtime))
+
+            converged = app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+            self.assertTrue(converged["inventory_consistent"])
+            self.assertEqual(converged["inventory_errors"], [])
+            self.assertEqual(converged["inventories"][0]["content_mismatches"], [])
+
+            expected_shared = None
+            for active_account in ["account-a", "account-b", "account-a", "account-b"]:
+                (app_root / "config.json").write_text(
+                    json.dumps({"lastKnownAccountUuid": active_account}),
+                    encoding="utf-8",
+                )
+                switched = app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+                records = [
+                    record
+                    for record in app.desktop_session_records(paths)
+                    if app.desktop_record_cli_session_id(record) == session_id
+                ]
+                self.assertEqual(len(records), 2)
+                self.assertEqual(
+                    {record.account_uuid for record in records},
+                    {"account-a", "account-b"},
+                )
+                self.assertEqual(
+                    {record.account_uuid: 1 for record in records},
+                    {"account-a": 1, "account-b": 1},
+                )
+                shared = [app.desktop_shared_session_data(record.data) for record in records]
+                self.assertEqual(shared[0], shared[1])
+                self.assertEqual(shared[0]["title"], "Newest shared content")
+                self.assertEqual(shared[0]["sessionSettings"], {"model": "opus", "effort": "xhigh"})
+                self.assertTrue(shared[0]["isArchived"])
+                expected_shared = expected_shared or shared[0]
+                self.assertEqual(shared[0], expected_shared)
+                self.assertEqual(switched["created"], 0)
+                self.assertEqual(switched["deduped"], 0)
+                self.assertTrue(switched["inventory_consistent"])
+
+    def test_claude_dedup_keeps_newest_logical_content_and_stays_stable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, app_root, account_a, account_b = self._claude_fixture(root)
+            session_id = "42424242-4242-4242-8242-424242424242"
+            source = self._write_claude_session(account_a / "local_shared.json", session_id, root)
+            app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+
+            duplicate = account_b / "local_newest_duplicate.json"
+            duplicate_data = self._read(source)
+            duplicate_data.update(
+                {
+                    "sessionId": duplicate.stem,
+                    "title": "Canonical duplicate content",
+                    "lastActivityAt": 2_000_000_000_000,
+                    "sessionSettings": {"model": "sonnet", "effort": "high"},
+                }
+            )
+            app.write_desktop_session_json(duplicate, duplicate_data)
+            os.utime(duplicate, ns=(1_000_000_000, 1_000_000_000))
+
+            deduped = app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+            self.assertEqual(deduped["deduped"], 1)
+            self.assertTrue(deduped["inventory_consistent"])
+
+            for active_account in ["account-b", "account-a", "account-b"]:
+                (app_root / "config.json").write_text(
+                    json.dumps({"lastKnownAccountUuid": active_account}),
+                    encoding="utf-8",
+                )
+                result = app.sync_claude_desktop_accounts(paths, include_transcripts=False)
+                records = [
+                    record
+                    for record in app.desktop_session_records(paths)
+                    if app.desktop_record_cli_session_id(record) == session_id
+                ]
+                self.assertEqual(len(records), 2)
+                self.assertEqual(
+                    {record.account_uuid: 1 for record in records},
+                    {"account-a": 1, "account-b": 1},
+                )
+                hashes = {app.desktop_session_content_hash(record.data) for record in records}
+                self.assertEqual(len(hashes), 1)
+                shared = app.desktop_shared_session_data(records[0].data)
+                self.assertEqual(shared["title"], "Canonical duplicate content")
+                self.assertEqual(shared["sessionSettings"], {"model": "sonnet", "effort": "high"})
+                self.assertEqual(result["created"], 0)
+                self.assertEqual(result["deduped"], 0)
+                self.assertTrue(result["inventory_consistent"])
+
+    def test_claude_inventory_rejects_equal_counts_with_different_content(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, app_root, account_a, account_b = self._claude_fixture(root)
+            session_id = "43434343-4343-4343-8343-434343434343"
+            self._write_claude_session(account_a / "local_a.json", session_id, root, title="Account A")
+            self._write_claude_session(account_b / "local_b.json", session_id, root, title="Account B")
+            records = app.desktop_session_records(paths)
+            inventory = app.desktop_replica_inventory(
+                {"sessions": {session_id: {"state": app.DESKTOP_STATE_ACTIVE, "replicas": {}}}},
+                records,
+                {"account-a", "account-b"},
+            )
+
+            self.assertEqual(sorted(inventory["counts"].values()), [1, 1])
+            self.assertFalse(inventory["consistent"])
+            self.assertEqual(len(inventory["content_mismatches"]), 1)
+            self.assertEqual(inventory["content_mismatches"][0]["session_id"], session_id)
+
+    def test_claude_inventory_rejects_another_accounts_transcript_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths, _, account_a, account_b = self._claude_fixture(root)
+            logical_session_id = "44434343-4343-4343-8343-434343434343"
+            alias_a = "45454545-4545-4545-8545-454545454545"
+            alias_b = "46464646-4646-4646-8646-464646464646"
+            self._write_claude_session(account_a / "local_a.json", alias_a, root)
+            self._write_claude_session(account_b / "local_b.json", alias_a, root)
+            root_state = {
+                "sessions": {
+                    logical_session_id: {
+                        "state": app.DESKTOP_STATE_ACTIVE,
+                        "replicas": {},
+                    }
+                },
+                "code_artifact_session_replicas": {
+                    logical_session_id: {
+                        "account-a": alias_a,
+                        "account-b": alias_b,
+                    }
+                },
+                "code_artifact_aliases": {
+                    alias_a: {
+                        "logical_session_id": logical_session_id,
+                        "account_uuid": "account-a",
+                    },
+                    alias_b: {
+                        "logical_session_id": logical_session_id,
+                        "account_uuid": "account-b",
+                    },
+                },
+            }
+
+            inventory = app.desktop_replica_inventory(
+                root_state,
+                app.desktop_session_records(paths),
+                {"account-a", "account-b"},
+            )
+
+            self.assertEqual(sorted(inventory["counts"].values()), [1, 1])
+            self.assertEqual(inventory["content_mismatches"], [])
+            self.assertFalse(inventory["consistent"])
+            self.assertEqual(
+                inventory["reference_mismatches"],
+                [{"account": app.short_hash("account-b"), "session_id": logical_session_id}],
+            )
 
     def test_claude_delete_from_non_active_account_still_propagates(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1856,6 +2129,53 @@ class AccountSyncTests(unittest.TestCase):
             self.assertEqual(group["threads"][source_id]["last_state"], app.DESKTOP_STATE_DELETED)
             self.assertEqual(group["threads"][destination_id]["last_state"], app.DESKTOP_STATE_DELETED)
 
+    def test_codex_linked_deleted_copy_cannot_reappear(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = self._paths(root)
+            source_id = "59595959-aaaa-4aaa-8aaa-595959595959"
+            destination_id = "81818181-bbbb-4bbb-8bbb-818181818181"
+            index = self._linked_index(source_id, destination_id)
+            group = index["codex_links"]["group-1"]
+            group["state"] = app.DESKTOP_STATE_DELETED
+            group["threads"][source_id]["last_state"] = app.DESKTOP_STATE_DELETED
+            group["threads"][destination_id]["last_state"] = app.DESKTOP_STATE_DELETED
+            app.save_account_index(paths, index)
+            states = {destination_id: app.DESKTOP_STATE_ACTIVE}
+            commands: list[list[str]] = []
+
+            def fake_cli(
+                _: Path,
+                arguments: list[str],
+                timeout: int = 15,
+                **__: object,
+            ) -> app.subprocess.CompletedProcess[str]:
+                commands.append(arguments)
+                states.pop(arguments[-1], None)
+                return app.subprocess.CompletedProcess(arguments, 0, "", "")
+
+            with (
+                patch.object(app, "find_codex_executable", return_value=root / "codex"),
+                patch.object(app, "codex_local_thread_states", side_effect=lambda _: dict(states)),
+                patch.object(app, "run_codex_cli_command", side_effect=fake_cli),
+                patch.object(
+                    app,
+                    "active_codex_account",
+                    return_value=app.AccountInfo("codex:destination", "destination", None, None, None, None),
+                ),
+            ):
+                result = app.sync_codex_linked_threads(paths)
+
+            self.assertEqual(result["deleted"], 1)
+            self.assertEqual(commands, [["delete", "--force", destination_id]])
+            self.assertFalse(states)
+            persisted = app.load_account_index(paths)["codex_links"]["group-1"]
+            self.assertEqual(persisted["state"], app.DESKTOP_STATE_DELETED)
+            self.assertEqual(
+                persisted["threads"][destination_id]["last_state"],
+                app.DESKTOP_STATE_DELETED,
+            )
+
     def test_codex_empty_store_pauses_instead_of_deleting_linked_copies(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -1965,6 +2285,48 @@ class AccountSyncTests(unittest.TestCase):
                 active_desktop_only=False,
             )
 
+    def test_web_chat_refresh_retries_after_account_sync_invalidates_its_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            paths = self._paths(Path(tmp))
+            signature = [("before",)]
+            first_started = threading.Event()
+            release_first = threading.Event()
+            second_finished = threading.Event()
+            codex_chat = SimpleNamespace(provider=app.PROVIDER_CODEX, session_id="codex-ready")
+            calls = 0
+
+            def discover(*_: object, **__: object) -> list[app.Chat]:
+                nonlocal calls
+                calls += 1
+                if calls == 1:
+                    first_started.set()
+                    self.assertTrue(release_first.wait(timeout=2))
+                    return []
+                second_finished.set()
+                return [codex_chat]  # type: ignore[list-item]
+
+            with (
+                patch.object(app, "claude_desktop_change_signature", side_effect=lambda _: signature[0]),
+                patch.object(app, "discover_agent_chats", side_effect=discover),
+            ):
+                state = web.WebState(paths, None, None)
+                state.refresh_chats_background()
+                self.assertTrue(first_started.wait(timeout=2))
+                signature[0] = ("after",)
+                state.invalidate_chats()
+                release_first.set()
+                self.assertTrue(second_finished.wait(timeout=2))
+                deadline = time.monotonic() + 2
+                while time.monotonic() < deadline:
+                    with state.lock:
+                        if not state._chats_refreshing and state._chats_cache:
+                            break
+                    time.sleep(0.01)
+
+            self.assertEqual(calls, 2)
+            self.assertFalse(state._chats_refreshing)
+            self.assertEqual([chat.session_id for chat in state._chats_cache], ["codex-ready"])
+
     def test_web_account_sync_monitor_starts_immediately_and_stops_cleanly(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             paths = self._paths(Path(tmp))
@@ -2001,6 +2363,31 @@ class AccountSyncTests(unittest.TestCase):
 
             with patch.object(state, "sync_linked_accounts_once", side_effect=sync_once):
                 state.start_account_sync_monitor(poll_seconds=1, full_poll_seconds=60)
+                self.assertTrue(observed.wait(timeout=3))
+                state.stop_account_sync_monitor()
+
+            self.assertEqual(scans[:2], [True, False])
+
+    def test_web_account_sync_monitor_waits_after_a_slow_full_scan(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state = web.WebState(self._paths(Path(tmp)), None, None)
+            observed = threading.Event()
+            scans: list[bool] = []
+
+            def sync_once(*, include_claude_transcripts: bool = True) -> dict[str, object]:
+                scans.append(include_claude_transcripts)
+                if len(scans) == 1:
+                    time.sleep(1.1)
+                elif len(scans) >= 2:
+                    observed.set()
+                return {"full_scan": include_claude_transcripts}
+
+            with patch.object(state, "sync_linked_accounts_once", side_effect=sync_once), patch.object(
+                app,
+                "claude_desktop_change_signature",
+                return_value=("stable",),
+            ):
+                state.start_account_sync_monitor(poll_seconds=1, full_poll_seconds=1)
                 self.assertTrue(observed.wait(timeout=3))
                 state.stop_account_sync_monitor()
 

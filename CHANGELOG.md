@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-07-30
+
+- Added a per-account Claude and ChatGPT usage dashboard with the next reset, first available account and browser-local date formatting.
+- Added audited multi-instance Claude Desktop profile discovery, automatic authenticated-profile launch and a non-consuming five-hour-window stagger plan.
+- Kept periodic Codex monitoring passive by reading SQLite in `mode=ro` with `query_only`, avoiding recurring app-server contention with active Codex tasks.
+- Made Claude deletion tombstones authoritative so an app rewrite or stale cached replica cannot recreate a deleted chat; archive and restore remain bidirectional.
+- Retried a complete chat discovery automatically when an account change invalidates an in-flight scan.
+- Compared synchronized Claude replicas by both logical count and shared-content digest, surfacing incomplete or divergent account copies.
+- Packaged the multi-instance launch helper with the wheel and kept the optional companion pinned to audited source hashes.
+- Updated GitHub Actions runtime dependencies and removed personal identifiers from public test fixtures.
+
 ## 0.2.8 - 2026-07-18
 
 - Detected when Claude reuses an account metadata filename for another session and restored the displaced logical chat to a unique path without treating it as deleted.

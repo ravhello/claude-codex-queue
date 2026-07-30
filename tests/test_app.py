@@ -40,7 +40,7 @@ class QueueAppTests(unittest.TestCase):
         self.assertNotIn("Promise.allSettled([doctorTask, chatsTask])", web.HTML)
 
     def test_public_version_and_legacy_state_compatibility(self) -> None:
-        self.assertEqual(claude_codex_queue.__version__, "0.2.8")
+        self.assertEqual(claude_codex_queue.__version__, "0.3.0")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             legacy = root / app.LEGACY_APP_DIR_NAME
@@ -53,6 +53,14 @@ class QueueAppTests(unittest.TestCase):
             preferred.mkdir()
             preferred_paths = app.resolve_paths(str(root))
             self.assertEqual(preferred_paths.state_dir, preferred)
+
+            (legacy / app.QUEUE_FILE_NAME).write_text('{"version":2,"items":[]}', encoding="utf-8")
+            preserved_paths = app.resolve_paths(str(root))
+            self.assertEqual(preserved_paths.state_dir, legacy)
+
+            (preferred / app.QUEUE_FILE_NAME).write_text('{"version":2,"items":[]}', encoding="utf-8")
+            migrated_paths = app.resolve_paths(str(root))
+            self.assertEqual(migrated_paths.state_dir, preferred)
 
     def test_find_codex_executable_prefers_windows_cmd_inside_wsl(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -126,13 +134,13 @@ class QueueAppTests(unittest.TestCase):
 
         timeout_message = app.public_error_message(timeout)
         process_message = app.public_error_message(process_error, "Comando non riuscito.")
-        credential_message = app.public_error_message("api_key=sk-example-secret-value-123456789")
+        credential_message = app.public_error_message("api_key=synthetic-test-secret")
 
         self.assertEqual(timeout_message, "Operazione temporaneamente lenta; nuovo tentativo automatico.")
         self.assertEqual(process_message, "Comando non riuscito.")
         self.assertNotIn("EncodedCommand", timeout_message)
         self.assertNotIn("internal.ps1", process_message)
-        self.assertNotIn("sk-example", credential_message)
+        self.assertNotIn("synthetic-test-secret", credential_message)
 
     def test_auto_continue_monitor_does_not_send_without_active_limit(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -371,6 +379,19 @@ class QueueAppTests(unittest.TestCase):
             )
             paths = app.resolve_paths(str(root), str(root / ".state"))
 
+            real_connect = sqlite3.connect
+            with patch.object(app.sqlite3, "connect", wraps=real_connect) as connect:
+                thread_rows = app.codex_thread_rows(codex_home)
+
+            self.assertIn(session, thread_rows)
+            state_store_call = next(
+                call
+                for call in connect.call_args_list
+                if "state_5.sqlite" in str(call.args[0])
+            )
+            self.assertIn("mode=ro", str(state_store_call.args[0]))
+            self.assertTrue(state_store_call.kwargs["uri"])
+
             with patch.object(app, "find_codex_executable", return_value=root / "codex"):
                 chats = app.discover_codex_app_sessions(paths)
 
@@ -431,14 +452,14 @@ class QueueAppTests(unittest.TestCase):
             self.assertNotIn("--dangerously-bypass-approvals-and-sandbox", output["args"])
 
     def test_codex_subprocess_env_converts_home_for_windows_cli(self) -> None:
-        codex_home = Path("/mnt/c/Users/rikyr/.codex")
+        codex_home = Path("/mnt/c/Users/Example/.codex")
         with patch.dict(
             app.os.environ,
             {"CODEX_HOME": "/tmp/wrong-account", "OPENAI_API_KEY": "invalid-external-key"},
         ):
             env = app.codex_subprocess_env(codex_home, windows=True)
 
-        self.assertEqual(env["CODEX_HOME"], r"C:\Users\rikyr\.codex")
+        self.assertEqual(env["CODEX_HOME"], r"C:\Users\Example\.codex")
         self.assertNotIn("OPENAI_API_KEY", env)
 
     def test_codex_transcript_detects_prompt_and_structured_limit(self) -> None:
@@ -1151,7 +1172,7 @@ class QueueAppTests(unittest.TestCase):
     def test_active_claude_account_reads_masked_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
-            self.write_account_files(root, "account-a", "riccardo@example.com", "a")
+            self.write_account_files(root, "account-a", "sample.user@example.com", "a")
             paths = app.Paths(
                 windows_home=root,
                 claude_home=root / ".claude",
@@ -1163,7 +1184,7 @@ class QueueAppTests(unittest.TestCase):
             account = app.active_claude_account(paths)
 
             self.assertIsNotNone(account)
-            self.assertEqual(account.label, "ri***@example.com")
+            self.assertEqual(account.label, "sam***er@example.com")
             self.assertIsNotNone(account.key)
             self.assertIsNotNone(account.email_hash)
 
@@ -1229,7 +1250,7 @@ class QueueAppTests(unittest.TestCase):
             account = app.active_claude_account(paths)
 
             self.assertIsNotNone(account)
-            self.assertEqual(account.label, "ol***@example.com")
+            self.assertEqual(account.label, "ol***d@example.com")
             self.assertEqual(account.account_uuid_hash, app.short_hash("old-account"))
             self.assertNotEqual(account.account_uuid_hash, app.short_hash("new-account"))
 
@@ -1344,6 +1365,378 @@ class QueueAppTests(unittest.TestCase):
             self.assertIsNotNone(reset)
             self.assertEqual(reset.hour, 18)
             self.assertEqual(reset.minute, 40)
+
+    def test_claude_usage_limit_status_tracks_all_windows_and_safe_availability(self) -> None:
+        now = dt.datetime(2026, 7, 18, 4, 0, tzinfo=app.UTC)
+        status = app.claude_usage_limit_status(
+            {
+                "limits": [
+                    {
+                        "kind": "session",
+                        "percent": 100,
+                        "resets_at": "2026-07-18T06:10:00Z",
+                        "is_active": True,
+                    },
+                    {
+                        "kind": "weekly_all",
+                        "percent": 56,
+                        "resets_at": "2026-07-21T21:00:00Z",
+                        "is_active": False,
+                    },
+                ]
+            },
+            observed_at="2026-07-18T04:00:00Z",
+            now=now,
+        )
+
+        self.assertTrue(status["limited"])
+        self.assertEqual([window["label"] for window in status["windows"]], ["Sessione", "Settimanale"])
+        self.assertEqual(app.parse_iso(status["next_reset_at"]), dt.datetime(2026, 7, 18, 6, 10, tzinfo=app.UTC))
+        self.assertEqual(app.parse_iso(status["available_at"]), dt.datetime(2026, 7, 18, 6, 11, tzinfo=app.UTC))
+
+    def test_discovers_isolated_claude_profiles_and_reports_two_connected_accounts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = app.Paths(
+                root,
+                root / ".claude",
+                root / ".state",
+                root / ".state" / "queue.json",
+                root / ".state" / "logs",
+            )
+            manager = paths.state_dir / "companions" / "ai-multi-instance"
+            manager.mkdir(parents=True)
+            (manager / "main.py").write_text("", encoding="utf-8")
+            (manager / "engine.py").write_text("", encoding="utf-8")
+            account_ids = [
+                "11111111-1111-4111-8111-111111111111",
+                "22222222-2222-4222-8222-222222222222",
+            ]
+            for name, account_id in zip(("lavoro", "personale"), account_ids):
+                profile = manager / "ClaudeProfiles" / name
+                profile.mkdir(parents=True)
+                (profile / "config.json").write_text(
+                    json.dumps(
+                        {
+                            "lastKnownAccountUuid": account_id,
+                            "oauth:tokenCacheV2": "encrypted",
+                        }
+                    ),
+                    encoding="utf-8",
+                )
+
+            roots = app.claude_multi_instance_profile_roots(paths)
+            overview = app.claude_profile_overview(paths)
+
+            self.assertEqual({path.name for path in roots}, {"lavoro", "personale"})
+            self.assertTrue(overview["manager_installed"])
+            self.assertEqual(overview["isolated_count"], 2)
+            self.assertEqual(overview["connected_count"], 2)
+            self.assertEqual(overview["distinct_account_count"], 2)
+            self.assertTrue(overview["simultaneous_ready"])
+
+    def test_multi_instance_profile_helper_is_part_of_the_runtime_package(self) -> None:
+        helper = Path(app.__file__).resolve().with_name("ensure_claude_profiles.py")
+
+        self.assertTrue(helper.is_file())
+
+    def test_claude_stagger_plan_schedules_second_account_at_midpoint(self) -> None:
+        now = dt.datetime(2026, 7, 18, 8, 0, tzinfo=app.UTC)
+        rows = [
+            {
+                "key": "first",
+                "label": "primo",
+                "provider": app.PROVIDER_CLAUDE,
+                "source": "claude_oauth_live",
+                "observed_at": now.isoformat(),
+                "windows": [
+                    {
+                        "id": "five_hour",
+                        "label": "Sessione",
+                        "used_percent": 12,
+                        "reset_at": (now + dt.timedelta(hours=4)).isoformat(),
+                    }
+                ],
+            },
+            {
+                "key": "second",
+                "label": "secondo",
+                "provider": app.PROVIDER_CLAUDE,
+                "source": "claude_oauth_live",
+                "observed_at": now.isoformat(),
+                "windows": [
+                    {
+                        "id": "five_hour",
+                        "label": "Sessione",
+                        "used_percent": 0,
+                        "reset_at": None,
+                    }
+                ],
+            },
+        ]
+
+        plan = app.claude_stagger_plan(rows, now)
+
+        self.assertEqual(plan["state"], "schedule_second")
+        self.assertEqual(plan["next_account_key"], "second")
+        self.assertEqual(
+            app.parse_iso(plan["next_activation_at"]),
+            now + dt.timedelta(hours=1, minutes=30),
+        )
+        self.assertFalse(plan["automatic_activation"])
+
+    def test_claude_stagger_plan_detects_balanced_cycles(self) -> None:
+        now = dt.datetime(2026, 7, 18, 8, 0, tzinfo=app.UTC)
+        rows = []
+        for key, reset_hours in (("first", 1), ("second", 3.5)):
+            rows.append(
+                {
+                    "key": key,
+                    "label": key,
+                    "provider": app.PROVIDER_CLAUDE,
+                    "source": "claude_oauth_live",
+                    "observed_at": now.isoformat(),
+                    "windows": [
+                        {
+                            "id": "five_hour",
+                            "label": "Sessione",
+                            "used_percent": 20,
+                            "reset_at": (now + dt.timedelta(hours=reset_hours)).isoformat(),
+                        }
+                    ],
+                }
+            )
+
+        plan = app.claude_stagger_plan(rows, now)
+
+        self.assertEqual(plan["state"], "balanced")
+        self.assertEqual(plan["offset_minutes"], 150)
+        self.assertEqual(
+            app.parse_iso(plan["next_activation_at"]),
+            now + dt.timedelta(hours=1, minutes=1),
+        )
+
+    def test_mask_email_keeps_similar_accounts_distinguishable(self) -> None:
+        self.assertEqual(app.mask_email("sample.user@example.com"), "sam***er@example.com")
+        self.assertEqual(app.mask_email("sample.store@example.com"), "sam***re@example.com")
+
+    def test_codex_live_limit_status_includes_named_model_windows(self) -> None:
+        now = dt.datetime(2026, 7, 18, 4, 0, tzinfo=app.UTC)
+        first_reset = int(dt.datetime(2026, 7, 24, 11, 21, 52, tzinfo=app.UTC).timestamp())
+        second_reset = int(dt.datetime(2026, 7, 25, 2, 25, 12, tzinfo=app.UTC).timestamp())
+        status = app.codex_limit_status(
+            {
+                "rateLimitsByLimitId": {
+                    "codex": {
+                        "limitId": "codex",
+                        "primary": {
+                            "usedPercent": 64,
+                            "windowDurationMins": 10080,
+                            "resetsAt": first_reset,
+                        },
+                        "planType": "pro",
+                    },
+                    "codex_spark": {
+                        "limitId": "codex_spark",
+                        "limitName": "Codex Spark",
+                        "primary": {
+                            "usedPercent": 0,
+                            "windowDurationMins": 10080,
+                            "resetsAt": second_reset,
+                        },
+                    },
+                }
+            },
+            now=now,
+        )
+
+        self.assertFalse(status["limited"])
+        self.assertEqual(status["plan"], "pro")
+        self.assertEqual(len(status["windows"]), 2)
+        self.assertEqual(status["windows"][1]["label"], "Codex Spark: Settimanale")
+        self.assertEqual(int(app.parse_iso(status["next_reset_at"]).timestamp()), first_reset)
+
+    def test_account_limit_overview_selects_first_reset_and_first_unlock(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = app.Paths(root, root / ".claude", root / ".state", root / ".state" / "queue.json", root / ".state" / "logs")
+            now = dt.datetime(2026, 7, 18, 4, 0, tzinfo=app.UTC)
+            claude_reset = "2026-07-18T06:10:00+00:00"
+            claude_available = "2026-07-18T06:11:00+00:00"
+            codex_reset = "2026-07-24T11:21:52+00:00"
+            app.save_account_index(
+                paths,
+                {
+                    "version": 1,
+                    "sessions": {},
+                    "accounts": {
+                        "claude-account": {
+                            "provider": app.PROVIDER_CLAUDE,
+                            "label": "cl***@example.com",
+                            "account_uuid_hash": "claude1",
+                            "limit_status": {
+                                "observed_at": "2026-07-18T04:00:00+00:00",
+                                "source": "claude_oauth_live",
+                                "limited": True,
+                                "available_at": claude_available,
+                                "blocking_reset_at": claude_reset,
+                                "windows": [
+                                    {
+                                        "id": "session",
+                                        "label": "Sessione",
+                                        "used_percent": 100,
+                                        "reset_at": claude_reset,
+                                    }
+                                ],
+                            },
+                        },
+                        "codex:account": {
+                            "provider": app.PROVIDER_CODEX,
+                            "label": "ch***@example.com",
+                            "account_uuid_hash": "codex001",
+                            "limit_status": {
+                                "observed_at": "2026-07-18T04:00:00+00:00",
+                                "source": "codex_app_server_live",
+                                "limited": False,
+                                "available_at": None,
+                                "windows": [
+                                    {
+                                        "id": "codex:primary",
+                                        "label": "Settimanale",
+                                        "used_percent": 64,
+                                        "reset_at": codex_reset,
+                                    }
+                                ],
+                            },
+                        },
+                    },
+                },
+            )
+
+            with patch.object(app, "active_limit_account_keys", return_value={"claude-account", "codex:account"}):
+                overview = app.account_limit_overview(paths, now=now)
+
+            self.assertEqual(len(overview["accounts"]), 2)
+            self.assertEqual(overview["first_reset"]["account_key"], "claude-account")
+            self.assertEqual(
+                app.parse_iso(overview["first_available"]["available_at"]),
+                app.parse_iso(claude_available),
+            )
+            self.assertEqual(overview["limited_count"], 1)
+
+    def test_refresh_account_limits_persists_live_snapshots_without_tokens(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = app.Paths(root, root / ".claude", root / ".state", root / ".state" / "queue.json", root / ".state" / "logs")
+            codex_exe = root / "codex.exe"
+            codex_exe.touch()
+            claude_uuid = "11111111-1111-4111-8111-111111111111"
+            claude = app.AccountInfo(
+                app.hash_text(claude_uuid),
+                "cl***@example.com",
+                app.short_hash(claude_uuid),
+                app.short_hash("org"),
+                app.short_hash("claude@example.com"),
+                app.now_utc(),
+            )
+            codex = app.AccountInfo(
+                "codex:account",
+                "ch***@example.com",
+                "codex-id",
+                None,
+                app.short_hash("chatgpt@example.com"),
+                app.now_utc(),
+            )
+            claude_usage = {
+                "five_hour": {"utilization": 10, "resets_at": "2026-07-18T08:00:00Z"},
+                "seven_day": {"utilization": 20, "resets_at": "2026-07-22T08:00:00Z"},
+            }
+            codex_usage = {
+                "rateLimits": {
+                    "limitId": "codex",
+                    "primary": {
+                        "usedPercent": 30,
+                        "windowDurationMins": 10080,
+                        "resetsAt": int(dt.datetime(2026, 7, 24, tzinfo=app.UTC).timestamp()),
+                    },
+                }
+            }
+
+            with (
+                patch.object(app, "known_claude_account_profiles", return_value={}),
+                patch.object(app, "active_claude_account", return_value=claude),
+                patch.object(app, "active_codex_account", return_value=codex),
+                patch.object(app, "claude_windows_app_roots", return_value=[]),
+                patch.object(
+                    app,
+                    "claude_oauth_sessions",
+                    return_value={
+                        claude_uuid: {
+                            "token": "secret-token-not-for-disk",
+                            "email": "claude@example.com",
+                            "organization_uuid": "org",
+                        }
+                    },
+                ),
+                patch.object(app, "claude_api_json", return_value=claude_usage),
+                patch.object(app, "codex_app_server_request", return_value=codex_usage),
+            ):
+                result = app.refresh_account_limits(
+                    paths,
+                    codex_exe,
+                    force=True,
+                    allow_codex_live=True,
+                )
+
+            index = app.load_account_index(paths)
+            self.assertEqual(result["updated"], 2)
+            self.assertEqual(index["accounts"][claude.key]["limit_status"]["source"], "claude_oauth_live")
+            self.assertEqual(index["accounts"][codex.key]["limit_status"]["source"], "codex_app_server_live")
+            self.assertNotIn("secret-token-not-for-disk", app.account_index_path(paths).read_text(encoding="utf-8"))
+
+    def test_refresh_account_limits_keeps_codex_passive_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            paths = app.Paths(root, root / ".claude", root / ".state", root / ".state" / "queue.json", root / ".state" / "logs")
+            codex_exe = root / "codex.exe"
+            codex_exe.touch()
+            codex = app.AccountInfo(
+                "codex:account",
+                "ch***@example.com",
+                "codex-id",
+                None,
+                app.short_hash("chatgpt@example.com"),
+                app.now_utc(),
+            )
+
+            with (
+                patch.object(app, "known_claude_account_profiles", return_value={}),
+                patch.object(app, "active_claude_account", return_value=None),
+                patch.object(app, "active_codex_account", return_value=codex),
+                patch.object(app, "active_limit_account_keys", return_value={codex.key}),
+                patch.object(app, "codex_transcript_limit_updates", return_value={}),
+                patch.object(app, "indexed_codex_transcript_limit_updates", return_value={}),
+                patch.object(app, "codex_app_server_request") as app_server,
+            ):
+                result = app.refresh_account_limits(paths, codex_exe, force=True)
+
+            self.assertEqual(result["codex_access"], "passive")
+            app_server.assert_not_called()
+
+    def test_dashboard_contains_account_limit_panel(self) -> None:
+        self.assertIn('id="limit-summary"', web.HTML)
+        self.assertIn('id="limit-list"', web.HTML)
+        self.assertIn("function renderAccountLimits", web.HTML)
+        self.assertIn("Primo reset di quota", web.HTML)
+        self.assertIn("Account attualmente limitati", web.HTML)
+        self.assertIn("Sfasamento Claude 2 h 30", web.HTML)
+        self.assertIn("stagger.offset_minutes !== null", web.HTML)
+        self.assertIn("Profili Claude simultanei", web.HTML)
+        self.assertIn("Verra acquisita automaticamente", web.HTML)
+        self.assertIn("Repliche chat Claude", web.HTML)
+        self.assertIn("numero e contenuto identici", web.HTML)
+        self.assertIn("Accesso Codex in background", web.HTML)
+        self.assertIn("sola lettura", web.HTML)
 
     def test_settings_fingerprint_detects_changed_settings_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

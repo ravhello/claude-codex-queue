@@ -53,6 +53,7 @@ Additional capabilities:
 - one-minute safety delay after a parsed reset time;
 - multi-account Claude Code, Cowork artifact and private Claude Code artifact synchronization with archive and delete propagation;
 - Codex task forks for the active ChatGPT-authenticated account, with linked lifecycle sync;
+- per-account Claude and ChatGPT usage windows with the next reset and first available account;
 - account mismatch and view-only checks before actions are enabled;
 - transcript confirmation after every Codex send;
 - local web UI plus a scriptable CLI;
@@ -69,6 +70,15 @@ identifiers remain owned by their original Claude account and are never copied
 to another account, preventing failed remote deletes from restoring a local
 replica. Account switches and session-directory changes wake the sync monitor
 immediately instead of waiting for the normal polling deadline.
+
+Every synchronization pass selects one canonical session record and writes the
+same shared fields to every account replica. It then compares both the chat count
+and a SHA-256 fingerprint of the shared content for every logical session. A
+duplicate, missing replica or content mismatch fails the inventory check and is
+shown on the dashboard instead of being reported as a successful sync. Only
+provider-required account-local transport fields (`sessionId`, private artifact
+`cliSessionId` aliases and `bridgeSessionIds`) are excluded from that comparison;
+they do not change the conversation or its settings.
 
 Account changes are read from Claude's session-bridge log as soon as login
 finishes, before the app writes its first activity to `config.json`. Cowork
@@ -134,6 +144,41 @@ stops synchronization instead of being replaced with an empty one.
 Here, “ChatGPT account” means the account authenticating Codex. This feature
 does not copy ordinary conversations from chatgpt.com, and the Claude feature
 does not copy ordinary claude.ai chats.
+
+### Two Claude Desktop accounts at the same time
+
+The optional multi-account companion uses the MIT-licensed
+[Zoltak-Dev/ai-multi-instance](https://github.com/Zoltak-Dev/ai-multi-instance).
+It gives every Claude Desktop account a separate Chromium `--user-data-dir`, so
+the official Windows app can keep multiple authenticated instances open side by
+side. This project installs the audited source commit rather than an unsigned
+binary:
+
+```powershell
+powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\install-claude-multi-account.ps1
+```
+
+The companion setup requires Windows 10 or later, Git for Windows and Python 3.
+The installer clones source rather than an unsigned binary, checks out a pinned
+commit, verifies the audited SHA-256 hashes and creates a Desktop shortcut.
+Create two Claude profiles in the visible manager and complete Claude's login
+once for each profile. OAuth callbacks must pass through Claude's default MSIX
+instance, so this provider login is the only interactive step. From then on the
+queue discovers every `ClaudeProfiles/<name>` directory, starts authenticated
+profiles again after Windows/app restarts, refreshes their usage every minute
+and shows whether two distinct accounts are simultaneously available.
+
+The dashboard also derives a 2 h 30 stagger plan from the two live five-hour
+reset windows. It never sends a synthetic prompt merely to start or manipulate
+a quota window. At the planned time it identifies the account on which the next
+real queued job should run; normal queue and auto-continue rules still prevent a
+prompt from being spent before the provider reset.
+
+Custom installations can set `CLAUDE_MULTI_INSTANCE_ROOTS` to one or more
+semicolon-separated manager or `ClaudeProfiles` paths. Automatic launch is
+enabled only after the installer records the exact audited commit and source
+hashes. The helper used at runtime is included in both the source package and
+wheel.
 
 ## Quick start
 
@@ -289,7 +334,7 @@ reproducible defects belong in
 
 ## Project status
 
-Current release: **v0.2.8**. The project is alpha software tested on Windows/WSL
+Current release: **v0.3.0**. The project is alpha software tested on Windows/WSL
 with local Claude Code and Codex App workflows. Upstream desktop metadata is not
 a public compatibility contract and may change between provider releases.
 

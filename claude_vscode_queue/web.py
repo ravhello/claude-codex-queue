@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 import os
 import signal
@@ -140,6 +141,35 @@ class WebState:
         self._runner_monitor_poll_seconds = 5.0
         self._runner_monitor_last_check_at: str | None = None
         self._runner_monitor_last_error: str | None = None
+        self._account_dashboard_cache: dict[str, Any] = {}
+        self._account_dashboard_cache_error: str | None = None
+        self.refresh_account_dashboard_cache()
+
+    def refresh_account_dashboard_cache(self) -> dict[str, Any]:
+        try:
+            snapshot = {
+                "active_account": app.active_desktop_account_public(self.paths),
+                "active_claude_code_account": app.account_public_dict(app.active_claude_account(self.paths)),
+                "active_codex_account": app.account_public_dict(app.active_codex_account(self.paths)),
+                "account_index": app.account_index_public(self.paths),
+                "account_limits": app.account_limit_overview(self.paths),
+                "claude_profiles": app.claude_profile_overview(self.paths),
+            }
+        except Exception as exc:
+            with self.lock:
+                self._account_dashboard_cache_error = app.public_error_message(
+                    exc,
+                    "Stato account non disponibile.",
+                )
+                return copy.deepcopy(self._account_dashboard_cache)
+        with self.lock:
+            self._account_dashboard_cache = snapshot
+            self._account_dashboard_cache_error = None
+            return copy.deepcopy(snapshot)
+
+    def account_dashboard_snapshot(self) -> dict[str, Any]:
+        with self.lock:
+            return copy.deepcopy(self._account_dashboard_cache)
 
     def base_command(self) -> list[str]:
         command = [
@@ -337,16 +367,22 @@ class WebState:
             retry = False
             with self.lock:
                 if generation != self._chats_generation:
-                    return
-                if finished_signature != started_signature:
+                    self._chats_refreshing = False
+                    self._chats_refresh_started_at = 0.0
+                    retry = True
+                elif finished_signature != started_signature:
                     self._chats_generation += 1
                     self._chats_desktop_signature = finished_signature
                     self._chats_cache_at = 0.0
+                    self._chats_refreshing = False
+                    self._chats_refresh_started_at = 0.0
                     retry = True
-                elif chats:
-                    self._chats_cache = chats
-                    self._chats_cache_at = time.monotonic()
-                self._chats_refreshing = False
+                else:
+                    if chats:
+                        self._chats_cache = chats
+                        self._chats_cache_at = time.monotonic()
+                    self._chats_refreshing = False
+                    self._chats_refresh_started_at = 0.0
             if retry:
                 self.refresh_chats_background()
 
@@ -362,8 +398,6 @@ class WebState:
                 self._chats_generation += 1
                 self._chats_desktop_signature = signature
                 self._chats_cache_at = 0.0
-                self._chats_refreshing = False
-                self._chats_refresh_started_at = 0.0
             generation = self._chats_generation
             if (
                 not signature_changed
@@ -412,8 +446,6 @@ class WebState:
             self._chats_generation += 1
             self._chats_desktop_signature = signature
             self._chats_cache_at = 0.0
-            self._chats_refreshing = False
-            self._chats_refresh_started_at = 0.0
 
     def claude_version(self, max_age_seconds: int = 300) -> str | None:
         if self.claude_exe is None:
@@ -472,6 +504,14 @@ class WebState:
         results: dict[str, Any] = {}
         errors: list[str] = []
         changed = False
+        if include_claude_transcripts:
+            profile_runtime = app.ensure_claude_multi_instance_profiles_running(self.paths)
+            results["claude_profiles"] = profile_runtime
+            errors.extend(
+                f"Profili Claude: {app.public_error_message(error, 'Avvio automatico non riuscito.')}"
+                for error in profile_runtime.get("errors", [])
+                if error
+            )
         try:
             claude = app.sync_claude_desktop_accounts(
                 self.paths,
@@ -521,6 +561,26 @@ class WebState:
             )
         except Exception as exc:
             errors.append(f"Codex: {app.public_error_message(exc, 'Sincronizzazione non riuscita.')}")
+
+        try:
+            limits = app.refresh_account_limits(
+                self.paths,
+                self.codex_exe,
+                chats=self.cached_chats(),
+                force=False,
+                allow_codex_live=False,
+            )
+            results["limits"] = limits
+            errors.extend(error for error in limits.get("errors", []) if isinstance(error, str) and error)
+        except Exception as exc:
+            errors.append(f"Limiti: {app.public_error_message(exc, 'Aggiornamento non riuscito.')}")
+
+        dashboard_snapshot = self.refresh_account_dashboard_cache()
+        if not dashboard_snapshot:
+            with self.lock:
+                dashboard_error = self._account_dashboard_cache_error
+            if dashboard_error:
+                errors.append(f"Dashboard account: {dashboard_error}")
 
         with self.lock:
             self._account_sync_last_check_at = app.now_utc()
@@ -595,7 +655,7 @@ class WebState:
                     full_scan = cycle_started >= next_full_at
                     result = self.sync_linked_accounts_once(include_claude_transcripts=full_scan)
                     if full_scan:
-                        next_full_at = cycle_started + self._account_sync_full_poll_seconds
+                        next_full_at = time.monotonic() + self._account_sync_full_poll_seconds
                     signature = app.claude_desktop_change_signature(self.paths)
                     elapsed = time.monotonic() - cycle_started
                     claude_result = result.get("claude") if isinstance(result.get("claude"), dict) else {}
@@ -868,6 +928,7 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             chats = self.state.chats()
         version = self.state.claude_version()
         codex_version = self.state.codex_version()
+        account_dashboard = self.state.account_dashboard_snapshot()
         claude_chats = [chat for chat in chats if chat.provider == app.PROVIDER_CLAUDE]
         codex_chats = [chat for chat in chats if chat.provider == app.PROVIDER_CODEX]
         return {
@@ -881,16 +942,19 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
             "codex_home": str(self.state.paths.codex_home),
             "codex_exe": str(self.state.codex_exe) if self.state.codex_exe else None,
             "codex_version": codex_version,
+            "codex_background_access": "passive",
             "chat_count": len(chats),
             "claude_chat_count": len(claude_chats),
             "codex_chat_count": len(codex_chats),
             "queueable_chat_count": len([chat for chat in chats if chat.can_queue]),
             "sources": sorted({chat.source for chat in chats}),
             "local_time": app.now_utc(),
-            "active_account": app.active_desktop_account_public(self.state.paths),
-            "active_claude_code_account": app.account_public_dict(app.active_claude_account(self.state.paths)),
-            "active_codex_account": app.account_public_dict(app.active_codex_account(self.state.paths)),
-            "account_index": app.account_index_public(self.state.paths),
+            "active_account": account_dashboard.get("active_account"),
+            "active_claude_code_account": account_dashboard.get("active_claude_code_account"),
+            "active_codex_account": account_dashboard.get("active_codex_account"),
+            "account_index": account_dashboard.get("account_index") or {"accounts": []},
+            "account_limits": account_dashboard.get("account_limits") or {"accounts": []},
+            "claude_profiles": account_dashboard.get("claude_profiles") or {"profiles": []},
             "account_sync": self.state.account_sync_status(),
             "runner": self.state.runner_status(),
         }
@@ -1323,6 +1387,60 @@ HTML = r"""<!doctype html>
       font-size: 12px;
       word-break: break-word;
     }
+    .limit-summary {
+      border-left: 3px solid var(--accent);
+      padding: 2px 0 2px 10px;
+      margin-bottom: 10px;
+      line-height: 1.5;
+    }
+    .limit-list { display: grid; }
+    .limit-account {
+      border-top: 1px solid var(--line);
+      padding: 10px 0;
+      min-width: 0;
+    }
+    .limit-account:first-child { border-top: 0; padding-top: 2px; }
+    .limit-account-head {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 8px;
+      margin-bottom: 6px;
+    }
+    .limit-account-name { min-width: 0; overflow-wrap: anywhere; }
+    .limit-state {
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      flex: 0 0 auto;
+      font-size: 11px;
+      padding: 1px 6px;
+    }
+    .limit-state.available { color: var(--ok); border-color: #bbf7d0; background: #f0fdf4; }
+    .limit-state.limited { color: var(--danger); border-color: #fecaca; background: #fff1f2; }
+    .limit-state.known { color: var(--blue); border-color: #bfdbfe; background: #eff6ff; }
+    .limit-state.stale, .limit-state.unknown { color: var(--muted); background: #f8fafc; }
+    .limit-window {
+      display: grid;
+      grid-template-columns: minmax(90px, 1fr) 96px minmax(120px, 1.35fr);
+      gap: 7px;
+      align-items: center;
+      color: var(--muted);
+      font-size: 11px;
+      margin-top: 4px;
+    }
+    .limit-window-label { color: var(--ink); overflow-wrap: anywhere; }
+    progress {
+      appearance: none;
+      width: 58px;
+      height: 7px;
+      border: 0;
+      border-radius: 4px;
+      overflow: hidden;
+      background: #e5e7eb;
+    }
+    progress::-webkit-progress-bar { background: #e5e7eb; }
+    progress::-webkit-progress-value { background: var(--accent); }
+    progress::-moz-progress-bar { background: var(--accent); }
     .chat-list {
       display: grid;
       gap: 7px;
@@ -1428,6 +1546,10 @@ HTML = r"""<!doctype html>
       main { grid-template-columns: 1fr; }
       header { height: auto; padding: 12px 14px; align-items: flex-start; }
     }
+    @media (max-width: 480px) {
+      .limit-window { grid-template-columns: minmax(0, 1fr) 96px; }
+      .limit-window-reset { grid-column: 1 / -1; }
+    }
   </style>
 </head>
 <body>
@@ -1445,6 +1567,11 @@ HTML = r"""<!doctype html>
       <section>
         <h2>Ambiente</h2>
         <div id="doctor" class="meta">Caricamento...</div>
+      </section>
+      <section>
+        <h2>Limiti account</h2>
+        <div id="limit-summary" class="limit-summary meta">Rilevamento in corso...</div>
+        <div id="limit-list" class="limit-list"></div>
       </section>
       <section>
         <h2>Chat</h2>
@@ -1542,11 +1669,33 @@ HTML = r"""<!doctype html>
       const account = data.active_account;
       const claudeCodeAccount = data.active_claude_code_account;
       const codexAccount = data.active_codex_account;
+      const claudeProfiles = data.claude_profiles || {};
       const accounts = data.account_index && Array.isArray(data.account_index.accounts) ? data.account_index.accounts : [];
       const accountSync = data.account_sync || {};
       const claudeSync = accountSync.last_result && accountSync.last_result.claude
         ? accountSync.last_result.claude
         : {};
+      const claudeInventories = Array.isArray(claudeSync.inventories) ? claudeSync.inventories : [];
+      const claudeReplicaCounts = {};
+      claudeInventories.forEach((inventory) => {
+        const counts = inventory && inventory.counts && typeof inventory.counts === "object"
+          ? inventory.counts
+          : {};
+        Object.entries(counts).forEach(([accountKey, count]) => {
+          claudeReplicaCounts[accountKey] = Number(claudeReplicaCounts[accountKey] || 0) + Number(count || 0);
+        });
+      });
+      const claudeReplicaValues = Object.values(claudeReplicaCounts);
+      const claudeReplicaAccountCount = claudeReplicaValues.length;
+      const claudeReplicaCountsMatch = claudeReplicaValues.length > 0
+        && claudeReplicaValues.every((count) => count === claudeReplicaValues[0]);
+      const claudeReplicaContentMatches = claudeInventories.length > 0
+        && claudeInventories.every((inventory) => inventory && inventory.consistent === true);
+      const claudeReplicaStatus = claudeInventories.length === 0
+        ? "in attesa del primo controllo"
+        : claudeReplicaAccountCount >= 2 && claudeReplicaCountsMatch && claudeReplicaContentMatches
+        ? `${claudeReplicaAccountCount} account · ${claudeReplicaValues[0]} chat per account · numero e contenuto identici`
+        : `verifica non superata · conteggi: ${claudeReplicaValues.join(" / ") || "non disponibili"}`;
       const codeArtifacts = Number(claudeSync.code_artifacts || 0);
       const pendingArtifactAccounts = Number(claudeSync.code_artifact_pending_accounts || 0);
       const artifactStatus = codeArtifacts > 0
@@ -1564,11 +1713,17 @@ HTML = r"""<!doctype html>
         `<b>Claude</b>: ${escapeHtml(data.claude_version || "non trovato")}`,
         `<b>Account app Claude</b>: ${escapeHtml(account ? account.label : "non rilevato")}`,
         `<b>Account CLI Claude Code</b>: ${escapeHtml(claudeCodeAccount ? claudeCodeAccount.label : "non rilevato")}`,
+        `<b>Profili Claude simultanei</b>: ${escapeHtml(String(Number(claudeProfiles.connected_count) || 0))} collegati · `
+          + `${escapeHtml(String(Number(claudeProfiles.distinct_account_count) || 0))} account distinti · `
+          + `${claudeProfiles.simultaneous_ready ? "pronti" : "da completare"}`
+          + `${claudeProfiles.auto_launch_enabled ? " · avvio automatico attivo" : ""}`,
         `<b>Codex</b>: ${escapeHtml(data.codex_version || "non trovato")}`,
         `<b>Account Codex</b>: ${escapeHtml(codexAccount ? codexAccount.label : "non rilevato")}`,
+        `<b>Accesso Codex in background</b>: ${data.codex_background_access === "passive" ? "sola lettura" : "attivo"}`,
         `<b>Account registrati</b>: ${escapeHtml(String(accounts.length))}`,
         `<b>Sync account</b>: ${escapeHtml(syncStatus)}${accountSync.last_check_at ? ` · ${escapeHtml(formatDateTime(accountSync.last_check_at))}` : ""}`,
         accountSync.last_full_check_at ? `<b>Scansione completa</b>: ${escapeHtml(formatDateTime(accountSync.last_full_check_at))}` : "",
+        `<b>Repliche chat Claude</b>: ${escapeHtml(claudeReplicaStatus)}`,
         `<b>Artefatti Claude Code</b>: ${escapeHtml(artifactStatus)}`,
         `<b>Chat Claude</b>: ${data.claude_chat_count || 0}`,
         `<b>Task Codex</b>: ${data.codex_chat_count || 0}`,
@@ -1577,7 +1732,125 @@ HTML = r"""<!doctype html>
         `<b>CLI Claude</b>: ${escapeHtml(data.claude_exe || "non trovato")}`,
         `<b>CLI Codex</b>: ${escapeHtml(data.codex_exe || "non trovato")}`,
       ].filter(Boolean).join("<br>");
+      renderAccountLimits(data.account_limits || {}, accountSync);
       renderRunner(data.runner || {});
+    }
+
+    function renderAccountLimits(overview, accountSync) {
+      const accounts = Array.isArray(overview.accounts) ? overview.accounts : [];
+      const firstReset = overview.first_reset || null;
+      const firstAvailable = overview.first_available || null;
+      const stagger = overview.stagger_plan || null;
+      const summary = [];
+      if (firstAvailable) {
+        summary.push(
+          `<b>Primo account che si sblocca</b>: ${escapeHtml(firstAvailable.provider_label)} · `
+          + `${escapeHtml(firstAvailable.account_label)} · ${escapeHtml(firstAvailable.account_short_key || "")} · `
+          + `${escapeHtml(formatDateTime(firstAvailable.available_at))}`
+        );
+      } else {
+        summary.push(`<b>Account attualmente limitati</b>: ${escapeHtml(String(Number(overview.limited_count) || 0))}`);
+      }
+      if (firstReset) {
+        summary.push(
+          `<b>Primo reset di quota</b>: ${escapeHtml(firstReset.provider_label)} · `
+          + `${escapeHtml(firstReset.account_label)} · ${escapeHtml(firstReset.account_short_key || "")} · `
+          + `${escapeHtml(firstReset.window_label || "Limite")} · ${escapeHtml(formatDateTime(firstReset.reset_at))}`
+        );
+      } else {
+        summary.push("Nessun reset futuro rilevato nei dati disponibili.");
+      }
+      if (stagger) {
+        const stateLabels = {
+          needs_two_logins: "servono due login simultanei",
+          ready_to_start: "due account pronti",
+          schedule_second: "secondo ciclo da avviare",
+          balanced: "cicli sfalsati correttamente",
+          rebalance: "sfasamento da correggere",
+        };
+        const nextActivation = stagger.next_activation_at
+          ? ` · prossima finestra: ${escapeHtml(formatDateTime(stagger.next_activation_at))}`
+            + (stagger.next_account_label ? ` · ${escapeHtml(stagger.next_account_label)}` : "")
+          : "";
+        const offset = stagger.offset_minutes !== null
+          && stagger.offset_minutes !== undefined
+          && Number.isFinite(Number(stagger.offset_minutes))
+          ? ` · sfasamento rilevato: ${escapeHtml(String(stagger.offset_minutes))} min`
+          : "";
+        summary.push(
+          `<b>Sfasamento Claude 2 h 30</b>: ${escapeHtml(stateLabels[stagger.state] || stagger.state || "in attesa")}`
+          + `${offset}${nextActivation}`
+        );
+        summary.push(`<span class="meta">${escapeHtml(stagger.message || "")}</span>`);
+      }
+      const checking = !!(accountSync && accountSync.in_progress);
+      const refreshed = overview.refreshed_at
+        ? `Dati aggiornati: ${escapeHtml(formatDateTime(overview.refreshed_at))}`
+        : (checking ? "Lettura account in corso..." : "In attesa del primo dato di utilizzo.");
+      summary.push(`<span class="meta">${refreshed}${checking ? " · controllo in corso" : ""}</span>`);
+      $("limit-summary").innerHTML = summary.join("<br>");
+
+      if (!accounts.length) {
+        $("limit-list").innerHTML = `<div class="empty">Nessun account registrato</div>`;
+        return;
+      }
+      const stateLabels = {
+        available: "Disponibile",
+        limited: "Limitato",
+        known: "Ultimo dato noto",
+        stale: "Da aggiornare",
+        unknown: "Non rilevato",
+      };
+      const sourceLabels = {
+        claude_oauth_live: "Claude live",
+        codex_app_server_live: "ChatGPT live",
+        claude_transcript: "transcript Claude",
+        codex_transcript: "transcript ChatGPT",
+      };
+      $("limit-list").innerHTML = accounts.map((account) => {
+        const windows = Array.isArray(account.windows) ? account.windows : [];
+        const windowRows = windows.length
+          ? windows.map((window) => {
+              const numeric = Number(window.used_percent);
+              const hasPercent = Number.isFinite(numeric);
+              const percent = hasPercent ? Math.max(0, Math.min(100, numeric)) : 0;
+              const percentLabel = hasPercent ? `${Math.round(numeric)}%` : "n/d";
+              const resetLabel = window.reset_at
+                ? `${window.future ? "Reset" : "Reset trascorso"}: ${formatDateTime(window.reset_at)}`
+                : "Reset non comunicato";
+              return `
+                <div class="limit-window">
+                  <span class="limit-window-label">${escapeHtml(window.label || "Limite")}</span>
+                  <span title="${escapeAttr(percentLabel)}"><progress max="100" value="${escapeAttr(percent)}"></progress> ${escapeHtml(percentLabel)}</span>
+                  <span class="limit-window-reset">${escapeHtml(resetLabel)}</span>
+                </div>
+              `;
+            }).join("")
+          : `<div class="meta">Quota non leggibile ora. Verra acquisita automaticamente al prossimo accesso dell'account.</div>`;
+        const activityLabel = account.active
+          ? (account.state === "available" || account.state === "limited" ? "attivo ora" : "configurato ora")
+          : "account memorizzato";
+        const details = [
+          activityLabel,
+          account.plan ? `piano ${account.plan}` : "",
+          account.observed_at ? `letto ${formatDateTime(account.observed_at)}` : "mai letto",
+          sourceLabels[account.source] || "",
+        ].filter(Boolean).join(" · ");
+        const availability = account.available_at
+          ? `<div class="meta"><b>Utilizzabile</b>: ${escapeHtml(formatDateTime(account.available_at))} (margine incluso)</div>`
+          : "";
+        return `
+          <div class="limit-account">
+            <div class="limit-account-head">
+              <div class="limit-account-name"><b>${escapeHtml(account.provider_label)}</b> · ${escapeHtml(account.label)} · ${escapeHtml(account.short_key || "")}</div>
+              <span class="limit-state ${escapeAttr(account.state || "unknown")}">${escapeHtml(stateLabels[account.state] || "Non rilevato")}</span>
+            </div>
+            ${windowRows}
+            ${availability}
+            <div class="meta" style="margin-top:5px">${escapeHtml(details)}</div>
+          </div>
+        `;
+      }).join("");
     }
 
     function renderRunner(runner) {

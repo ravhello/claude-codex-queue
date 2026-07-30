@@ -49,6 +49,16 @@ CLAUDE_DESKTOP_TRY_AGAIN_EXIT = 4
 RATE_LIMIT_EXIT = 75
 CONFIG_CHANGED_EXIT = 78
 RATE_LIMIT_RESET_DELAY_SECONDS = 60
+ACCOUNT_LIMIT_REFRESH_SECONDS = 5 * 60
+ACCOUNT_LIMIT_LIVE_MAX_AGE_SECONDS = 5 * 60
+ACCOUNT_LIMIT_TRANSCRIPT_SCAN_PER_ACCOUNT = 8
+CLAUDE_SESSION_WINDOW_SECONDS = 5 * 60 * 60
+CLAUDE_STAGGER_TARGET_SECONDS = CLAUDE_SESSION_WINDOW_SECONDS // 2
+CLAUDE_MULTI_INSTANCE_ENV_VAR = "CLAUDE_MULTI_INSTANCE_ROOTS"
+CLAUDE_MULTI_INSTANCE_REPOSITORY = "https://github.com/Zoltak-Dev/ai-multi-instance.git"
+CLAUDE_MULTI_INSTANCE_COMMIT = "a5fba4a75f00cd680125f079dc47a3c43d0e0d21"
+CLAUDE_MULTI_INSTANCE_ENGINE_SHA256 = "a041e3ed220d9b58c290f957c7500ee9d6faba625b992e2878efd9e8eab9a3ed"
+CLAUDE_MULTI_INSTANCE_AUTO_LAUNCH_FILE_NAME = "claude-multi-instance-auto-launch.json"
 SYNTHETIC_MODELS = {"<synthetic>"}
 CLAUDE_EXTERNAL_AUTH_ENV_VARS = {
     "ANTHROPIC_API_KEY",
@@ -136,9 +146,17 @@ DESKTOP_ARTIFACT_LOCAL_ONLY_FIELDS = {
     "sharedAnchorConversationUuid",
     "sharedArtifactUuid",
 }
+DESKTOP_SESSION_ACCOUNT_LOCAL_FIELDS = frozenset(
+    {
+        "sessionId",
+        "cliSessionId",
+        "bridgeSessionIds",
+    }
+)
 CLAUDE_OAUTH_SESSION_CACHE_TTL_SECONDS = 55.0
 _DESKTOP_SYNC_LOCK = threading.RLock()
 _ACCOUNT_INDEX_LOCK = threading.RLock()
+_CODEX_APP_SERVER_LOCK = threading.RLock()
 _CLAUDE_OAUTH_SESSION_CACHE_LOCK = threading.RLock()
 _DESKTOP_SESSION_FILE_CACHE_LOCK = threading.RLock()
 _DESKTOP_ACCOUNT_LOG_CACHE_LOCK = threading.RLock()
@@ -149,7 +167,7 @@ _CLAUDE_OAUTH_SESSION_CACHE: dict[
 ] = {}
 _DESKTOP_SESSION_FILE_CACHE: dict[
     str,
-    tuple[tuple[int, int, int], dict[str, Any]],
+    tuple[tuple[int, int, int], str, dict[str, Any]],
 ] = {}
 _DESKTOP_ACCOUNT_LOG_CACHE: dict[
     str,
@@ -908,7 +926,10 @@ def resolve_paths(windows_home: str | None = None, state_dir: str | None = None)
     else:
         preferred_state = selected_home / APP_DIR_NAME
         legacy_state = selected_home / LEGACY_APP_DIR_NAME
-        state = preferred_state if path_exists(preferred_state) or not path_exists(legacy_state) else legacy_state
+        if path_exists(legacy_state / QUEUE_FILE_NAME) and not path_exists(preferred_state / QUEUE_FILE_NAME):
+            state = legacy_state
+        else:
+            state = preferred_state if path_exists(preferred_state) or not path_exists(legacy_state) else legacy_state
     return Paths(
         windows_home=selected_home,
         claude_home=claude_home,
@@ -1278,8 +1299,13 @@ def mask_email(value: str | None) -> str | None:
     local, domain = value.split("@", 1)
     if not local or not domain:
         return None
-    visible_local = local[:2] if len(local) > 2 else local[:1]
-    return f"{visible_local}***@{domain}"
+    if len(local) <= 2:
+        masked_local = f"{local[:1]}***"
+    elif len(local) <= 5:
+        masked_local = f"{local[:2]}***{local[-1:]}"
+    else:
+        masked_local = f"{local[:3]}***{local[-2:]}"
+    return f"{masked_local}@{domain}"
 
 
 def account_index_path(paths: Paths) -> Path:
@@ -1561,6 +1587,7 @@ def account_index_public(paths: Paths) -> dict[str, Any]:
                 "key": key,
                 "short_key": key[:8],
                 "label": value.get("label") or f"Account {key[:8]}",
+                "provider": value.get("provider") or PROVIDER_CLAUDE,
                 "first_seen_at": value.get("first_seen_at"),
                 "last_seen_at": value.get("last_seen_at"),
                 "source_changed_at": value.get("source_changed_at"),
@@ -1744,6 +1771,7 @@ def codex_thread_rows(codex_home: Path) -> dict[str, dict[str, Any]]:
     connection: sqlite3.Connection | None = None
     try:
         connection = sqlite3.connect(f"file:{database.as_posix()}?mode=ro", uri=True, timeout=1)
+        connection.execute("PRAGMA query_only=ON")
         connection.row_factory = sqlite3.Row
         available = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
         selected = [column for column in columns if column in available]
@@ -1761,11 +1789,14 @@ def codex_thread_rows(codex_home: Path) -> dict[str, dict[str, Any]]:
         return {}
     script = r"""
 import json
+import pathlib
 import sqlite3
 import sys
 
 columns = json.loads(sys.argv[2])
-connection = sqlite3.connect(sys.argv[1])
+database_uri = pathlib.Path(sys.argv[1]).resolve().as_uri() + "?mode=ro"
+connection = sqlite3.connect(database_uri, uri=True, timeout=1)
+connection.execute("PRAGMA query_only=ON")
 connection.row_factory = sqlite3.Row
 available = {row[1] for row in connection.execute("PRAGMA table_info(threads)")}
 selected = [column for column in columns if column in available]
@@ -1865,7 +1896,7 @@ def codex_timestamp(index_entry: dict[str, Any], row: dict[str, Any]) -> str | N
     return max(values).astimezone().replace(microsecond=0).isoformat()
 
 
-def codex_app_server_request(
+def _codex_app_server_request_unlocked(
     codex_exe: Path,
     method: str,
     params: dict[str, Any],
@@ -1874,6 +1905,12 @@ def codex_app_server_request(
     codex_home: Path | None = None,
 ) -> dict[str, Any]:
     command = codex_cli_command(codex_exe, ["app-server", "--listen", "stdio://"])
+    process_env = codex_subprocess_env(
+        codex_home,
+        windows=codex_executable_is_windows(codex_exe),
+    )
+    process_env["RUST_LOG"] = "warn"
+    process_env["RUST_LOG_STYLE"] = "never"
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
@@ -1883,10 +1920,7 @@ def codex_app_server_request(
         encoding="utf-8",
         errors="replace",
         bufsize=1,
-        env=codex_subprocess_env(
-            codex_home,
-            windows=codex_executable_is_windows(codex_exe),
-        ),
+        env=process_env,
         **background_process_kwargs(),
     )
     responses: queue_module.Queue[dict[str, Any]] = queue_module.Queue()
@@ -1991,6 +2025,26 @@ def codex_app_server_request(
     if not isinstance(value, dict):
         raise ValueError(f"Risposta Codex {method} non valida.")
     return value
+
+
+def codex_app_server_request(
+    codex_exe: Path,
+    method: str,
+    params: dict[str, Any],
+    timeout: int = 45,
+    *,
+    codex_home: Path | None = None,
+) -> dict[str, Any]:
+    lock_root = codex_home or Path(tempfile.gettempdir()) / "claude-codex-queue"
+    lock_state = lock_root / ".claude-codex-queue-app-server"
+    with _state_file_lock(_CODEX_APP_SERVER_LOCK, lock_state):
+        return _codex_app_server_request_unlocked(
+            codex_exe,
+            method,
+            params,
+            timeout,
+            codex_home=codex_home,
+        )
 
 
 def codex_thread_turns(
@@ -2542,6 +2596,65 @@ def workspace_storage_root(paths: Paths) -> Path:
     return paths.windows_home / "AppData" / "Roaming" / "Code" / "User" / "workspaceStorage"
 
 
+def claude_profile_root_has_state(path: Path) -> bool:
+    return any(
+        (path / marker).exists()
+        for marker in (
+            "config.json",
+            "Local State",
+            "Network/Cookies",
+            "claude-code-sessions",
+            "local-agent-mode-sessions",
+            "logs",
+        )
+    )
+
+
+def claude_multi_instance_manager_candidates(paths: Paths) -> list[Path]:
+    candidates: list[Path] = []
+    configured = os.environ.get(CLAUDE_MULTI_INSTANCE_ENV_VAR, "")
+    for raw in re.split(r"[;\r\n]+", configured):
+        value = raw.strip().strip('"')
+        if value:
+            candidates.append(windows_to_local_path(value))
+
+    candidates.extend(
+        [
+            paths.state_dir / "companions" / "ai-multi-instance",
+            paths.windows_home / "AppData" / "Local" / "ClaudeCodexQueue" / "ai-multi-instance",
+        ]
+    )
+    for base in (
+        paths.windows_home / "Desktop",
+        paths.windows_home / "Documents",
+        paths.windows_home / "Downloads",
+    ):
+        candidates.append(base / "ai-multi-instance")
+    return unique_paths(candidates)
+
+
+def claude_multi_instance_profile_roots(paths: Paths) -> list[Path]:
+    profiles: list[Path] = []
+    for candidate in claude_multi_instance_manager_candidates(paths):
+        if claude_profile_root_has_state(candidate):
+            profiles.append(candidate)
+        profile_parent = candidate if candidate.name.casefold() == "claudeprofiles" else candidate / "ClaudeProfiles"
+        try:
+            children = [child for child in profile_parent.iterdir() if child.is_dir()]
+        except OSError:
+            children = []
+        profiles.extend(child for child in children if claude_profile_root_has_state(child))
+    return unique_paths(profiles)
+
+
+def claude_multi_instance_manager(paths: Paths) -> Path | None:
+    for candidate in claude_multi_instance_manager_candidates(paths):
+        manager = candidate.parent if candidate.name.casefold() == "claudeprofiles" else candidate
+        if (manager / "main.py").is_file() and (manager / "engine.py").is_file():
+            return manager
+    return None
+
+
 def claude_windows_app_roots(paths: Paths) -> list[Path]:
     candidates: list[Path] = []
     packages = paths.windows_home / "AppData" / "Local" / "Packages"
@@ -2554,15 +2667,164 @@ def claude_windows_app_roots(paths: Paths) -> list[Path]:
             paths.windows_home / "AppData" / "Local" / "Claude",
         ]
     )
+    candidates.extend(claude_multi_instance_profile_roots(paths))
     return [
         path
         for path in unique_paths(candidates)
         if path.exists()
-        and any(
-            (path / marker).exists()
-            for marker in ("config.json", "claude-code-sessions", "local-agent-mode-sessions", "logs")
-        )
+        and claude_profile_root_has_state(path)
     ]
+
+
+def claude_profile_overview(paths: Paths) -> dict[str, Any]:
+    isolated_roots = {
+        str(root).casefold(): root
+        for root in claude_multi_instance_profile_roots(paths)
+    }
+    state = load_desktop_sync_state(paths)
+    rows: list[dict[str, Any]] = []
+    account_ids: set[str] = set()
+    for root in claude_windows_app_roots(paths):
+        context = active_desktop_account_context(root)
+        config = desktop_config(root)
+        account_uuid = None if context.logged_out else context.account_uuid
+        root_state = desktop_existing_root_state(state, root)
+        profiles = root_state.get("oauth_account_profiles")
+        profile = profiles.get(account_uuid) if account_uuid and isinstance(profiles, dict) else None
+        email = profile.get("email") if isinstance(profile, dict) else None
+        has_oauth = any(
+            isinstance(config.get(key), str) and bool(config.get(key))
+            for key in ("oauth:tokenCacheV2", "oauth:tokenCache")
+        )
+        has_cookie_store = (root / "Network" / "Cookies").is_file()
+        connected = bool(account_uuid or has_oauth or has_cookie_store)
+        if account_uuid:
+            account_ids.add(account_uuid)
+        isolated = str(root).casefold() in isolated_roots
+        rows.append(
+            {
+                "name": root.name if isolated else "Principale",
+                "kind": "isolated" if isolated else "default",
+                "connected": connected,
+                "account_short_key": account_uuid[:8] if account_uuid else None,
+                "account_uuid_hash": short_hash(account_uuid),
+                "label": mask_email(email) if isinstance(email, str) and email else None,
+            }
+        )
+    rows.sort(key=lambda row: (row["kind"] != "default", str(row["name"]).casefold()))
+    return {
+        "manager_installed": claude_multi_instance_manager(paths) is not None,
+        "auto_launch_enabled": claude_multi_instance_auto_launch_config(paths) is not None,
+        "profile_count": len(rows),
+        "isolated_count": len([row for row in rows if row["kind"] == "isolated"]),
+        "connected_count": len([row for row in rows if row["connected"]]),
+        "distinct_account_count": len(account_ids),
+        "simultaneous_ready": len(account_ids) >= 2,
+        "profiles": rows,
+    }
+
+
+def claude_multi_instance_auto_launch_path(paths: Paths) -> Path:
+    return paths.state_dir / CLAUDE_MULTI_INSTANCE_AUTO_LAUNCH_FILE_NAME
+
+
+def claude_multi_instance_auto_launch_config(paths: Paths) -> dict[str, Any] | None:
+    value = load_json_file(claude_multi_instance_auto_launch_path(paths))
+    if value.get("enabled") is not True or value.get("commit") != CLAUDE_MULTI_INSTANCE_COMMIT:
+        return None
+    raw_manager = value.get("manager")
+    if not isinstance(raw_manager, str) or not raw_manager:
+        return None
+    configured_manager = windows_to_local_path(raw_manager)
+    discovered_manager = claude_multi_instance_manager(paths)
+    if discovered_manager is None:
+        return None
+    try:
+        configured_key = str(configured_manager.resolve()).casefold()
+        discovered_key = str(discovered_manager.resolve()).casefold()
+    except OSError:
+        return None
+    if configured_key != discovered_key:
+        return None
+    try:
+        engine_sha256 = sha256_file(discovered_manager / "engine.py")
+    except OSError:
+        return None
+    if engine_sha256 != CLAUDE_MULTI_INSTANCE_ENGINE_SHA256:
+        return None
+    return value
+
+
+def ensure_claude_multi_instance_profiles_running(paths: Paths) -> dict[str, Any]:
+    config = claude_multi_instance_auto_launch_config(paths)
+    manager = claude_multi_instance_manager(paths)
+    if config is None or manager is None:
+        return {"enabled": False, "checked": False, "running": [], "launched": [], "errors": []}
+    helper = Path(__file__).resolve().with_name("ensure_claude_profiles.py")
+    if not helper.is_file():
+        return {
+            "enabled": True,
+            "checked": False,
+            "running": [],
+            "launched": [],
+            "errors": ["Helper di avvio profili non trovato."],
+        }
+    if is_wsl():
+        launcher = shutil.which("py.exe") or shutil.which("python.exe")
+    else:
+        launcher = shutil.which("py.exe") or shutil.which("python.exe") or shutil.which("python")
+    if launcher is None:
+        return {
+            "enabled": True,
+            "checked": False,
+            "running": [],
+            "launched": [],
+            "errors": ["Python per Windows non trovato."],
+        }
+    launcher_command = local_to_windows_path(Path(launcher)) if is_wsl() else launcher
+    command = [launcher_command]
+    if Path(launcher).name.casefold() == "py.exe":
+        command.append("-3")
+    command.extend([local_to_windows_path(helper), local_to_windows_path(manager)])
+    if is_wsl():
+        command = local_windows_hidden_command(command)
+    try:
+        completed = subprocess.run(
+            command,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            capture_output=True,
+            timeout=60,
+            **background_process_kwargs(),
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        return {
+            "enabled": True,
+            "checked": False,
+            "running": [],
+            "launched": [],
+            "errors": [public_error_message(exc, "Avvio profili Claude non riuscito.")],
+        }
+    try:
+        payload = json.loads(completed.stdout.lstrip("\ufeff\r\n ")) if completed.stdout.strip() else {}
+    except json.JSONDecodeError:
+        payload = {}
+    if completed.returncode != 0 or not isinstance(payload, dict):
+        return {
+            "enabled": True,
+            "checked": False,
+            "running": [],
+            "launched": [],
+            "errors": ["Avvio profili Claude non riuscito."],
+        }
+    return {
+        "enabled": True,
+        "checked": True,
+        "running": [value for value in payload.get("running", []) if isinstance(value, str)],
+        "launched": [value for value in payload.get("launched", []) if isinstance(value, str)],
+        "errors": [value for value in payload.get("errors", []) if isinstance(value, str)],
+    }
 
 
 def file_tail_text(path: Path, max_bytes: int) -> str:
@@ -2970,13 +3232,34 @@ def claude_oauth_sessions(
     return sessions
 
 
+def desktop_session_content_fingerprint(path: Path, stat: os.stat_result) -> str | None:
+    sample_size = 4096
+    try:
+        with path.open("rb") as handle:
+            first = handle.read(sample_size)
+            last = b""
+            if stat.st_size > sample_size:
+                handle.seek(max(0, stat.st_size - sample_size))
+                last = handle.read(sample_size)
+    except OSError:
+        return None
+    digest = hashlib.sha256()
+    digest.update(str(stat.st_size).encode("ascii"))
+    digest.update(first)
+    digest.update(last)
+    return digest.hexdigest()
+
+
 def cached_desktop_session_json(path: Path, stat: os.stat_result) -> dict[str, Any]:
     key = str(path).casefold() if os.name == "nt" or str(path).startswith("/mnt/") else str(path)
     signature = (stat.st_mtime_ns, stat.st_size, stat.st_ctime_ns)
+    fingerprint = desktop_session_content_fingerprint(path, stat)
+    if fingerprint is None:
+        return {}
     with _DESKTOP_SESSION_FILE_CACHE_LOCK:
         cached = _DESKTOP_SESSION_FILE_CACHE.get(key)
-        if cached is not None and cached[0] == signature:
-            return copy.deepcopy(cached[1])
+        if cached is not None and cached[0] == signature and cached[1] == fingerprint:
+            return copy.deepcopy(cached[2])
     try:
         value = json.loads(path.read_text(encoding="utf-8-sig"))
     except (OSError, UnicodeError, json.JSONDecodeError):
@@ -2986,7 +3269,7 @@ def cached_desktop_session_json(path: Path, stat: os.stat_result) -> dict[str, A
     with _DESKTOP_SESSION_FILE_CACHE_LOCK:
         if len(_DESKTOP_SESSION_FILE_CACHE) >= 4096:
             _DESKTOP_SESSION_FILE_CACHE.clear()
-        _DESKTOP_SESSION_FILE_CACHE[key] = (signature, copy.deepcopy(value))
+        _DESKTOP_SESSION_FILE_CACHE[key] = (signature, fingerprint, copy.deepcopy(value))
     return value
 
 
@@ -3106,6 +3389,25 @@ def sanitize_desktop_session_data(data: dict[str, Any]) -> dict[str, Any]:
     if "isArchived" in sanitized and not isinstance(sanitized["isArchived"], bool):
         sanitized["isArchived"] = False
     return sanitized
+
+
+def desktop_shared_session_data(data: dict[str, Any]) -> dict[str, Any]:
+    sanitized = sanitize_desktop_session_data(data)
+    return {
+        key: copy.deepcopy(value)
+        for key, value in sanitized.items()
+        if key not in DESKTOP_SESSION_ACCOUNT_LOCAL_FIELDS
+    }
+
+
+def desktop_session_content_hash(data: dict[str, Any]) -> str:
+    payload = json.dumps(
+        desktop_shared_session_data(data),
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def write_desktop_session_json(path: Path, data: dict[str, Any]) -> None:
@@ -4227,6 +4529,14 @@ def desktop_record_mtime_ns(record: DesktopSessionRecord) -> int:
     return record.mtime_ns
 
 
+def desktop_record_freshness_key(record: DesktopSessionRecord) -> tuple[int, int, str]:
+    return (
+        desktop_record_timestamp_ms(record),
+        desktop_record_mtime_ns(record),
+        str(record.path),
+    )
+
+
 def desktop_record_snapshot(record: DesktopSessionRecord) -> dict[str, Any]:
     try:
         relative_path = record.path.relative_to(record.sessions_root).as_posix()
@@ -4238,6 +4548,7 @@ def desktop_record_snapshot(record: DesktopSessionRecord) -> dict[str, Any]:
         "path": relative_path,
         "state": desktop_record_state(record),
         "mtime_ns": desktop_record_mtime_ns(record),
+        "content_hash": desktop_session_content_hash(record.data),
         "present": True,
         "missing_scans": 0,
     }
@@ -4256,7 +4567,7 @@ def desktop_primary_records(
             session_id = desktop_logical_session_id(root_state, session_id)
         key = (session_id, desktop_record_slot(record))
         existing = primary.get(key)
-        if existing is None or desktop_record_mtime_ns(record) >= desktop_record_mtime_ns(existing):
+        if existing is None or desktop_record_freshness_key(record) >= desktop_record_freshness_key(existing):
             primary[key] = record
     return primary
 
@@ -4370,7 +4681,8 @@ def refresh_desktop_sync_snapshots(
                 ):
                     replicas[slot] = snapshot
             entry["replicas"] = replicas
-            entry.setdefault("state", max(session_records.values(), key=desktop_record_mtime_ns) and desktop_record_state(max(session_records.values(), key=desktop_record_mtime_ns)))
+            freshest = max(session_records.values(), key=desktop_record_freshness_key)
+            entry.setdefault("state", desktop_record_state(freshest))
             entry.setdefault("state_changed_at_ns", max(desktop_record_mtime_ns(record) for record in session_records.values()))
             sessions[session_id] = entry
 
@@ -4385,6 +4697,7 @@ def desktop_replica_inventory(
         account_uuid: {} for account_uuid in account_uuids
     }
     logical_session_ids: set[str] = set()
+    reference_mismatches: list[dict[str, str]] = []
     for record in records:
         raw_session_id = desktop_record_cli_session_id(record)
         if not raw_session_id:
@@ -4395,9 +4708,18 @@ def desktop_replica_inventory(
             continue
         logical_session_ids.add(session_id)
         by_account.setdefault(record.account_uuid, {}).setdefault(session_id, []).append(record)
+        expected_session_id = desktop_account_session_id(root_state, session_id, record.account_uuid)
+        if raw_session_id != expected_session_id:
+            reference_mismatches.append(
+                {
+                    "account": short_hash(record.account_uuid) or record.account_uuid[:8],
+                    "session_id": session_id,
+                }
+            )
 
     missing: list[dict[str, str]] = []
     duplicates: list[dict[str, Any]] = []
+    content_mismatches: list[dict[str, Any]] = []
     counts: dict[str, int] = {}
     for account_uuid in sorted(by_account):
         account_sessions = by_account[account_uuid]
@@ -4429,14 +4751,54 @@ def desktop_replica_inventory(
                 )
 
     digest_payload = "\n".join(sorted(logical_session_ids)).encode("utf-8")
+    canonical_content_hashes: dict[str, str] = {}
+    for session_id in sorted(logical_session_ids):
+        records_for_session = [
+            record
+            for account_sessions in by_account.values()
+            for record in account_sessions.get(session_id, [])
+        ]
+        if not records_for_session:
+            continue
+        canonical_record = max(records_for_session, key=desktop_record_freshness_key)
+        canonical_content_hashes[session_id] = desktop_session_content_hash(canonical_record.data)
+        hashes_by_account = {
+            short_hash(account_uuid) or account_uuid[:8]: sorted(
+                {desktop_session_content_hash(record.data) for record in account_sessions.get(session_id, [])}
+            )
+            for account_uuid, account_sessions in sorted(by_account.items())
+            if account_sessions.get(session_id)
+        }
+        unique_hashes = {
+            content_hash
+            for content_hashes in hashes_by_account.values()
+            for content_hash in content_hashes
+        }
+        if len(unique_hashes) > 1:
+            content_mismatches.append(
+                {
+                    "session_id": session_id,
+                    "accounts": {
+                        account: [content_hash[:12] for content_hash in content_hashes]
+                        for account, content_hashes in hashes_by_account.items()
+                    },
+                }
+            )
+    content_digest_payload = "\n".join(
+        f"{session_id}:{content_hash}"
+        for session_id, content_hash in sorted(canonical_content_hashes.items())
+    ).encode("utf-8")
     return {
         "accounts": len(by_account),
         "logical_sessions": len(logical_session_ids),
         "digest": hashlib.sha256(digest_payload).hexdigest(),
+        "content_digest": hashlib.sha256(content_digest_payload).hexdigest(),
         "counts": counts,
         "missing": missing,
         "duplicates": duplicates,
-        "consistent": not missing and not duplicates,
+        "content_mismatches": content_mismatches,
+        "reference_mismatches": reference_mismatches,
+        "consistent": not missing and not duplicates and not content_mismatches and not reference_mismatches,
     }
 
 
@@ -4644,7 +5006,7 @@ def sync_claude_desktop_accounts(
                     by_slot.setdefault(desktop_record_slot(record), []).append(record)
                 kept: list[DesktopSessionRecord] = []
                 for slot_records in by_slot.values():
-                    primary = max(slot_records, key=desktop_record_mtime_ns)
+                    primary = max(slot_records, key=desktop_record_freshness_key)
                     kept.append(primary)
                     for duplicate in slot_records:
                         if duplicate.path == primary.path or not duplicate.path.exists():
@@ -4692,6 +5054,7 @@ def sync_claude_desktop_accounts(
                 previous_replicas = entry.get("replicas") if isinstance(entry.get("replicas"), dict) else {}
                 if (
                     previous_state == DESKTOP_STATE_DELETED
+                    and entry.get("tombstone_authoritative") is not True
                     and desktop_session_entry_has_workspace_transition(entry)
                     and (session_records or session_id in transcript_chats)
                 ):
@@ -4699,6 +5062,7 @@ def sync_claude_desktop_accounts(
                     previous_replicas = {}
                     entry["state"] = DESKTOP_STATE_ACTIVE
                     entry["replicas"] = previous_replicas
+                    entry.pop("tombstone_authoritative", None)
                     result["repaired"] += 1
                 current_by_slot = {
                     desktop_record_slot(record): record
@@ -4795,6 +5159,10 @@ def sync_claude_desktop_accounts(
                     state_event_record = None
 
                 entry["state"] = canonical_state
+                if canonical_state == DESKTOP_STATE_DELETED:
+                    entry["tombstone_authoritative"] = True
+                else:
+                    entry.pop("tombstone_authoritative", None)
                 entry["state_changed_at_ns"] = max(
                     int(entry.get("state_changed_at_ns") or 0),
                     max((event[0] for event in events), default=0),
@@ -4825,12 +5193,13 @@ def sync_claude_desktop_accounts(
                         result["unarchived"] += 1
 
                 chat = transcript_chats.get(session_id)
-                source_record = state_event_record
-                if source_record is None and session_records:
-                    source_record = max(
-                        session_records,
-                        key=lambda record: (desktop_record_timestamp_ms(record), desktop_record_mtime_ns(record)),
-                    )
+                # Lifecycle events decide archive/delete state, but every account
+                # must receive content from one independently selected canonical copy.
+                source_record = (
+                    max(session_records, key=desktop_record_freshness_key)
+                    if session_records
+                    else None
+                )
                 if source_record is None and chat is None:
                     continue
                 source_data = source_record.data if source_record is not None else synthetic_desktop_session_data(chat)
@@ -4853,12 +5222,9 @@ def sync_claude_desktop_accounts(
                         ):
                             continue
                         if target_records:
-                            primary = max(target_records, key=desktop_record_mtime_ns)
-                            base_data = source_data
-                            if source_record is not None and desktop_record_timestamp_ms(primary) > desktop_record_timestamp_ms(source_record):
-                                base_data = primary.data
+                            primary = max(target_records, key=desktop_record_freshness_key)
                             data = desktop_session_data_for_path(
-                                base_data,
+                                source_data,
                                 desktop_account_session_id(root_state, session_id, account_uuid),
                                 primary.path,
                                 archived=canonical_state == DESKTOP_STATE_ARCHIVED,
@@ -4918,7 +5284,7 @@ def sync_claude_desktop_accounts(
                 for account_uuid, account_records in by_account.items():
                     preferred = set(workspace_uuids_by_account.get(account_uuid, []))
                     preferred_records = [record for record in account_records if record.workspace_uuid in preferred]
-                    primary = max(preferred_records or account_records, key=desktop_record_mtime_ns)
+                    primary = max(preferred_records or account_records, key=desktop_record_freshness_key)
                     for duplicate in account_records:
                         if duplicate.path == primary.path or not duplicate.path.exists():
                             continue
@@ -4987,6 +5353,18 @@ def sync_claude_desktop_accounts(
                     "Account Claude "
                     f"{duplicate['account']}: sessione {duplicate['session_id'][:8]} presente "
                     f"{duplicate['copies']} volte dopo la deduplicazione."
+                )
+            for mismatch in inventory["content_mismatches"]:
+                result["inventory_errors"].append(
+                    "Sessione Claude "
+                    f"{mismatch['session_id'][:8]}: contenuto non identico tra gli account "
+                    f"{', '.join(sorted(mismatch['accounts']))}."
+                )
+            for mismatch in inventory["reference_mismatches"]:
+                result["inventory_errors"].append(
+                    "Account Claude "
+                    f"{mismatch['account']}: sessione {mismatch['session_id'][:8]} collegata "
+                    "a una transcript di un altro account."
                 )
         save_desktop_sync_state(paths, state)
     return result
@@ -7632,6 +8010,928 @@ def latest_rate_limit_reset_from_chat(chat: Chat, now: dt.datetime | None = None
         return None
     ready_at = latest_reset + dt.timedelta(seconds=RATE_LIMIT_RESET_DELAY_SECONDS)
     return latest_reset if ready_at > now else None
+
+
+def canonical_limit_account_key(provider: str, account_key: str | None) -> str | None:
+    if not account_key:
+        return None
+    if provider == PROVIDER_CLAUDE and account_key.startswith("claude-app:"):
+        account_uuid = account_key.removeprefix("claude-app:")
+        return hash_text(account_uuid) or account_key
+    return account_key
+
+
+def limit_value(data: dict[str, Any], *names: str) -> Any:
+    for name in names:
+        if name in data:
+            return data[name]
+    return None
+
+
+def limit_percent(value: Any) -> float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    return max(0.0, min(100.0, float(value)))
+
+
+def limit_reset_iso(value: Any) -> str | None:
+    parsed: dt.datetime | None = None
+    if isinstance(value, (int, float)) and not isinstance(value, bool):
+        epoch = float(value)
+        if epoch > 10_000_000_000:
+            epoch /= 1000
+        try:
+            parsed = dt.datetime.fromtimestamp(epoch, tz=UTC)
+        except (OSError, OverflowError, ValueError):
+            return None
+    elif isinstance(value, str):
+        parsed = parse_iso(value)
+    if parsed is None:
+        return None
+    return parsed.astimezone().isoformat()
+
+
+def next_future_reset(windows: list[dict[str, Any]], now: dt.datetime) -> str | None:
+    candidates = [
+        parsed
+        for window in windows
+        for parsed in [parse_iso(window.get("reset_at") if isinstance(window.get("reset_at"), str) else None)]
+        if parsed is not None and parsed > now
+    ]
+    return min(candidates).astimezone().isoformat() if candidates else None
+
+
+def limit_status_payload(
+    provider: str,
+    windows: list[dict[str, Any]],
+    *,
+    observed_at: str | None,
+    source: str,
+    limited: bool,
+    blocking_resets: list[str],
+    now: dt.datetime,
+    plan: str | None = None,
+) -> dict[str, Any]:
+    resets = [parse_iso(value) for value in blocking_resets]
+    valid_resets = [value for value in resets if value is not None]
+    blocking_reset_at = max(valid_resets).astimezone().isoformat() if valid_resets else None
+    available_at = (
+        (max(valid_resets) + dt.timedelta(seconds=RATE_LIMIT_RESET_DELAY_SECONDS)).astimezone().isoformat()
+        if limited and valid_resets
+        else None
+    )
+    return {
+        "provider": provider,
+        "observed_at": observed_at or now.astimezone().isoformat(),
+        "source": source,
+        "limited": limited,
+        "blocking_reset_at": blocking_reset_at,
+        "available_at": available_at,
+        "next_reset_at": next_future_reset(windows, now),
+        "plan": plan,
+        "windows": windows,
+    }
+
+
+def claude_usage_limit_status(
+    payload: dict[str, Any],
+    *,
+    observed_at: str | None = None,
+    now: dt.datetime | None = None,
+    source: str = "claude_oauth_live",
+) -> dict[str, Any]:
+    now = now or local_now()
+    windows: list[dict[str, Any]] = []
+    labels = {
+        "session": "Sessione",
+        "weekly_all": "Settimanale",
+        "weekly_scoped": "Settimanale modello",
+        "five_hour": "Sessione",
+        "seven_day": "Settimanale",
+    }
+    raw_limits = payload.get("limits") if isinstance(payload.get("limits"), list) else []
+    for position, entry in enumerate(raw_limits):
+        if not isinstance(entry, dict):
+            continue
+        kind = entry.get("kind") if isinstance(entry.get("kind"), str) else f"limit_{position + 1}"
+        percent = limit_percent(entry.get("percent"))
+        reset_at = limit_reset_iso(entry.get("resets_at"))
+        scope = entry.get("scope") if isinstance(entry.get("scope"), dict) else {}
+        model = scope.get("model") if isinstance(scope.get("model"), dict) else {}
+        display_name = model.get("display_name") if isinstance(model.get("display_name"), str) else None
+        label = labels.get(kind, kind.replace("_", " ").strip().capitalize())
+        if display_name:
+            label = f"{label}: {display_name}"
+        if percent is None and reset_at is None:
+            continue
+        windows.append(
+            {
+                "id": kind,
+                "label": label,
+                "used_percent": percent,
+                "reset_at": reset_at,
+                "active": bool(entry.get("is_active")),
+            }
+        )
+
+    if not windows:
+        for key in ("five_hour", "seven_day"):
+            entry = payload.get(key) if isinstance(payload.get(key), dict) else {}
+            percent = limit_percent(entry.get("utilization"))
+            reset_at = limit_reset_iso(entry.get("resets_at"))
+            if percent is None and reset_at is None:
+                continue
+            windows.append(
+                {
+                    "id": key,
+                    "label": labels[key],
+                    "used_percent": percent,
+                    "reset_at": reset_at,
+                    "active": key == "five_hour",
+                }
+            )
+
+    blocking = [
+        window["reset_at"]
+        for window in windows
+        if isinstance(window.get("used_percent"), (int, float))
+        and float(window["used_percent"]) >= 100
+        and isinstance(window.get("reset_at"), str)
+    ]
+    return limit_status_payload(
+        PROVIDER_CLAUDE,
+        windows,
+        observed_at=observed_at,
+        source=source,
+        limited=bool(blocking),
+        blocking_resets=blocking,
+        now=now,
+    )
+
+
+def codex_window_label(slot: str, duration_minutes: Any) -> str:
+    if isinstance(duration_minutes, (int, float)):
+        minutes = int(duration_minutes)
+        if minutes == 5 * 60:
+            return "5 ore"
+        if minutes == 7 * 24 * 60:
+            return "Settimanale"
+        if minutes and minutes % (24 * 60) == 0:
+            return f"{minutes // (24 * 60)} giorni"
+        if minutes and minutes % 60 == 0:
+            return f"{minutes // 60} ore"
+        if minutes:
+            return f"{minutes} minuti"
+    return "Principale" if slot == "primary" else "Secondaria"
+
+
+def codex_limit_status(
+    payload: dict[str, Any],
+    *,
+    observed_at: str | None = None,
+    now: dt.datetime | None = None,
+    source: str = "codex_app_server_live",
+) -> dict[str, Any]:
+    now = now or local_now()
+    by_id = limit_value(payload, "rateLimitsByLimitId", "rate_limits_by_limit_id")
+    snapshots: list[tuple[str, dict[str, Any]]] = []
+    if isinstance(by_id, dict):
+        snapshots.extend((str(key), value) for key, value in by_id.items() if isinstance(value, dict))
+    if not snapshots:
+        main = limit_value(payload, "rateLimits", "rate_limits")
+        if isinstance(main, dict):
+            snapshots.append((str(limit_value(main, "limitId", "limit_id") or "codex"), main))
+        elif any(key in payload for key in ("primary", "secondary", "rate_limit_reached_type", "rateLimitReachedType")):
+            snapshots.append((str(limit_value(payload, "limitId", "limit_id") or "codex"), payload))
+
+    windows: list[dict[str, Any]] = []
+    blocking: list[str] = []
+    limited = False
+    plan: str | None = None
+    for limit_id, snapshot in snapshots:
+        limit_name = limit_value(snapshot, "limitName", "limit_name")
+        display_limit = str(limit_name) if isinstance(limit_name, str) and limit_name else None
+        if plan is None:
+            raw_plan = limit_value(snapshot, "planType", "plan_type")
+            plan = raw_plan if isinstance(raw_plan, str) else None
+        reached = limit_value(snapshot, "rateLimitReachedType", "rate_limit_reached_type")
+        reached_text = str(reached).lower() if reached is not None else ""
+        snapshot_windows: list[dict[str, Any]] = []
+        for slot in ("primary", "secondary"):
+            entry = snapshot.get(slot) if isinstance(snapshot.get(slot), dict) else None
+            if entry is None:
+                continue
+            percent = limit_percent(limit_value(entry, "usedPercent", "used_percent"))
+            reset_at = limit_reset_iso(limit_value(entry, "resetsAt", "resets_at"))
+            duration = limit_value(entry, "windowDurationMins", "window_minutes")
+            label = codex_window_label(slot, duration)
+            if display_limit:
+                label = f"{display_limit}: {label}"
+            window = {
+                "id": f"{limit_id}:{slot}",
+                "label": label,
+                "used_percent": percent,
+                "reset_at": reset_at,
+                "active": slot == "primary",
+            }
+            snapshot_windows.append(window)
+            windows.append(window)
+
+        exhausted = [
+            window
+            for window in snapshot_windows
+            if isinstance(window.get("used_percent"), (int, float)) and float(window["used_percent"]) >= 100
+        ]
+        reached_slots = [
+            window
+            for window in snapshot_windows
+            if window["id"].endswith(f":{reached_text}")
+        ]
+        snapshot_blocking = reached_slots or exhausted
+        if reached and not snapshot_blocking:
+            snapshot_blocking = snapshot_windows
+        snapshot_limited = bool(reached or exhausted)
+        limited = limited or snapshot_limited
+        if snapshot_limited:
+            blocking.extend(
+                window["reset_at"]
+                for window in snapshot_blocking
+                if isinstance(window.get("reset_at"), str)
+            )
+
+    return limit_status_payload(
+        PROVIDER_CODEX,
+        windows,
+        observed_at=observed_at,
+        source=source,
+        limited=limited,
+        blocking_resets=blocking,
+        now=now,
+        plan=plan,
+    )
+
+
+def codex_limit_status_from_path(
+    path: Path,
+    *,
+    now: dt.datetime | None = None,
+    max_bytes: int = 8 * 1024 * 1024,
+) -> dict[str, Any] | None:
+    now = now or local_now()
+    for obj in reversed(codex_tail_objects(path, max_bytes=max_bytes)):
+        if obj.get("type") != "event_msg":
+            continue
+        event = obj.get("payload") if isinstance(obj.get("payload"), dict) else {}
+        if event.get("type") != "token_count":
+            continue
+        limits = event.get("rate_limits") if isinstance(event.get("rate_limits"), dict) else None
+        if limits is None:
+            continue
+        observed_at = obj.get("timestamp") if isinstance(obj.get("timestamp"), str) else None
+        return codex_limit_status(
+            limits,
+            observed_at=observed_at,
+            now=now,
+            source="codex_transcript",
+        )
+    return None
+
+
+def known_claude_account_profiles(paths: Paths) -> dict[str, dict[str, str]]:
+    state = load_desktop_sync_state(paths)
+    profiles: dict[str, dict[str, str]] = {}
+    for root in claude_windows_app_roots(paths):
+        root_state = desktop_existing_root_state(state, root)
+        values = root_state.get("oauth_account_profiles")
+        if not isinstance(values, dict):
+            continue
+        for account_uuid, profile in values.items():
+            if not isinstance(account_uuid, str) or not isinstance(profile, dict):
+                continue
+            candidate = {
+                "account_uuid": account_uuid,
+                "organization_uuid": profile.get("organization_uuid")
+                if isinstance(profile.get("organization_uuid"), str)
+                else "",
+                "email": profile.get("email") if isinstance(profile.get("email"), str) else "",
+                "last_seen_at": profile.get("last_seen_at") if isinstance(profile.get("last_seen_at"), str) else "",
+            }
+            existing = profiles.get(account_uuid)
+            if existing is None or str(candidate.get("last_seen_at") or "") >= str(existing.get("last_seen_at") or ""):
+                profiles[account_uuid] = candidate
+    return profiles
+
+
+def upsert_known_limit_account(
+    index: dict[str, Any],
+    *,
+    key: str,
+    provider: str,
+    label: str,
+    account_uuid_hash: str | None,
+    organization_uuid_hash: str | None = None,
+    email_hash: str | None = None,
+    seen_at: str | None = None,
+) -> None:
+    accounts = index.setdefault("accounts", {})
+    existing = accounts.get(key) if isinstance(accounts.get(key), dict) else {}
+    previous_seen = existing.get("last_seen_at") if isinstance(existing.get("last_seen_at"), str) else None
+    selected_seen = seen_at or previous_seen
+    if seen_at and previous_seen:
+        seen_value = parse_iso(seen_at)
+        previous_value = parse_iso(previous_seen)
+        if seen_value is not None and previous_value is not None and previous_value > seen_value:
+            selected_seen = previous_seen
+    accounts[key] = {
+        **existing,
+        "key": key,
+        "provider": provider,
+        "label": label,
+        "account_uuid_hash": account_uuid_hash,
+        "organization_uuid_hash": organization_uuid_hash,
+        "email_hash": email_hash,
+        "first_seen_at": existing.get("first_seen_at") or selected_seen or now_utc(),
+        "last_seen_at": selected_seen or existing.get("last_seen_at") or now_utc(),
+    }
+
+
+def upsert_account_info_for_limits(index: dict[str, Any], account: AccountInfo, provider: str) -> None:
+    upsert_known_limit_account(
+        index,
+        key=account.key,
+        provider=provider,
+        label=account.label,
+        account_uuid_hash=account.account_uuid_hash,
+        organization_uuid_hash=account.organization_uuid_hash,
+        email_hash=account.email_hash,
+        seen_at=account.source_changed_at or now_utc(),
+    )
+
+
+def account_limit_status_is_fresh(
+    status: dict[str, Any] | None,
+    now: dt.datetime,
+    max_age_seconds: int = ACCOUNT_LIMIT_REFRESH_SECONDS,
+) -> bool:
+    if not isinstance(status, dict):
+        return False
+    observed = parse_iso(status.get("observed_at") if isinstance(status.get("observed_at"), str) else None)
+    if observed is None:
+        return False
+    return now - observed.astimezone(now.tzinfo) <= dt.timedelta(seconds=max_age_seconds)
+
+
+def active_limit_account_keys(paths: Paths) -> set[str]:
+    keys: set[str] = set()
+    claude_account = active_claude_account(paths)
+    if claude_account is not None:
+        keys.add(claude_account.key)
+    for root in claude_windows_app_roots(paths):
+        account_uuid = active_desktop_account_uuid(root)
+        key = hash_text(account_uuid)
+        if key:
+            keys.add(key)
+    codex_account = active_codex_account(paths)
+    if codex_account is not None:
+        keys.add(codex_account.key)
+    return keys
+
+
+def chat_limit_account_key(chat: Chat, index: dict[str, Any]) -> str | None:
+    key = canonical_limit_account_key(chat.provider, chat.account_key)
+    if key:
+        return key
+    sessions = index.get("sessions") if isinstance(index.get("sessions"), dict) else {}
+    session_ids = [chat.session_id, chat.logical_session_id, *chat.session_aliases]
+    for session_id in session_ids:
+        if not isinstance(session_id, str) or not session_id:
+            continue
+        candidate = dataclasses.replace(chat, session_id=session_id)
+        record = sessions.get(chat_account_session_key(candidate))
+        if not isinstance(record, dict):
+            continue
+        record_key = record.get("account_key") if isinstance(record.get("account_key"), str) else None
+        key = canonical_limit_account_key(chat.provider, record_key)
+        if key:
+            return key
+    return None
+
+
+def codex_transcript_limit_updates(
+    chats: list[Chat],
+    index: dict[str, Any],
+    account_keys: set[str],
+    now: dt.datetime,
+) -> dict[str, dict[str, Any]]:
+    if not account_keys:
+        return {}
+    grouped: dict[str, list[Chat]] = {}
+    for chat in chats:
+        if chat.provider != PROVIDER_CODEX:
+            continue
+        key = chat_limit_account_key(chat, index)
+        if key in account_keys:
+            grouped.setdefault(key, []).append(chat)
+    updates: dict[str, dict[str, Any]] = {}
+    for key, candidates in grouped.items():
+        for chat in sorted(candidates, key=chat_sort_key, reverse=True)[:ACCOUNT_LIMIT_TRANSCRIPT_SCAN_PER_ACCOUNT]:
+            status = codex_limit_status_from_path(chat.jsonl_path, now=now)
+            if status is not None and status.get("windows"):
+                updates[key] = status
+                break
+    return updates
+
+
+def indexed_codex_transcript_limit_updates(
+    paths: Paths,
+    index: dict[str, Any],
+    account_keys: set[str],
+    now: dt.datetime,
+) -> dict[str, dict[str, Any]]:
+    if not account_keys:
+        return {}
+    rows = codex_thread_rows(paths.codex_home)
+    active_files, archived_files = codex_rollout_files(paths.codex_home)
+    sessions = index.get("sessions") if isinstance(index.get("sessions"), dict) else {}
+    grouped: dict[str, list[tuple[dt.datetime, Path]]] = {}
+    for record in sessions.values():
+        if not isinstance(record, dict):
+            continue
+        provider = record.get("provider") if isinstance(record.get("provider"), str) else None
+        raw_key = record.get("account_key") if isinstance(record.get("account_key"), str) else None
+        if provider != PROVIDER_CODEX and not (raw_key and raw_key.startswith("codex:")):
+            continue
+        key = canonical_limit_account_key(PROVIDER_CODEX, raw_key)
+        session_id = record.get("session_id") if isinstance(record.get("session_id"), str) else None
+        if key not in account_keys or not session_id:
+            continue
+        row = rows.get(session_id, {})
+        raw_rollout = row.get("rollout_path") if isinstance(row.get("rollout_path"), str) else None
+        path = windows_to_local_path(raw_rollout) if raw_rollout else None
+        if path is None or not path.exists():
+            path = active_files.get(session_id.lower()) or archived_files.get(session_id.lower())
+        if path is None or not path.exists():
+            continue
+        timestamp = parse_iso(codex_timestamp({}, row))
+        if timestamp is None:
+            try:
+                timestamp = dt.datetime.fromtimestamp(path.stat().st_mtime, tz=UTC)
+            except OSError:
+                timestamp = dt.datetime.min.replace(tzinfo=UTC)
+        grouped.setdefault(key, []).append((timestamp, path))
+
+    updates: dict[str, dict[str, Any]] = {}
+    for key, candidates in grouped.items():
+        seen_paths: set[str] = set()
+        scanned = 0
+        for _, path in sorted(candidates, key=lambda item: item[0], reverse=True):
+            path_key = str(path).casefold()
+            if path_key in seen_paths:
+                continue
+            seen_paths.add(path_key)
+            scanned += 1
+            status = codex_limit_status_from_path(path, now=now)
+            if status is not None and status.get("windows"):
+                updates[key] = status
+                break
+            if scanned >= ACCOUNT_LIMIT_TRANSCRIPT_SCAN_PER_ACCOUNT:
+                break
+    return updates
+
+
+def claude_transcript_limit_update(
+    chats: list[Chat],
+    index: dict[str, Any],
+    account_keys: set[str],
+    now: dt.datetime,
+) -> tuple[str, dict[str, Any]] | None:
+    if not account_keys:
+        return None
+    candidates = [
+        chat
+        for chat in chats
+        if chat.provider == PROVIDER_CLAUDE and chat_limit_account_key(chat, index) in account_keys
+    ]
+    for chat in sorted(candidates, key=chat_sort_key, reverse=True)[:ACCOUNT_LIMIT_TRANSCRIPT_SCAN_PER_ACCOUNT]:
+        reset = latest_rate_limit_reset_from_chat(chat, now=now)
+        key = chat_limit_account_key(chat, index)
+        if reset is None or key is None:
+            continue
+        reset_at = reset.astimezone().isoformat()
+        status = limit_status_payload(
+            PROVIDER_CLAUDE,
+            [
+                {
+                    "id": "transcript_limit",
+                    "label": "Sessione",
+                    "used_percent": 100.0,
+                    "reset_at": reset_at,
+                    "active": True,
+                }
+            ],
+            observed_at=chat.last_timestamp,
+            source="claude_transcript",
+            limited=True,
+            blocking_resets=[reset_at],
+            now=now,
+        )
+        return key, status
+    return None
+
+
+def refresh_account_limits(
+    paths: Paths,
+    codex_exe: Path | None = None,
+    *,
+    chats: list[Chat] | None = None,
+    force: bool = False,
+    allow_codex_live: bool = False,
+) -> dict[str, Any]:
+    now = local_now()
+    index = load_account_index(paths)
+    profiles = known_claude_account_profiles(paths)
+    for account_uuid, profile in profiles.items():
+        key = hash_text(account_uuid)
+        if not key:
+            continue
+        email = profile.get("email") or ""
+        upsert_known_limit_account(
+            index,
+            key=key,
+            provider=PROVIDER_CLAUDE,
+            label=mask_email(email) or f"Claude {account_uuid[:8]}",
+            account_uuid_hash=short_hash(account_uuid),
+            organization_uuid_hash=short_hash(profile.get("organization_uuid") or None),
+            email_hash=short_hash(email.lower() if email else None),
+            seen_at=profile.get("last_seen_at") or None,
+        )
+
+    active_claude = active_claude_account(paths)
+    if active_claude is not None:
+        upsert_account_info_for_limits(index, active_claude, PROVIDER_CLAUDE)
+    active_codex = active_codex_account(paths)
+    if active_codex is not None:
+        upsert_account_info_for_limits(index, active_codex, PROVIDER_CODEX)
+
+    accounts = index.setdefault("accounts", {})
+    updates: dict[str, dict[str, Any]] = {}
+    errors: list[str] = []
+    active_keys = active_limit_account_keys(paths)
+    active_claude_keys = {
+        key
+        for key in active_keys
+        if isinstance(accounts.get(key), dict) and (accounts[key].get("provider") or PROVIDER_CLAUDE) == PROVIDER_CLAUDE
+    }
+    claude_due = force or any(
+        not account_limit_status_is_fresh(
+            accounts.get(key, {}).get("limit_status") if isinstance(accounts.get(key), dict) else None,
+            now,
+        )
+        for key in active_claude_keys
+    )
+    if claude_due:
+        sessions: dict[str, dict[str, str]] = {}
+        try:
+            sessions = claude_oauth_sessions(paths, force_refresh=force)
+        except Exception as exc:
+            errors.append(f"Claude: {public_error_message(exc, 'Utilizzo account non disponibile.')}")
+        for account_uuid, session in sessions.items():
+            key = hash_text(account_uuid)
+            if not key:
+                continue
+            email = session.get("email") or ""
+            upsert_known_limit_account(
+                index,
+                key=key,
+                provider=PROVIDER_CLAUDE,
+                label=mask_email(email) or f"Claude {account_uuid[:8]}",
+                account_uuid_hash=short_hash(account_uuid),
+                organization_uuid_hash=short_hash(session.get("organization_uuid") or None),
+                email_hash=short_hash(email.lower() if email else None),
+                seen_at=now.astimezone().isoformat(),
+            )
+            previous = accounts.get(key, {}).get("limit_status") if isinstance(accounts.get(key), dict) else None
+            if not force and account_limit_status_is_fresh(previous, now):
+                continue
+            try:
+                usage = claude_api_json(session["token"], "/api/oauth/usage", timeout=15)
+                updates[key] = claude_usage_limit_status(usage, now=now)
+            except Exception as exc:
+                label = accounts.get(key, {}).get("label") if isinstance(accounts.get(key), dict) else f"Claude {account_uuid[:8]}"
+                errors.append(f"Claude {label}: {public_error_message(exc, 'Utilizzo account non disponibile.')}")
+
+    if active_codex is not None:
+        previous = accounts.get(active_codex.key, {}).get("limit_status") if isinstance(accounts.get(active_codex.key), dict) else None
+        codex_due = force or not account_limit_status_is_fresh(previous, now)
+        if allow_codex_live and codex_due and codex_exe is not None and path_exists(codex_exe):
+            try:
+                payload = codex_app_server_request(
+                    codex_exe,
+                    "account/rateLimits/read",
+                    {},
+                    timeout=30,
+                    codex_home=paths.codex_home,
+                )
+                updates[active_codex.key] = codex_limit_status(payload, now=now)
+            except Exception as exc:
+                errors.append(f"ChatGPT {active_codex.label}: {public_error_message(exc, 'Utilizzo account non disponibile.')}")
+
+    available_chats = chats or []
+    codex_account_keys = {
+        key
+        for key, value in accounts.items()
+        if isinstance(value, dict)
+        and value.get("provider") == PROVIDER_CODEX
+        and key not in updates
+        and not account_limit_status_is_fresh(
+            value.get("limit_status") if isinstance(value.get("limit_status"), dict) else None,
+            now,
+            max_age_seconds=ACCOUNT_LIMIT_LIVE_MAX_AGE_SECONDS,
+        )
+        and (
+            force
+            or not account_limit_status_is_fresh(
+                {"observed_at": value.get("limit_scan_checked_at")},
+                now,
+                max_age_seconds=ACCOUNT_LIMIT_LIVE_MAX_AGE_SECONDS,
+            )
+        )
+    }
+    transcript_updates = codex_transcript_limit_updates(available_chats, index, codex_account_keys, now)
+    updates.update(transcript_updates)
+    remaining_codex_keys = codex_account_keys - set(transcript_updates)
+    updates.update(indexed_codex_transcript_limit_updates(paths, index, remaining_codex_keys, now))
+    for key in codex_account_keys:
+        account = accounts.get(key)
+        if isinstance(account, dict):
+            account["limit_scan_checked_at"] = now.astimezone().isoformat()
+
+    claude_without_status = {
+        key
+        for key in active_claude_keys
+        if key not in updates
+        and not account_limit_status_is_fresh(
+            accounts.get(key, {}).get("limit_status") if isinstance(accounts.get(key), dict) else None,
+            now,
+            max_age_seconds=ACCOUNT_LIMIT_LIVE_MAX_AGE_SECONDS,
+        )
+    }
+    fallback = claude_transcript_limit_update(available_chats, index, claude_without_status, now)
+    if fallback is not None:
+        updates[fallback[0]] = fallback[1]
+
+    with account_index_lock(paths):
+        latest = load_account_index(paths)
+        for key, value in index.get("accounts", {}).items():
+            if not isinstance(value, dict):
+                continue
+            current = latest.setdefault("accounts", {}).get(key)
+            latest["accounts"][key] = {**(current if isinstance(current, dict) else {}), **value}
+        for key, status in updates.items():
+            account = latest.setdefault("accounts", {}).get(key)
+            if not isinstance(account, dict):
+                continue
+            account["limit_status"] = status
+        save_account_index(paths, latest)
+
+    return {
+        "checked_at": now.astimezone().isoformat(),
+        "updated": len(updates),
+        "account_count": len(index.get("accounts", {})),
+        "codex_access": "live" if allow_codex_live else "passive",
+        "errors": errors,
+    }
+
+
+def claude_stagger_plan(rows: list[dict[str, Any]], now: dt.datetime) -> dict[str, Any]:
+    live_rows: list[dict[str, Any]] = []
+    session_windows: list[tuple[dict[str, Any], dict[str, Any], dt.datetime]] = []
+    for row in rows:
+        if row.get("provider") != PROVIDER_CLAUDE or row.get("source") != "claude_oauth_live":
+            continue
+        observed = parse_iso(row.get("observed_at") if isinstance(row.get("observed_at"), str) else None)
+        if observed is None or now - observed.astimezone(now.tzinfo) > dt.timedelta(
+            seconds=ACCOUNT_LIMIT_LIVE_MAX_AGE_SECONDS
+        ):
+            continue
+        live_rows.append(row)
+        for window in row.get("windows", []):
+            if not isinstance(window, dict):
+                continue
+            window_id = str(window.get("id") or "").casefold()
+            window_label = str(window.get("label") or "").casefold()
+            if window_id not in {"session", "five_hour"} and window_label != "sessione":
+                continue
+            reset = parse_iso(window.get("reset_at") if isinstance(window.get("reset_at"), str) else None)
+            if reset is not None and reset > now:
+                session_windows.append((row, window, reset))
+            break
+
+    plan: dict[str, Any] = {
+        "target_minutes": CLAUDE_STAGGER_TARGET_SECONDS // 60,
+        "cycle_minutes": CLAUDE_SESSION_WINDOW_SECONDS // 60,
+        "live_account_count": len(live_rows),
+        "active_cycle_count": len(session_windows),
+        "automatic_check": True,
+        "automatic_activation": False,
+        "state": "needs_two_logins",
+        "message": "Servono due profili Claude autenticati e leggibili contemporaneamente.",
+        "next_activation_at": None,
+        "next_account_key": None,
+        "next_account_label": None,
+        "offset_minutes": None,
+    }
+    if len(live_rows) < 2:
+        return plan
+
+    if not session_windows:
+        plan.update(
+            {
+                "state": "ready_to_start",
+                "message": (
+                    "Entrambi gli account sono leggibili. Avvia il primo ciclo con il prossimo lavoro reale; "
+                    "la finestra del secondo verra calcolata 2 h 30 dopo."
+                ),
+            }
+        )
+        return plan
+
+    if len(session_windows) == 1:
+        active_row, _, reset = session_windows[0]
+        other = next(row for row in live_rows if row["key"] != active_row["key"])
+        target = reset - dt.timedelta(seconds=CLAUDE_STAGGER_TARGET_SECONDS)
+        target = max(target, now)
+        plan.update(
+            {
+                "state": "schedule_second",
+                "message": (
+                    "Il secondo account e pronto: usa su di lui il primo lavoro reale disponibile "
+                    "nella finestra indicata."
+                ),
+                "next_activation_at": target.astimezone().isoformat(),
+                "next_account_key": other["key"],
+                "next_account_label": other["label"],
+            }
+        )
+        return plan
+
+    best_pair: tuple[
+        float,
+        tuple[dict[str, Any], dict[str, Any], dt.datetime],
+        tuple[dict[str, Any], dict[str, Any], dt.datetime],
+        float,
+    ] | None = None
+    for position, first in enumerate(session_windows):
+        for second in session_windows[position + 1 :]:
+            if first[0]["key"] == second[0]["key"]:
+                continue
+            raw_gap = abs((first[2] - second[2]).total_seconds()) % CLAUDE_SESSION_WINDOW_SECONDS
+            circular_gap = min(raw_gap, CLAUDE_SESSION_WINDOW_SECONDS - raw_gap)
+            score = abs(circular_gap - CLAUDE_STAGGER_TARGET_SECONDS)
+            candidate = (score, first, second, circular_gap)
+            if best_pair is None or candidate[0] < best_pair[0]:
+                best_pair = candidate
+
+    if best_pair is None:
+        return plan
+    score, first, second, circular_gap = best_pair
+    next_row, _, next_reset = min((first, second), key=lambda item: item[2])
+    balanced = score <= 15 * 60
+    plan.update(
+        {
+            "state": "balanced" if balanced else "rebalance",
+            "message": (
+                "Cicli gia sfalsati correttamente. Al prossimo reset usa il primo lavoro reale disponibile."
+                if balanced
+                else "Entrambi i cicli sono attivi, ma lo sfasamento non e ancora vicino a 2 h 30."
+            ),
+            "next_activation_at": (
+                next_reset + dt.timedelta(seconds=RATE_LIMIT_RESET_DELAY_SECONDS)
+            ).astimezone().isoformat(),
+            "next_account_key": next_row["key"],
+            "next_account_label": next_row["label"],
+            "offset_minutes": round(circular_gap / 60),
+        }
+    )
+    return plan
+
+
+def account_limit_overview(paths: Paths, now: dt.datetime | None = None) -> dict[str, Any]:
+    now = now or local_now()
+    index = load_account_index(paths)
+    accounts = index.get("accounts") if isinstance(index.get("accounts"), dict) else {}
+    active_keys = active_limit_account_keys(paths)
+    rows: list[dict[str, Any]] = []
+    first_reset_candidates: list[tuple[dt.datetime, dict[str, Any], dict[str, Any]]] = []
+    first_available_candidates: list[tuple[dt.datetime, dict[str, Any]]] = []
+    latest_observed: dt.datetime | None = None
+    for key, account in accounts.items():
+        if not isinstance(account, dict):
+            continue
+        provider = account.get("provider") if isinstance(account.get("provider"), str) else PROVIDER_CLAUDE
+        status = account.get("limit_status") if isinstance(account.get("limit_status"), dict) else {}
+        observed = parse_iso(status.get("observed_at") if isinstance(status.get("observed_at"), str) else None)
+        if observed is not None and (latest_observed is None or observed > latest_observed):
+            latest_observed = observed
+        windows = [dict(window) for window in status.get("windows", []) if isinstance(window, dict)]
+        future_windows: list[dict[str, Any]] = []
+        for window in windows:
+            reset = parse_iso(window.get("reset_at") if isinstance(window.get("reset_at"), str) else None)
+            window["future"] = bool(reset and reset > now)
+            if reset and reset > now:
+                future_windows.append(window)
+        windows.sort(
+            key=lambda window: (
+                parse_iso(window.get("reset_at") if isinstance(window.get("reset_at"), str) else None)
+                or dt.datetime.max.replace(tzinfo=UTC),
+                str(window.get("label") or ""),
+            )
+        )
+
+        next_reset_at = next_future_reset(windows, now)
+        available = parse_iso(status.get("available_at") if isinstance(status.get("available_at"), str) else None)
+        actively_limited = bool(status.get("limited") and available and available > now)
+        live_fresh = str(status.get("source") or "").endswith("_live") and account_limit_status_is_fresh(
+            status,
+            now,
+            max_age_seconds=ACCOUNT_LIMIT_LIVE_MAX_AGE_SECONDS,
+        )
+        if actively_limited:
+            state = "limited"
+        elif live_fresh:
+            state = "available"
+        elif status and future_windows:
+            state = "known"
+        elif status:
+            state = "stale"
+        else:
+            state = "unknown"
+
+        row = {
+            "key": key,
+            "short_key": account.get("account_uuid_hash") or key.removeprefix("codex:")[:8],
+            "provider": provider,
+            "provider_label": "ChatGPT" if provider == PROVIDER_CODEX else "Claude",
+            "label": account.get("label") or f"Account {key[:8]}",
+            "active": key in active_keys,
+            "state": state,
+            "limited": actively_limited,
+            "observed_at": status.get("observed_at"),
+            "source": status.get("source"),
+            "plan": status.get("plan"),
+            "next_reset_at": next_reset_at,
+            "blocking_reset_at": status.get("blocking_reset_at"),
+            "available_at": available.astimezone().isoformat() if actively_limited and available else None,
+            "windows": windows,
+        }
+        rows.append(row)
+        for window in future_windows:
+            reset = parse_iso(window.get("reset_at") if isinstance(window.get("reset_at"), str) else None)
+            if reset is not None:
+                first_reset_candidates.append((reset, row, window))
+        if actively_limited and available is not None:
+            first_available_candidates.append((available, row))
+
+    rows.sort(
+        key=lambda row: (
+            parse_iso(row.get("next_reset_at")) or dt.datetime.max.replace(tzinfo=UTC),
+            str(row.get("provider_label") or ""),
+            str(row.get("label") or ""),
+            str(row.get("short_key") or ""),
+        )
+    )
+    first_reset = None
+    if first_reset_candidates:
+        reset, row, window = min(first_reset_candidates, key=lambda item: item[0])
+        first_reset = {
+            "account_key": row["key"],
+            "account_label": row["label"],
+            "account_short_key": row["short_key"],
+            "provider": row["provider"],
+            "provider_label": row["provider_label"],
+            "window_label": window.get("label"),
+            "reset_at": reset.astimezone().isoformat(),
+        }
+    first_available = None
+    if first_available_candidates:
+        available, row = min(first_available_candidates, key=lambda item: item[0])
+        first_available = {
+            "account_key": row["key"],
+            "account_label": row["label"],
+            "account_short_key": row["short_key"],
+            "provider": row["provider"],
+            "provider_label": row["provider_label"],
+            "available_at": available.astimezone().isoformat(),
+        }
+    return {
+        "generated_at": now.astimezone().isoformat(),
+        "refreshed_at": latest_observed.astimezone().isoformat() if latest_observed else None,
+        "accounts": rows,
+        "first_reset": first_reset,
+        "first_available": first_available,
+        "limited_count": len([row for row in rows if row["limited"]]),
+        "stagger_plan": claude_stagger_plan(rows, now),
+    }
 
 
 def prompt_recorded_after(claude_home: Path, session_id: str, prompt: str, after: dt.datetime) -> bool:
