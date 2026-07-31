@@ -1808,47 +1808,54 @@ HTML = r"""<!doctype html>
         && claudeReplicaValues.every((count) => count === claudeReplicaValues[0]);
       const claudeReplicaContentMatches = claudeInventories.length > 0
         && claudeInventories.every((inventory) => inventory && inventory.consistent === true);
+
+      const isIt = CURRENT_LANG === "it";
+
       const claudeReplicaStatus = claudeInventories.length === 0
-        ? "in attesa del primo controllo"
+        ? (isIt ? "in attesa del primo controllo" : "waiting for first check")
         : claudeReplicaAccountCount >= 2 && claudeReplicaCountsMatch && claudeReplicaContentMatches
-        ? `${claudeReplicaAccountCount} account · ${claudeReplicaValues[0]} chat per account · numero e contenuto identici`
-        : `verifica non superata · conteggi: ${claudeReplicaValues.join(" / ") || "non disponibili"}`;
+        ? `${claudeReplicaAccountCount} ${isIt ? "account ·" : "accounts ·"} ${claudeReplicaValues[0]} ${isIt ? "chat per account · numero e contenuto identici" : "chats per account · identical count and content"}`
+        : `${isIt ? "verifica non superata · conteggi:" : "verification failed · counts:"} ${claudeReplicaValues.join(" / ") || (isIt ? "non disponibili" : "unavailable")}`;
+
       const codeArtifacts = Number(claudeSync.code_artifacts || 0);
       const pendingArtifactAccounts = Number(claudeSync.code_artifact_pending_accounts || 0);
       const artifactStatus = codeArtifacts > 0
-        ? `${codeArtifacts} · copie private create: ${Number(claudeSync.code_artifact_copies_created || 0)}`
-          + (pendingArtifactAccounts > 0 ? ` · in attesa di autenticazione: ${pendingArtifactAccounts}` : " · sincronizzati")
-        : "nessuno rilevato";
+        ? `${codeArtifacts} · ${isIt ? "copie private create:" : "private copies created:"} ${Number(claudeSync.code_artifact_copies_created || 0)}`
+          + (pendingArtifactAccounts > 0 ? ` · ${isIt ? "in attesa di autenticazione:" : "waiting for authentication:"} ${pendingArtifactAccounts}` : ` · ${isIt ? "sincronizzati" : "synchronized"}`)
+        : (isIt ? "nessuno rilevato" : "none detected");
+
       const syncStatus = accountSync.running
         ? (accountSync.last_error
-          ? `attiva, errore: ${accountSync.last_error}`
-          : (accountSync.in_progress ? "attiva · controllo in corso" : "attiva"))
-        : "ferma";
+          ? `${isIt ? "attiva, errore:" : "active, error:"} ${accountSync.last_error}`
+          : (accountSync.in_progress ? (isIt ? "attiva · controllo in corso" : "active · check in progress") : (isIt ? "attiva" : "active")))
+        : (isIt ? "ferma" : "stopped");
+
       $("doctor").innerHTML = [
-        `<b>Ora PC</b>: ${escapeHtml(formatDateTime(data.local_time || new Date().toISOString()))}`,
-        `<b>Versione app</b>: ${escapeHtml(data.app_version || "")}`,
-        `<b>Claude</b>: ${escapeHtml(data.claude_version || "non trovato")}`,
-        `<b>Account app Claude</b>: ${escapeHtml(account ? account.label : "non rilevato")}`,
-        `<b>Account CLI Claude Code</b>: ${escapeHtml(claudeCodeAccount ? claudeCodeAccount.label : "non rilevato")}`,
-        `<b>Profili Claude simultanei</b>: ${escapeHtml(String(Number(claudeProfiles.connected_count) || 0))} collegati · `
-          + `${escapeHtml(String(Number(claudeProfiles.distinct_account_count) || 0))} account distinti · `
-          + `${claudeProfiles.simultaneous_ready ? "pronti" : "da completare"}`
-          + `${claudeProfiles.auto_launch_enabled ? " · avvio automatico attivo" : ""}`,
-        `<b>Codex</b>: ${escapeHtml(data.codex_version || "non trovato")}`,
-        `<b>Account Codex</b>: ${escapeHtml(codexAccount ? codexAccount.label : "non rilevato")}`,
-        `<b>Accesso Codex in background</b>: ${data.codex_background_access === "passive" ? "sola lettura" : "attivo"}`,
-        `<b>Account registrati</b>: ${escapeHtml(String(accounts.length))}`,
+        `<b>${isIt ? "Ora PC" : "PC Time"}</b>: ${escapeHtml(formatDateTime(data.local_time || new Date().toISOString()))}`,
+        `<b>${isIt ? "Versione app" : "App version"}</b>: ${escapeHtml(data.app_version || "")}`,
+        `<b>Claude</b>: ${escapeHtml(data.claude_version || (isIt ? "non trovato" : "not found"))}`,
+        `<b>${isIt ? "Account app Claude" : "Claude app account"}</b>: ${escapeHtml(account ? account.label : (isIt ? "non rilevato" : "not detected"))}`,
+        `<b>${isIt ? "Account CLI Claude Code" : "Claude Code CLI account"}</b>: ${escapeHtml(claudeCodeAccount ? claudeCodeAccount.label : (isIt ? "non rilevato" : "not detected"))}`,
+        `<b>${isIt ? "Profili Claude simultanei" : "Simultaneous Claude profiles"}</b>: ${escapeHtml(String(Number(claudeProfiles.connected_count) || 0))} ${isIt ? "collegati ·" : "connected ·"} `
+          + `${escapeHtml(String(Number(claudeProfiles.distinct_account_count) || 0))} ${isIt ? "account distinti ·" : "distinct accounts ·"}`
+          + `${claudeProfiles.simultaneous_ready ? (isIt ? "pronti" : "ready") : (isIt ? "da completare" : "incomplete")}`
+          + `${claudeProfiles.auto_launch_enabled ? (isIt ? " · avvio automatico attivo" : " · auto-launch active") : ""}`,
+        `<b>Codex</b>: ${escapeHtml(data.codex_version || (isIt ? "non trovato" : "not found"))}`,
+        `<b>${isIt ? "Account Codex" : "Codex account"}</b>: ${escapeHtml(codexAccount ? codexAccount.label : (isIt ? "non rilevato" : "not detected"))}`,
+        `<b>${isIt ? "Accesso Codex in background" : "Codex background access"}</b>: ${data.codex_background_access === "passive" ? (isIt ? "sola lettura" : "read-only") : (isIt ? "attivo" : "active")}`,
+        `<b>${isIt ? "Account registrati" : "Registered accounts"}</b>: ${escapeHtml(String(accounts.length))}`,
         `<b>Sync account</b>: ${escapeHtml(syncStatus)}${accountSync.last_check_at ? ` · ${escapeHtml(formatDateTime(accountSync.last_check_at))}` : ""}`,
-        accountSync.last_full_check_at ? `<b>Scansione completa</b>: ${escapeHtml(formatDateTime(accountSync.last_full_check_at))}` : "",
-        `<b>Repliche chat Claude</b>: ${escapeHtml(claudeReplicaStatus)}`,
-        `<b>Artefatti Claude Code</b>: ${escapeHtml(artifactStatus)}`,
-        `<b>Chat Claude</b>: ${data.claude_chat_count || 0}`,
-        `<b>Task Codex</b>: ${data.codex_chat_count || 0}`,
-        `<b>Accodabili</b>: ${data.queueable_chat_count}`,
-        `<b>Coda</b>: ${escapeHtml(data.queue_file || "")}`,
-        `<b>CLI Claude</b>: ${escapeHtml(data.claude_exe || "non trovato")}`,
-        `<b>CLI Codex</b>: ${escapeHtml(data.codex_exe || "non trovato")}`,
+        accountSync.last_full_check_at ? `<b>${isIt ? "Scansione completa" : "Full scan"}</b>: ${escapeHtml(formatDateTime(accountSync.last_full_check_at))}` : "",
+        `<b>${isIt ? "Repliche chat Claude" : "Claude chat replicas"}</b>: ${escapeHtml(claudeReplicaStatus)}`,
+        `<b>${isIt ? "Artefatti Claude Code" : "Claude Code artifacts"}</b>: ${escapeHtml(artifactStatus)}`,
+        `<b>${isIt ? "Chat Claude" : "Claude chats"}</b>: ${data.claude_chat_count || 0}`,
+        `<b>${isIt ? "Task Codex" : "Codex tasks"}</b>: ${data.codex_chat_count || 0}`,
+        `<b>${isIt ? "Accodabili" : "Queueable"}</b>: ${data.queueable_chat_count}`,
+        `<b>${isIt ? "Coda" : "Queue"}</b>: ${escapeHtml(data.queue_file || "")}`,
+        `<b>${isIt ? "CLI Claude" : "Claude CLI"}</b>: ${escapeHtml(data.claude_exe || (isIt ? "non trovato" : "not found"))}`,
+        `<b>${isIt ? "CLI Codex" : "Codex CLI"}</b>: ${escapeHtml(data.codex_exe || (isIt ? "non trovato" : "not found"))}`,
       ].filter(Boolean).join("<br>");
+
       renderAccountLimits(data.account_limits || {}, accountSync);
       renderRunner(data.runner || {});
     }
@@ -1859,64 +1866,92 @@ HTML = r"""<!doctype html>
       const firstAvailable = overview.first_available || null;
       const stagger = overview.stagger_plan || null;
       const summary = [];
+      const isIt = CURRENT_LANG === "it";
+
       if (firstAvailable) {
         summary.push(
-          `<b>Primo account che si sblocca</b>: ${escapeHtml(firstAvailable.provider_label)} · `
+          `<b>${isIt ? "Primo account che si sblocca" : "First account to unlock"}</b>: ${escapeHtml(firstAvailable.provider_label)} · `
           + `${escapeHtml(firstAvailable.account_label)} · ${escapeHtml(firstAvailable.account_short_key || "")} · `
           + `${escapeHtml(formatDateTime(firstAvailable.available_at))}`
         );
       } else {
-        summary.push(`<b>Account attualmente limitati</b>: ${escapeHtml(String(Number(overview.limited_count) || 0))}`);
+        summary.push(`<b>${isIt ? "Account attualmente limitati" : "Currently limited accounts"}</b>: ${escapeHtml(String(Number(overview.limited_count) || 0))}`);
       }
       if (firstReset) {
         summary.push(
-          `<b>Primo reset di quota</b>: ${escapeHtml(firstReset.provider_label)} · `
+          `<b>${isIt ? "Primo reset di quota" : "First quota reset"}</b>: ${escapeHtml(firstReset.provider_label)} · `
           + `${escapeHtml(firstReset.account_label)} · ${escapeHtml(firstReset.account_short_key || "")} · `
-          + `${escapeHtml(firstReset.window_label || "Limite")} · ${escapeHtml(formatDateTime(firstReset.reset_at))}`
+          + `${escapeHtml(firstReset.window_label || (isIt ? "Limite" : "Limit"))} · ${escapeHtml(formatDateTime(firstReset.reset_at))}`
         );
       } else {
-        summary.push("Nessun reset futuro rilevato nei dati disponibili.");
+        summary.push(isIt ? "Nessun reset futuro rilevato nei dati disponibili." : "No future resets detected in available data.");
       }
       if (stagger) {
-        const stateLabels = {
+        const stateLabels = isIt ? {
           needs_two_logins: "servono due login simultanei",
           ready_to_start: "due account pronti",
           schedule_second: "secondo ciclo da avviare",
           balanced: "cicli sfalsati correttamente",
           rebalance: "sfasamento da correggere",
+        } : {
+          needs_two_logins: "two simultaneous logins required",
+          ready_to_start: "two accounts ready",
+          schedule_second: "second cycle to schedule",
+          balanced: "cycles balanced correctly",
+          rebalance: "stagger imbalance to correct",
         };
         const nextActivation = stagger.next_activation_at
-          ? ` · prossima finestra: ${escapeHtml(formatDateTime(stagger.next_activation_at))}`
+          ? ` · ${isIt ? "prossima finestra:" : "next window:"} ${escapeHtml(formatDateTime(stagger.next_activation_at))}`
             + (stagger.next_account_label ? ` · ${escapeHtml(stagger.next_account_label)}` : "")
           : "";
         const offset = stagger.offset_minutes !== null
           && stagger.offset_minutes !== undefined
           && Number.isFinite(Number(stagger.offset_minutes))
-          ? ` · sfasamento rilevato: ${escapeHtml(String(stagger.offset_minutes))} min`
+          ? ` · ${isIt ? "sfasamento rilevato:" : "detected offset:"} ${escapeHtml(String(stagger.offset_minutes))} min`
           : "";
         summary.push(
-          `<b>Sfasamento Claude 2 h 30</b>: ${escapeHtml(stateLabels[stagger.state] || stagger.state || "in attesa")}`
+          `<b>${isIt ? "Sfasamento Claude 2 h 30" : "Claude 2h 30m stagger"}</b>: ${escapeHtml(stateLabels[stagger.state] || stagger.state || (isIt ? "in attesa" : "waiting"))}`
           + `${offset}${nextActivation}`
         );
-        summary.push(`<span class="meta">${escapeHtml(stagger.message || "")}</span>`);
+        const staggerMessages = isIt ? {
+          "Servono due profili Claude autenticati e leggibili contemporaneamente.": "Servono due profili Claude autenticati e leggibili contemporaneamente.",
+          "Entrambi gli account sono leggibili. Avvia il primo ciclo con il prossimo lavoro reale; la finestra del secondo verra calcolata 2 h 30 dopo.": "Entrambi gli account sono leggibili. Avvia il primo ciclo con il prossimo lavoro reale; la finestra del secondo verra calcolata 2 h 30 dopo.",
+          "Il secondo account e pronto: usa su di lui il primo lavoro reale disponibile nella finestra indicata.": "Il secondo account e pronto: usa su di lui il primo lavoro reale disponibile nella finestra indicata.",
+          "Cicli gia sfalsati correttamente. Al prossimo reset usa il primo lavoro reale disponibile.": "Cicli gia sfalsati correttamente. Al prossimo reset usa il primo lavoro reale disponibile.",
+          "Entrambi i cicli sono attivi, ma lo sfasamento non e ancora vicino a 2 h 30.": "Entrambi i cicli sono attivi, ma lo sfasamento non e ancora vicino a 2 h 30."
+        } : {
+          "Servono due profili Claude autenticati e leggibili contemporaneamente.": "Two Claude profiles must be authenticated and readable simultaneously.",
+          "Entrambi gli account sono leggibili. Avvia il primo ciclo con il prossimo lavoro reale; la finestra del secondo verra calcolata 2 h 30 dopo.": "Both accounts are readable. Start the first cycle with the next real job; the window of the second will be calculated 2h 30m later.",
+          "Il secondo account e pronto: usa su di lui il primo lavoro reale disponibile nella finestra indicata.": "The second account is ready: use the first available real job on it within the specified window.",
+          "Cicli gia sfalsati correttamente. Al prossimo reset usa il primo lavoro reale disponibile.": "Cycles already correctly staggered. At the next reset, use the first available real job.",
+          "Entrambi i cicli sono attivi, ma lo sfasamento non e ancora vicino a 2 h 30.": "Both cycles are active, but the stagger is not yet close to 2h 30m."
+        };
+        const msg = staggerMessages[stagger.message] || stagger.message || "";
+        summary.push(`<span class="meta">${escapeHtml(msg)}</span>`);
       }
       const checking = !!(accountSync && accountSync.in_progress);
       const refreshed = overview.refreshed_at
-        ? `Dati aggiornati: ${escapeHtml(formatDateTime(overview.refreshed_at))}`
-        : (checking ? "Lettura account in corso..." : "In attesa del primo dato di utilizzo.");
-      summary.push(`<span class="meta">${refreshed}${checking ? " · controllo in corso" : ""}</span>`);
+        ? `${isIt ? "Dati aggiornati:" : "Data updated:"} ${escapeHtml(formatDateTime(overview.refreshed_at))}`
+        : (checking ? (isIt ? "Lettura account in corso..." : "Reading accounts...") : (isIt ? "In attesa del primo dato di utilizzo." : "Waiting for initial usage data."));
+      summary.push(`<span class="meta">${refreshed}${checking ? (isIt ? " · controllo in corso" : " · check in progress") : ""}</span>`);
       $("limit-summary").innerHTML = summary.join("<br>");
 
       if (!accounts.length) {
-        $("limit-list").innerHTML = `<div class="empty">Nessun account registrato</div>`;
+        $("limit-list").innerHTML = `<div class="empty">${isIt ? "Nessun account registrato" : "No registered accounts"}</div>`;
         return;
       }
-      const stateLabels = {
+      const stateLabels = isIt ? {
         available: "Disponibile",
         limited: "Limitato",
         known: "Ultimo dato noto",
         stale: "Da aggiornare",
         unknown: "Non rilevato",
+      } : {
+        available: "Available",
+        limited: "Limited",
+        known: "Last known data",
+        stale: "To update",
+        unknown: "Not detected",
       };
       const sourceLabels = {
         claude_oauth_live: "Claude live",
@@ -1933,34 +1968,34 @@ HTML = r"""<!doctype html>
               const percent = hasPercent ? Math.max(0, Math.min(100, numeric)) : 0;
               const percentLabel = hasPercent ? `${Math.round(numeric)}%` : "n/d";
               const resetLabel = window.reset_at
-                ? `${window.future ? "Reset" : "Reset trascorso"}: ${formatDateTime(window.reset_at)}`
-                : "Reset non comunicato";
+                ? `${window.future ? "Reset" : (isIt ? "Reset trascorso" : "Reset passed")}: ${formatDateTime(window.reset_at)}`
+                : (isIt ? "Reset non comunicato" : "Reset not specified");
               return `
                 <div class="limit-window">
-                  <span class="limit-window-label">${escapeHtml(window.label || "Limite")}</span>
+                  <span class="limit-window-label">${escapeHtml(window.label || (isIt ? "Limite" : "Limit"))}</span>
                   <span title="${escapeAttr(percentLabel)}"><progress max="100" value="${escapeAttr(percent)}"></progress> ${escapeHtml(percentLabel)}</span>
                   <span class="limit-window-reset">${escapeHtml(resetLabel)}</span>
                 </div>
               `;
             }).join("")
-          : `<div class="meta">Quota non leggibile ora. Verra acquisita automaticamente al prossimo accesso dell'account.</div>`;
+          : `<div class="meta">${isIt ? "Quota non leggibile ora. Verra acquisita automaticamente al prossimo accesso dell'account." : "Quota currently unreadable. It will be acquired automatically on next account access."}</div>`;
         const activityLabel = account.active
-          ? (account.state === "available" || account.state === "limited" ? "attivo ora" : "configurato ora")
-          : "account memorizzato";
+          ? (account.state === "available" || account.state === "limited" ? (isIt ? "attivo ora" : "active now") : (isIt ? "configurato ora" : "configured now"))
+          : (isIt ? "account memorizzato" : "stored account");
         const details = [
           activityLabel,
-          account.plan ? `piano ${account.plan}` : "",
-          account.observed_at ? `letto ${formatDateTime(account.observed_at)}` : "mai letto",
+          account.plan ? `${isIt ? "piano" : "plan"} ${account.plan}` : "",
+          account.observed_at ? `${isIt ? "letto" : "read"} ${formatDateTime(account.observed_at)}` : (isIt ? "mai letto" : "never read"),
           sourceLabels[account.source] || "",
         ].filter(Boolean).join(" · ");
         const availability = account.available_at
-          ? `<div class="meta"><b>Utilizzabile</b>: ${escapeHtml(formatDateTime(account.available_at))} (margine incluso)</div>`
+          ? `<div class="meta"><b>${isIt ? "Utilizzabile" : "Usable"}</b>: ${escapeHtml(formatDateTime(account.available_at))} (${isIt ? "margine incluso" : "margin included"})</div>`
           : "";
         return `
           <div class="limit-account">
             <div class="limit-account-head">
               <div class="limit-account-name"><b>${escapeHtml(account.provider_label)}</b> · ${escapeHtml(account.label)} · ${escapeHtml(account.short_key || "")}</div>
-              <span class="limit-state ${escapeAttr(account.state || "unknown")}">${escapeHtml(stateLabels[account.state] || "Non rilevato")}</span>
+              <span class="limit-state ${escapeAttr(account.state || "unknown")}">${escapeHtml(stateLabels[account.state] || (isIt ? "Non rilevato" : "Not detected"))}</span>
             </div>
             ${windowRows}
             ${availability}
