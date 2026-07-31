@@ -1556,29 +1556,29 @@ HTML = r"""<!doctype html>
   <header>
     <h1>Claude + Codex Queue</h1>
     <div class="row">
-      <span class="status"><span id="runner-dot" class="dot off"></span><span id="runner-text">Runner fermo</span></span>
-      <button id="refresh-btn">Aggiorna</button>
-      <button id="start-btn" class="primary">Avvia runner</button>
-      <button id="stop-btn" class="danger">Ferma</button>
+      <span class="status"><span id="runner-dot" class="dot off"></span><span id="runner-text" data-i18n="runnerStopped">Runner stopped</span></span>
+      <button id="refresh-btn" data-i18n="refresh">Refresh</button>
+      <button id="start-btn" class="primary" data-i18n="startRunner">Start runner</button>
+      <button id="stop-btn" class="danger" data-i18n="stopRunner">Stop</button>
     </div>
   </header>
   <main>
     <div class="stack">
       <section>
-        <h2>Ambiente</h2>
-        <div id="doctor" class="meta">Caricamento...</div>
+        <h2 data-i18n="environment">Environment</h2>
+        <div id="doctor" class="meta" data-i18n="loading">Loading...</div>
       </section>
       <section>
-        <h2>Limiti account</h2>
-        <div id="limit-summary" class="limit-summary meta">Rilevamento in corso...</div>
+        <h2 data-i18n="accountLimits">Account limits</h2>
+        <div id="limit-summary" class="limit-summary meta" data-i18n="detecting">Detecting...</div>
         <div id="limit-list" class="limit-list"></div>
       </section>
       <section>
-        <h2>Chat</h2>
+        <h2 data-i18n="chats">Chats</h2>
         <div class="chat-filters">
-          <input id="chat-filter" placeholder="Filtra chat o task">
+          <input id="chat-filter" data-i18n-placeholder="filterPlaceholder" placeholder="Filter chats or tasks">
           <select id="provider-filter" aria-label="Provider">
-            <option value="">Tutte</option>
+            <option value="" data-i18n="all">All</option>
             <option value="claude">Claude</option>
             <option value="codex">Codex</option>
           </select>
@@ -1588,43 +1588,160 @@ HTML = r"""<!doctype html>
     </div>
     <div class="stack">
       <section>
-        <h2>Messaggi</h2>
-        <textarea id="messages" spellcheck="false" placeholder="Un messaggio oppure piu' messaggi separati da una riga con solo ---"></textarea>
+        <h2 data-i18n="messages">Messages</h2>
+        <textarea id="messages" spellcheck="false" data-i18n-placeholder="messagesPlaceholder" placeholder="One message or multiple messages separated by a line with only ---"></textarea>
         <div class="settings-grid">
-          <label class="field-label">Modello<select id="model-select"></select></label>
-          <label class="field-label">Effort<select id="effort-select"></select></label>
-          <label id="permission-field" class="field-label">Permessi<select id="permission-select"></select></label>
-          <label id="approval-field" class="field-label hidden">Approvazioni<select id="approval-select"></select></label>
-          <label class="field-label">Priorita'
+          <label class="field-label"><span data-i18n="model">Model</span><select id="model-select"></select></label>
+          <label class="field-label"><span data-i18n="effort">Effort</span><select id="effort-select"></select></label>
+          <label id="permission-field" class="field-label"><span data-i18n="permissions">Permissions</span><select id="permission-select"></select></label>
+          <label id="approval-field" class="field-label hidden"><span data-i18n="approvals">Approvals</span><select id="approval-select"></select></label>
+          <label class="field-label"><span data-i18n="priority">Priority</span>
             <select id="priority-select">
-              <option value="100">Normale</option>
-              <option value="0">Urgente</option>
-              <option value="50">Alta</option>
-              <option value="200">Bassa</option>
+              <option value="100" data-i18n="priorityNormal">Normal</option>
+              <option value="0" data-i18n="priorityUrgent">Urgent</option>
+              <option value="50" data-i18n="priorityHigh">High</option>
+              <option value="200" data-i18n="priorityLow">Low</option>
             </select>
           </label>
         </div>
         <div class="row" style="margin-top:10px">
-          <button id="add-btn" class="primary">Aggiungi alla coda</button>
-          <button id="check-btn">Controlla impostazioni</button>
-          <button id="auto-btn" class="blue">Auto-continua</button>
-          <button id="transfer-btn">Importa nell'account attivo</button>
-          <label class="inline-check"><input id="transfer-move" type="checkbox"> rimuovi sorgente</label>
-          <span id="selected-chat" class="meta grow">Nessuna chat selezionata</span>
+          <button id="add-btn" class="primary" data-i18n="addToQueue">Add to queue</button>
+          <button id="check-btn" data-i18n="checkSettings">Check settings</button>
+          <button id="auto-btn" class="blue" data-i18n="enableAutoContinue">Auto-continue</button>
+          <button id="transfer-btn" data-i18n="importToActiveAccount">Import into active account</button>
+          <label class="inline-check"><input id="transfer-move" type="checkbox"> <span data-i18n="removeSource">remove source</span></label>
+          <span id="selected-chat" class="meta grow" data-i18n="noChatSelected">No chat selected</span>
           <span id="auto-feedback" class="meta auto-feedback"></span>
         </div>
       </section>
       <section>
-        <h2>Coda</h2>
+        <h2 data-i18n="queue">Queue</h2>
         <div id="queue"></div>
       </section>
       <section>
-        <h2>Log</h2>
+        <h2 data-i18n="logs">Logs</h2>
         <pre id="log"></pre>
       </section>
     </div>
   </main>
   <script>
+    const USER_LOCALE = navigator.language || "en-US";
+    let CURRENT_LANG = USER_LOCALE.toLowerCase().startsWith("it") ? "it" : "en";
+    document.documentElement.lang = CURRENT_LANG;
+
+    const I18N = {
+      en: {
+        runnerStopped: "Runner stopped",
+        runnerActive: "Runner active",
+        runnerWaiting: "Automatic waiting",
+        refresh: "Refresh",
+        startRunner: "Start runner",
+        stopRunner: "Stop",
+        environment: "Environment",
+        accountLimits: "Account limits",
+        chats: "Chats",
+        messages: "Messages",
+        queue: "Queue",
+        logs: "Logs",
+        filterPlaceholder: "Filter chats or tasks",
+        all: "All",
+        messagesPlaceholder: "One message or multiple messages separated by a line with only ---",
+        model: "Model",
+        effort: "Effort",
+        permissions: "Permissions",
+        sandbox: "Sandbox",
+        approvals: "Approvals",
+        priority: "Priority",
+        priorityNormal: "Normal",
+        priorityUrgent: "Urgent",
+        priorityHigh: "High",
+        priorityLow: "Low",
+        addToQueue: "Add to queue",
+        checkSettings: "Check settings",
+        enableAutoContinue: "Enable auto-continue",
+        disableAutoContinue: "Disable auto-continue",
+        importToActiveAccount: "Import into active account",
+        removeSource: "remove source",
+        noChatSelected: "No chat selected",
+        status: "Status",
+        id: "ID",
+        item: "Item",
+        actions: "Actions",
+        remove: "Remove",
+        reset: "Reset",
+        queueEmpty: "Queue empty",
+        noChats: "No chats found",
+        loading: "Loading...",
+        detecting: "Detecting...",
+      },
+      it: {
+        runnerStopped: "Runner fermo",
+        runnerActive: "Runner attivo",
+        runnerWaiting: "Automatico in attesa",
+        refresh: "Aggiorna",
+        startRunner: "Avvia runner",
+        stopRunner: "Ferma",
+        environment: "Ambiente",
+        accountLimits: "Limiti account",
+        chats: "Chat",
+        messages: "Messaggi",
+        queue: "Coda",
+        logs: "Log",
+        filterPlaceholder: "Filtra chat o task",
+        all: "Tutte",
+        messagesPlaceholder: "Un messaggio oppure piu' messaggi separati da una riga con solo ---",
+        model: "Modello",
+        effort: "Effort",
+        permissions: "Permessi",
+        sandbox: "Sandbox",
+        approvals: "Approvazioni",
+        priority: "Priorita'",
+        priorityNormal: "Normale",
+        priorityUrgent: "Urgente",
+        priorityHigh: "Alta",
+        priorityLow: "Bassa",
+        addToQueue: "Aggiungi alla coda",
+        checkSettings: "Controlla impostazioni",
+        enableAutoContinue: "Attiva auto-continua",
+        disableAutoContinue: "Disattiva auto-continua",
+        importToActiveAccount: "Importa nell'account attivo",
+        removeSource: "rimuovi sorgente",
+        noChatSelected: "Nessuna chat selezionata",
+        status: "Stato",
+        id: "ID",
+        item: "Elemento",
+        actions: "Azioni",
+        remove: "Rimuovi",
+        reset: "Reset",
+        queueEmpty: "Coda vuota",
+        noChats: "Nessuna chat",
+        loading: "Caricamento...",
+        detecting: "Rilevamento in corso...",
+      }
+    };
+
+    function t(key, fallback = "") {
+      return I18N[CURRENT_LANG]?.[key] || I18N.en?.[key] || fallback || key;
+    }
+
+    function applyStaticI18n() {
+      document.querySelectorAll("[data-i18n]").forEach((el) => {
+        const key = el.getAttribute("data-i18n");
+        if (key && I18N[CURRENT_LANG]?.[key]) {
+          el.textContent = t(key);
+        }
+      });
+      document.querySelectorAll("[data-i18n-placeholder]").forEach((el) => {
+        const key = el.getAttribute("data-i18n-placeholder");
+        if (key && I18N[CURRENT_LANG]?.[key]) {
+          el.placeholder = t(key);
+        }
+      });
+    }
+
+    // Call it immediately on script load
+    applyStaticI18n();
+
     const state = { chats: [], selected: null, queue: [], autoContinues: [], runner: {}, autoBusy: false, autoBusyAction: null, settingsSession: null, transferBusy: false, refreshBusy: false, doctorBusy: false, messagePreviews: {}, previewRequests: {} };
     let chatPreviewObserver = null;
     const $ = (id) => document.getElementById(id);
@@ -1635,7 +1752,7 @@ HTML = r"""<!doctype html>
     const SANDBOX_OPTIONS = ["read-only", "workspace-write", "danger-full-access"];
     const APPROVAL_OPTIONS = ["untrusted", "on-request", "on-failure", "never"];
     const USER_TIME_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
-    const USER_LOCALE = navigator.language || "it-IT";
+     //const USER_LOCALE = navigator.language || "it-IT";
     const DATE_TIME_OPTIONS = {
       year: "numeric",
       month: "2-digit",
@@ -1853,14 +1970,17 @@ HTML = r"""<!doctype html>
       }).join("");
     }
 
-    function renderRunner(runner) {
+   function renderRunner(runner) {
       state.runner = runner || {};
       const running = !!runner.running;
       const automatic = !!runner.automatic;
       $("runner-dot").className = "dot " + (running || automatic ? "on" : "off");
+      
+      const autoPrefix = automatic ? (CURRENT_LANG === "it" ? "Automatico · " : "Automatic · ") : "";
       $("runner-text").textContent = running
-        ? `${automatic ? "Automatico · " : ""}Runner attivo${runner.pid ? ` #${runner.pid}` : ""}`
-        : (automatic ? "Automatico in attesa" : "Runner fermo");
+        ? `${autoPrefix}${t("runnerActive")}${runner.pid ? ` #${runner.pid}` : ""}`
+        : (automatic ? t("runnerWaiting") : t("runnerStopped"));
+
       $("start-btn").disabled = running || automatic;
       $("stop-btn").disabled = !running || automatic;
       if (runner.log_tail) log(runner.log_tail);
@@ -1937,11 +2057,21 @@ HTML = r"""<!doctype html>
       if (!chat) return "";
       const provider = chat.provider === "codex" ? "Codex" : "Claude";
       const copies = Array.isArray(chat.account_copies) ? chat.account_copies.filter(Boolean) : [];
-      if (copies.length > 1) return `sincronizzata su ${copies.length} account: ${copies.join(", ")}`;
-      if (chat.account_status === "active") return `${provider} attivo: ${chat.account_label || chat.account_short_key || ""}`;
-      if (chat.account_status === "other") return `altro account: ${chat.account_label || chat.account_short_key || ""}`;
-      if (chat.account_status === "known") return `account: ${chat.account_label || chat.account_short_key || ""}`;
-      return "account non associato";
+      if (copies.length > 1) {
+        return CURRENT_LANG === "it"
+          ? `sincronizzata su ${copies.length} account: ${copies.join(", ")}`
+          : `synced across ${copies.length} accounts: ${copies.join(", ")}`;
+      }
+      if (chat.account_status === "active") {
+        return `${provider} ${CURRENT_LANG === "it" ? "attivo" : "active"}: ${chat.account_label || chat.account_short_key || ""}`;
+      }
+      if (chat.account_status === "other") {
+        return `${CURRENT_LANG === "it" ? "altro account" : "other account"}: ${chat.account_label || chat.account_short_key || ""}`;
+      }
+      if (chat.account_status === "known") {
+        return `account: ${chat.account_label || chat.account_short_key || ""}`;
+      }
+      return CURRENT_LANG === "it" ? "account non associato" : "unlinked account";
     }
 
     function renderSelect(select, currentValue, options, previousValue) {
@@ -1962,7 +2092,7 @@ HTML = r"""<!doctype html>
       select.value = previousValue && values.includes(previousValue) ? previousValue : "";
     }
 
-    function renderSettingsControls() {
+function renderSettingsControls() {
       const chat = selectedChat();
       const isCodex = !!(chat && chat.provider === "codex");
       const reset = state.settingsSession !== state.selected;
@@ -1979,7 +2109,13 @@ HTML = r"""<!doctype html>
         previousPermission,
       );
       renderSelect($("approval-select"), chat && chat.approval_policy, APPROVAL_OPTIONS, previousApproval);
-      $("permission-field").childNodes[0].nodeValue = isCodex ? "Sandbox" : "Permessi";
+
+      // --- LOCALIZED PERMISSION/SANDBOX LABEL ---
+      const permLabel = $("permission-field").querySelector("span") || $("permission-field").childNodes[0];
+      if (permLabel) {
+        permLabel.textContent = isCodex ? t("sandbox") : t("permissions");
+      }
+
       $("approval-field").classList.toggle("hidden", !isCodex);
       const disabled = !(chat && chat.can_queue);
       $("model-select").disabled = disabled;
@@ -2013,10 +2149,10 @@ HTML = r"""<!doctype html>
       $("auto-btn").disabled = !selectedAvailable || state.autoBusy;
       $("auto-btn").className = activeForSelected ? "danger" : "blue";
       $("auto-btn").textContent = state.autoBusy
-        ? (state.autoBusyAction === "disable" ? "Disattivo..." : "Attivo...")
+        ? (state.autoBusyAction === "disable" ? "..." : "...")
         : activeForSelected
-        ? "Disattiva auto-continua"
-        : "Attiva auto-continua";
+        ? t("disableAutoContinue")
+        : t("enableAutoContinue");
     }
 
     function transferAvailable(chat) {
@@ -2034,13 +2170,22 @@ HTML = r"""<!doctype html>
       moveToggle.disabled = isCodex || !available || state.transferBusy || !(chat && chat.account_status === "other");
       if (moveToggle.disabled) moveToggle.checked = false;
       $("transfer-btn").disabled = !available || state.transferBusy;
-      $("transfer-btn").textContent = state.transferBusy
-        ? "Importo..."
-        : isCodex
-        ? "Copia nell'account ChatGPT attivo"
-        : chat && chat.account_status === "other"
-        ? (moveToggle.checked ? "Sposta da altro account" : "Importa da altro account")
-        : "Importa nell'account attivo";
+      
+      if (state.transferBusy) {
+        $("transfer-btn").textContent = CURRENT_LANG === "it" ? "Importo..." : "Importing...";
+        return;
+      }
+      if (isCodex) {
+        $("transfer-btn").textContent = CURRENT_LANG === "it" ? "Copia nell'account ChatGPT attivo" : "Copy to active ChatGPT account";
+        return;
+      }
+      if (chat && chat.account_status === "other") {
+        $("transfer-btn").textContent = moveToggle.checked
+          ? (CURRENT_LANG === "it" ? "Sposta da altro account" : "Move from other account")
+          : (CURRENT_LANG === "it" ? "Importa da altro account" : "Import from other account");
+        return;
+      }
+      $("transfer-btn").textContent = CURRENT_LANG === "it" ? "Importa nell'account attivo" : "Import into active account";
     }
 
     function formatDateTime(value) {
@@ -2136,7 +2281,7 @@ HTML = r"""<!doctype html>
       }).sort((a, b) => Date.parse(b.last_timestamp || 0) - Date.parse(a.last_timestamp || 0));
       list.innerHTML = "";
       if (!chats.length) {
-        list.innerHTML = `<div class="empty">Nessuna chat</div>`;
+          list.innerHTML = `<div class="empty">${t("noChats")}</div>`;
         renderSettingsControls();
         renderAutoButton();
         renderTransferButton();
@@ -2150,16 +2295,27 @@ HTML = r"""<!doctype html>
         const accountBadge = accountText(chat);
         const lastMessage = chat.last_user_message || chat.last_prompt || "";
         const lastMessageLoaded = !!(chat.last_user_message_loaded || lastMessage);
-        const lastMessageText = lastMessage || (lastMessageLoaded ? "non disponibile" : "caricamento...");
+        const lastMessageLabel = CURRENT_LANG === "it" ? "Ultimo messaggio:" : "Last message:";
+        const unavailableText = CURRENT_LANG === "it" ? "non disponibile" : "unavailable";
+        const loadingText = CURRENT_LANG === "it" ? "caricamento..." : "loading...";
+        const usableBadge = chat.can_queue 
+          ? (CURRENT_LANG === "it" ? "utilizzabile" : "usable") 
+          : (CURRENT_LANG === "it" ? "solo visibile" : "view-only");
+        const autoBadge = autoContinueForSession(chat.session_id)?.enabled 
+          ? `<span class="badge">${CURRENT_LANG === "it" ? "auto-continua attivo" : "auto-continue active"}</span>` 
+          : "";
+        const untitledText = CURRENT_LANG === "it" ? "Senza titolo" : "Untitled";
+        const lastMessageText = lastMessage || (lastMessageLoaded ? unavailableText : loadingText);
+
         btn.innerHTML = `
-          <span class="chat-title">${escapeHtml(chat.short_id)} · ${escapeHtml(chat.title || "Senza titolo")}</span>
-          <span class="chat-last-message${lastMessage ? "" : " unavailable"}" title="${escapeAttr(`Ultimo messaggio: ${lastMessageText}`)}"><b>Ultimo messaggio:</b> ${escapeHtml(lastMessageText)}</span>
+          <span class="chat-title">${escapeHtml(chat.short_id)} · ${escapeHtml(chat.title || untitledText)}</span>
+          <span class="chat-last-message${lastMessage ? "" : " unavailable"}" title="${escapeAttr(`${lastMessageLabel} ${lastMessageText}`)}"><b>${lastMessageLabel}</b> ${escapeHtml(lastMessageText)}</span>
           <span class="chat-sub">
             <span class="badge">${escapeHtml(chat.source || "")}</span>
             <span class="badge">${chat.provider === "codex" ? "Codex" : "Claude"}</span>
             ${chat.remote_host ? `<span class="badge">SSH ${escapeHtml(chat.remote_host)}</span>` : ""}
-            <span class="badge">${chat.can_queue ? "utilizzabile" : "solo visibile"}</span>
-            ${autoContinueForSession(chat.session_id)?.enabled ? `<span class="badge">auto-continua attivo</span>` : ""}
+            <span class="badge">${usableBadge}</span>
+            ${autoBadge}
             <span class="badge">${escapeHtml(accountBadge)}</span>
             ${chat.model ? `<span class="badge">${escapeHtml(chat.model)}</span>` : ""}
             ${chat.message_count >= 0 ? `${escapeHtml(String(chat.message_count || 0))} msg` : ""}
@@ -2204,9 +2360,9 @@ HTML = r"""<!doctype html>
       const recovery = data.recovery || null;
       const recoveryBox = recovery ? `
         <div class="recovery-box">
-          Recovery attiva: la prossima azione sara' <b>${escapeHtml(recovery.recovery_prompt_preview || recovery.prompt || "analisi automatica")}</b> sulla chat ${escapeHtml((recovery.session_id || "").slice(0, 8))}.
-          ${recovery.recovery_followup_count ? `<br><span class="meta">Altri ${escapeHtml(String(recovery.recovery_followup_count))} messaggi falliti sono in coda nello stesso ordine.</span>` : ""}
-          ${recovery.not_before ? `<br><span class="meta">Non prima di ${escapeHtml(formatDateTime(recovery.not_before))}</span>` : ""}
+          Recovery: <b>${escapeHtml(recovery.recovery_prompt_preview || recovery.prompt || "analisi automatica")}</b> ${CURRENT_LANG === "it" ? "sulla chat" : "on chat"} ${escapeHtml((recovery.session_id || "").slice(0, 8))}.
+          ${recovery.recovery_followup_count ? `<br><span class="meta">${escapeHtml(String(recovery.recovery_followup_count))} ${CURRENT_LANG === "it" ? "altri messaggi falliti in coda." : "more failed messages in queue."}</span>` : ""}
+          ${recovery.not_before ? `<br><span class="meta">${CURRENT_LANG === "it" ? "Non prima di" : "Not before"} ${escapeHtml(formatDateTime(recovery.not_before))}</span>` : ""}
         </div>
       ` : "";
       const runner = state.runner || {};
@@ -2215,53 +2371,57 @@ HTML = r"""<!doctype html>
         const effective = auto.fingerprint && auto.fingerprint.effective ? auto.fingerprint.effective : {};
         const autoIsCodex = auto.provider === "codex";
         const autoDetails = [
-          `Stato: ${escapeHtml(auto.status || "spento")}`,
-          `Azione: ${escapeHtml(autoActionLabel(auto))}`,
-          auto.recovery_followup_count ? `Messaggi recuperati in coda: ${escapeHtml(String(auto.recovery_followup_count))}` : "",
-          `Runner: ${runner.running ? `attivo${runner.pid ? ` #${escapeHtml(runner.pid)}` : ""}` : (runner.automatic ? "automatico in attesa" : "fermo")}`,
-          `Origine: ${escapeHtml(auto.source || (autoIsCodex ? "Codex App" : "Claude Code"))}`,
-          !autoIsCodex && auto.source_key === "claude_windows_app" ? "Integrazione IDE: non usata" : "",
-          `Modello: ${escapeHtml(auto.model_override || effective.model || "chat")}`,
-          `Effort: ${escapeHtml(auto.effort_level_override || effective.effortLevel || "chat")}`,
+          `${t("status")}: ${escapeHtml(auto.status || "off")}`,
+          `Action: ${escapeHtml(autoActionLabel(auto))}`,
+          auto.recovery_followup_count ? `Recovered messages: ${escapeHtml(String(auto.recovery_followup_count))}` : "",
+          `Runner: ${runner.running ? `active${runner.pid ? ` #${escapeHtml(runner.pid)}` : ""}` : (runner.automatic ? "automatic waiting" : "stopped")}`,
+          `Source: ${escapeHtml(auto.source || (autoIsCodex ? "Codex App" : "Claude Code"))}`,
+          !autoIsCodex && auto.source_key === "claude_windows_app" ? "IDE integration: unused" : "",
+          `${t("model")}: ${escapeHtml(auto.model_override || effective.model || "chat")}`,
+          `${t("effort")}: ${escapeHtml(auto.effort_level_override || effective.effortLevel || "chat")}`,
           autoIsCodex
-            ? `Sandbox: ${escapeHtml(auto.sandbox_mode_override || effective.sandboxMode || "task")}`
-            : `Permessi: ${escapeHtml(auto.permission_mode_override || effective.permissionMode || "chat")}`,
-          autoIsCodex ? `Approvazioni: ${escapeHtml(auto.approval_policy_override || effective.approvalPolicy || "task")}` : "",
-          `Controlli: ${escapeHtml(String(auto.attempts || 0))}`,
-          auto.actions_completed ? `Try again eseguiti: ${escapeHtml(String(auto.actions_completed))}` : "",
-          auto.last_action_at ? `Ultima azione: ${escapeHtml(formatDateTime(auto.last_action_at))}` : "",
-          auto.sending_started_at ? `Invio iniziato: ${escapeHtml(formatDateTime(auto.sending_started_at))}` : "",
-          auto.not_before && auto.status !== "sending" ? `Prossimo tentativo: ${escapeHtml(formatDateTime(auto.not_before))}` : "",
-          auto.next_check_in_seconds ? `Prossimo controllo: tra ${escapeHtml(formatDuration(auto.next_check_in_seconds))}` : "",
-          auto.last_check_at ? `Ultimo check: ${escapeHtml(formatDateTime(auto.last_check_at))}` : "",
-          auto.updated_at ? `Aggiornato: ${escapeHtml(formatDateTime(auto.updated_at))}` : "",
+            ? `${t("sandbox")}: ${escapeHtml(auto.sandbox_mode_override || effective.sandboxMode || "task")}`
+            : `${t("permissions")}: ${escapeHtml(auto.permission_mode_override || effective.permissionMode || "chat")}`,
+          autoIsCodex ? `${t("approvals")}: ${escapeHtml(auto.approval_policy_override || effective.approvalPolicy || "task")}` : "",
+          `Checks: ${escapeHtml(String(auto.attempts || 0))}`,
+          auto.actions_completed ? `Try again executed: ${escapeHtml(String(auto.actions_completed))}` : "",
+          auto.last_action_at ? `Last action: ${escapeHtml(formatDateTime(auto.last_action_at))}` : "",
+          auto.sending_started_at ? `Sending started: ${escapeHtml(formatDateTime(auto.sending_started_at))}` : "",
+          auto.not_before && auto.status !== "sending" ? `Next attempt: ${escapeHtml(formatDateTime(auto.not_before))}` : "",
+          auto.next_check_in_seconds ? `Next check: in ${escapeHtml(formatDuration(auto.next_check_in_seconds))}` : "",
+          auto.last_check_at ? `Last check: ${escapeHtml(formatDateTime(auto.last_check_at))}` : "",
+          auto.updated_at ? `Updated: ${escapeHtml(formatDateTime(auto.updated_at))}` : "",
         ].filter(Boolean).join("<br>");
         return `
           <div class="auto-box">
-            Auto-continua: <b>${auto.enabled ? "attivo" : escapeHtml(auto.status || "spento")}</b>
-            sulla chat ${escapeHtml((auto.session_id || "").slice(0, 8))}
+            Auto-continue: <b>${auto.enabled ? "active" : escapeHtml(auto.status || "off")}</b>
+            ${CURRENT_LANG === "it" ? "sulla chat" : "on chat"} ${escapeHtml((auto.session_id || "").slice(0, 8))}
             ${auto.title ? ` · ${escapeHtml(auto.title)}` : ""}.
             <br><span class="meta">${autoDetails}</span>
             ${auto.last_error && auto.status !== "sending" ? `<br><span class="meta">${escapeHtml(auto.last_error)}</span>` : ""}
           </div>
         `;
       }).join("");
+
       if (!state.queue.length) {
-        $("queue").innerHTML = autoBoxes + recoveryBox + `<div class="empty">Coda vuota</div>`;
+        $("queue").innerHTML = autoBoxes + recoveryBox + `<div class="empty">${t("queueEmpty")}</div>`;
         return;
       }
+
+      const attemptsSuffix = CURRENT_LANG === "it" ? "tent." : "att.";
       const rows = state.queue.map((item) => `
         <tr>
           <td style="width:82px"><span class="status-pill ${escapeHtml(item.status || "")}">${escapeHtml(item.status || "")}</span></td>
-          <td style="width:90px">${escapeHtml(item.id || "")}<br><span class="meta">${escapeHtml(String(item.attempts || 0))} tent.</span></td>
-          <td><span class="badge">${item.provider === "codex" ? "Codex" : "Claude"}</span> ${escapeHtml(item.title || item.session_id || "")}<br><span class="meta">Priorita': ${escapeHtml(String(item.priority ?? 100))} · ${escapeHtml((item.prompt || "").slice(0, 180))}</span></td>
+          <td style="width:90px">${escapeHtml(item.id || "")}<br><span class="meta">${escapeHtml(String(item.attempts || 0))} ${attemptsSuffix}</span></td>
+          <td><span class="badge">${item.provider === "codex" ? "Codex" : "Claude"}</span> ${escapeHtml(item.title || item.session_id || "")}<br><span class="meta">${t("priority")}: ${escapeHtml(String(item.priority ?? 100))} · ${escapeHtml((item.prompt || "").slice(0, 180))}</span></td>
           <td style="width:178px">
-            <button onclick="removeItem('${escapeAttr(item.id || "")}')">Rimuovi</button>
-            <button onclick="resetItem('${escapeAttr(item.id || "")}')">Reset</button>
+            <button onclick="removeItem('${escapeAttr(item.id || "")}')">${t("remove")}</button>
+            <button onclick="resetItem('${escapeAttr(item.id || "")}')">${t("reset")}</button>
           </td>
         </tr>
       `).join("");
-      $("queue").innerHTML = autoBoxes + recoveryBox + `<table><thead><tr><th>Stato</th><th>ID</th><th>Elemento</th><th>Azioni</th></tr></thead><tbody>${rows}</tbody></table>`;
+
+      $("queue").innerHTML = autoBoxes + recoveryBox + `<table><thead><tr><th>${t("status")}</th><th>${t("id")}</th><th>${t("item")}</th><th>${t("actions")}</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
     async function refreshDoctor() {
