@@ -56,7 +56,7 @@ Additional capabilities:
 - per-account Claude and ChatGPT usage windows with the next reset and first available account;
 - account mismatch and view-only checks before actions are enabled;
 - transcript confirmation after every Codex send;
-- local web UI plus a scriptable CLI;
+- English/Italian local web UI selected automatically from the browser language, plus a scriptable CLI;
 - no runtime Python dependencies outside the standard library.
 
 ### Multi-account chat copies
@@ -202,6 +202,11 @@ Under WSL, PowerShell scripts are stored atomically in the current user's
 private queue cache and invoked by file; large encoded scripts and raw child
 commands are never returned by the web diagnostics.
 
+The dashboard follows the browser language (Italian for `it-*`, English for
+all other locales) and formats dates and times with the browser's regional
+settings. Append `?lang=en` or `?lang=it` to the local URL for an explicit
+per-tab override. No language pack or runtime dependency is required.
+
 The installer also registers the app in the current Windows user's Startup
 folder. At login it starts the server in the background and opens the browser
 after the health check succeeds. The page refreshes every five seconds and
@@ -334,7 +339,7 @@ reproducible defects belong in
 
 ## Project status
 
-Current release: **v0.3.0**. The project is alpha software tested on Windows/WSL
+Current release: **v0.3.1**. The project is alpha software tested on Windows/WSL
 with local Claude Code and Codex App workflows. Upstream desktop metadata is not
 a public compatibility contract and may change between provider releases.
 

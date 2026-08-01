@@ -1250,7 +1250,7 @@ class QueueRequestHandler(BaseHTTPRequestHandler):
 
 
 HTML = r"""<!doctype html>
-<html lang="it">
+<html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -1625,15 +1625,13 @@ HTML = r"""<!doctype html>
     </div>
   </main>
   <script>
-    const USER_LOCALE = navigator.language || "en-US";
-    let CURRENT_LANG = USER_LOCALE.toLowerCase().startsWith("it") ? "it" : "en";
-    document.documentElement.lang = CURRENT_LANG;
-
+    // I18N_CORE_START
     const I18N = {
       en: {
         runnerStopped: "Runner stopped",
         runnerActive: "Runner active",
         runnerWaiting: "Automatic waiting",
+        runnerAutomaticPrefix: "Automatic · ",
         refresh: "Refresh",
         startRunner: "Start runner",
         stopRunner: "Stop",
@@ -1660,7 +1658,13 @@ HTML = r"""<!doctype html>
         checkSettings: "Check settings",
         enableAutoContinue: "Enable auto-continue",
         disableAutoContinue: "Disable auto-continue",
+        enablingAutoContinue: "Enabling...",
+        disablingAutoContinue: "Disabling...",
         importToActiveAccount: "Import into active account",
+        importInProgress: "Importing...",
+        copyToActiveChatGpt: "Copy to active ChatGPT account",
+        moveFromOtherAccount: "Move from other account",
+        importFromOtherAccount: "Import from other account",
         removeSource: "remove source",
         noChatSelected: "No chat selected",
         status: "Status",
@@ -1673,11 +1677,197 @@ HTML = r"""<!doctype html>
         noChats: "No chats found",
         loading: "Loading...",
         detecting: "Detecting...",
+        pcTime: "PC time",
+        appVersion: "App version",
+        claudeAppAccount: "Claude app account",
+        claudeCodeCliAccount: "Claude Code CLI account",
+        simultaneousClaudeProfiles: "Simultaneous Claude profiles",
+        connectedProfiles: "{count} connected",
+        distinctAccounts: "{count} distinct accounts",
+        ready: "ready",
+        incomplete: "incomplete",
+        autoLaunchActive: "auto-launch active",
+        codexAccount: "Codex account",
+        codexBackgroundAccess: "Codex background access",
+        readOnly: "read-only",
+        active: "active",
+        stopped: "stopped",
+        registeredAccounts: "Registered accounts",
+        accountSync: "Account sync",
+        fullScan: "Full scan",
+        claudeChatReplicas: "Claude chat replicas",
+        claudeCodeArtifacts: "Claude Code artifacts",
+        claudeChats: "Claude chats",
+        codexTasks: "Codex tasks",
+        queueable: "Queueable",
+        claudeCli: "Claude CLI",
+        codexCli: "Codex CLI",
+        notFound: "not found",
+        notDetected: "not detected",
+        replicaWaiting: "waiting for first check",
+        replicaConsistent: "{accounts} accounts · {chats} chats per account · identical count and content",
+        replicaFailed: "verification failed · counts: {counts}",
+        countsUnavailable: "unavailable",
+        artifactStatus: "{artifacts} · private copies created: {copies}",
+        waitingAuthentication: "waiting for authentication: {count}",
+        synchronized: "synchronized",
+        noneDetected: "none detected",
+        syncError: "active, error: {error}",
+        syncChecking: "active · check in progress",
+        firstAccountUnlock: "First account to unlock",
+        currentlyLimitedAccounts: "Currently limited accounts",
+        firstQuotaReset: "First quota reset",
+        limit: "Limit",
+        noFutureReset: "No future resets detected in available data.",
+        claudeStagger: "Claude 2h 30m stagger",
+        staggerNeedsTwoLogins: "two simultaneous logins required",
+        staggerReadyToStart: "two accounts ready",
+        staggerScheduleSecond: "second cycle to schedule",
+        staggerBalanced: "cycles balanced correctly",
+        staggerRebalance: "stagger imbalance to correct",
+        nextWindow: "next window: {time}",
+        detectedOffset: "detected offset: {minutes} min",
+        staggerNeedsTwoLoginsMessage: "Two Claude profiles must be authenticated and readable simultaneously.",
+        staggerReadyToStartMessage: "Both accounts are readable. Start the first cycle with the next real job; the second window will be calculated 2h 30m later.",
+        staggerScheduleSecondMessage: "The second account is ready: use the first available real job on it within the specified window.",
+        staggerBalancedMessage: "Cycles are already correctly staggered. At the next reset, use the first available real job.",
+        staggerRebalanceMessage: "Both cycles are active, but the stagger is not yet close to 2h 30m.",
+        dataUpdated: "Data updated: {time}",
+        readingAccounts: "Reading accounts...",
+        waitingUsage: "Waiting for initial usage data.",
+        checkInProgress: "check in progress",
+        noRegisteredAccounts: "No registered accounts",
+        available: "Available",
+        limited: "Limited",
+        lastKnownData: "Last known data",
+        needsUpdate: "Needs update",
+        unknown: "Not detected",
+        notAvailable: "n/a",
+        resetPassed: "Reset passed",
+        resetNotSpecified: "Reset not specified",
+        quotaUnreadable: "Quota is currently unreadable. It will be acquired automatically on the next account access.",
+        activeNow: "active now",
+        configuredNow: "configured now",
+        storedAccount: "stored account",
+        plan: "plan",
+        readAt: "read {time}",
+        neverRead: "never read",
+        usable: "Usable",
+        marginIncluded: "margin included",
+        sessionWindow: "Session",
+        weeklyWindow: "Weekly",
+        syncedAccounts: "synced across {count} accounts: {accounts}",
+        providerActive: "{provider} active: {account}",
+        otherAccount: "other account: {account}",
+        accountLabel: "account: {account}",
+        unlinkedAccount: "unlinked account",
+        chatSetting: "Chat",
+        lastMessage: "Last message:",
+        unavailable: "unavailable",
+        loadingLower: "loading...",
+        usableLower: "usable",
+        viewOnly: "view-only",
+        autoContinueActive: "auto-continue active",
+        untitled: "Untitled",
+        nativeTryAgain: "native Try again",
+        retryWithoutDuplicate: "retry without duplicate: {prompt}",
+        lastMessageLower: "last message",
+        inspectCodexTurn: "automatic Codex turn analysis",
+        continueAction: "continue",
+        continueInterrupted: "continue to finish the interrupted turn",
+        runnerActiveLower: "runner active",
+        runnerStoppedLower: "runner stopped",
+        nextCheckSuffix: ", new check in {duration}",
+        lastTryAgainSuffix: ", last Try again executed {time}",
+        checkSuffix: ", check in {duration}",
+        untilSuffix: " until {time}",
+        autoMonitoring: "Auto-continue active on {id}{title}: native monitoring{action}{wait}, {runner}.",
+        autoWaitingLimit: "Auto-continue active on {id}{title}: waiting for reset plus safety margin{until}; then {action}{wait}, {runner}.",
+        autoWaitingRetry: "Auto-continue active on {id}{title}: Try again was not visible yet; no message was sent, retrying automatically, {runner}.",
+        autoSending: "Auto-continue active on {id}{title}: {action} in progress, {runner}.",
+        autoEnabled: "Auto-continue active on {id}{title}, {runner}.",
+        autoFailed: "Auto-continue {status} on {id}{title}: {error}.",
+        autoDone: "Auto-continue completed on {id}{title}.",
+        autoDisabled: "Auto-continue disabled on {id}{title}.",
+        autoOff: "Auto-continue {status} on {id}{title}.",
+        autoActiveCount: "Auto-continue active on {count} chats.",
+        errorLower: "error",
+        off: "off",
+        stateArmed: "armed",
+        stateMonitoring: "monitoring",
+        stateWaitingLimit: "waiting for limit reset",
+        stateWaitingRetry: "waiting to retry",
+        stateSending: "sending",
+        stateFailed: "failed",
+        stateBlocked: "blocked",
+        stateBlockedPermission: "permission blocked",
+        stateDone: "done",
+        stateDisabled: "disabled",
+        automaticAnalysis: "automatic analysis",
+        recoveryTitle: "Recovery",
+        onChat: "on chat",
+        recoveredFollowups: "{count} more failed messages are queued in the same order.",
+        notBefore: "Not before {time}",
+        action: "Action",
+        recoveredMessages: "Recovered messages queued",
+        runner: "Runner",
+        source: "Source",
+        ideIntegrationUnused: "IDE integration: unused",
+        checks: "Checks",
+        tryAgainExecuted: "Try again executed",
+        lastAction: "Last action",
+        sendingStarted: "Sending started",
+        nextAttempt: "Next attempt",
+        nextCheck: "Next check",
+        inDuration: "in {duration}",
+        lastCheck: "Last check",
+        updated: "Updated",
+        autoContinue: "Auto-continue",
+        attemptsAbbrev: "att.",
+        queueStatePending: "pending",
+        queueStateRunning: "running",
+        queueStateDone: "done",
+        queueStateFailed: "failed",
+        queueStateRateLimited: "rate limited",
+        queueStateBlocked: "blocked",
+        environmentError: "Environment error: {error}",
+        queueError: "Queue error: {error}",
+        chatError: "Chat error: {error}",
+        refreshError: "Refresh error: {error}",
+        otherAccountCannotSend: "This chat/task belongs to another account: switch or link the account before sending.",
+        viewOnlyCannotQueue: "This chat/task is view-only and cannot be queued.",
+        queuedMessages: "Queued {count} messages.",
+        addError: "Queue error: {error}",
+        noQueueItems: "No items in the queue.",
+        settingsError: "Settings error: {error}",
+        autoDisableProgress: "Disabling auto-continue...",
+        autoEnablePrepareProgress: "Enabling auto-continue: preparing context and checking remote settings...",
+        autoEnableProgress: "Enabling auto-continue...",
+        autoDisabledSuccess: "Auto-continue disabled.",
+        autoEnabledSuccess: "Auto-continue enabled.",
+        autoContinueError: "Auto-continue error: {error}",
+        confirmCopyCodex: "Create a new task in the active ChatGPT/Codex account? The full context will be copied to a new ID; archive, restore and deletion will remain synchronized between the two local copies.",
+        confirmMoveClaude: "Move this chat from another account into the active Claude account?",
+        confirmImportOtherClaude: "Import this chat from another account into the active Claude account?",
+        confirmImportTranscriptClaude: "Import this chat from the local transcript into the active Claude account?",
+        artifactsSuffix: " · artifacts: {count}",
+        importCompleted: "Import completed: {status} · {title}{artifacts}",
+        missingArtifacts: "Warning: {count} artifacts have a manifest but the local file is missing.",
+        pendingClaudeArtifacts: "Claude Code artifacts waiting: {count} accounts do not yet have a valid cached credential.",
+        artifactError: "Claude Code artifact error: {error}",
+        importError: "Account import error: {error}",
+        runtimeChatNotFound: "Chat not found",
+        runtimeChatNotFoundAuto: "Chat not found for auto-continue",
+        runtimeChatNotFoundRecovery: "Chat not found during recovery",
+        runtimeSettingsChanged: "Settings changed: {details}",
+        runtimeDifferentAccount: "different account",
+        runtimeUsageLimitWait: "Usage limit active: waiting for reset plus one minute before retrying."
       },
       it: {
         runnerStopped: "Runner fermo",
         runnerActive: "Runner attivo",
         runnerWaiting: "Automatico in attesa",
+        runnerAutomaticPrefix: "Automatico · ",
         refresh: "Aggiorna",
         startRunner: "Avvia runner",
         stopRunner: "Ferma",
@@ -1704,7 +1894,13 @@ HTML = r"""<!doctype html>
         checkSettings: "Controlla impostazioni",
         enableAutoContinue: "Attiva auto-continua",
         disableAutoContinue: "Disattiva auto-continua",
+        enablingAutoContinue: "Attivo...",
+        disablingAutoContinue: "Disattivo...",
         importToActiveAccount: "Importa nell'account attivo",
+        importInProgress: "Importo...",
+        copyToActiveChatGpt: "Copia nell'account ChatGPT attivo",
+        moveFromOtherAccount: "Sposta da altro account",
+        importFromOtherAccount: "Importa da altro account",
         removeSource: "rimuovi sorgente",
         noChatSelected: "Nessuna chat selezionata",
         status: "Stato",
@@ -1717,12 +1913,237 @@ HTML = r"""<!doctype html>
         noChats: "Nessuna chat",
         loading: "Caricamento...",
         detecting: "Rilevamento in corso...",
+        pcTime: "Ora PC",
+        appVersion: "Versione app",
+        claudeAppAccount: "Account app Claude",
+        claudeCodeCliAccount: "Account CLI Claude Code",
+        simultaneousClaudeProfiles: "Profili Claude simultanei",
+        connectedProfiles: "{count} collegati",
+        distinctAccounts: "{count} account distinti",
+        ready: "pronti",
+        incomplete: "da completare",
+        autoLaunchActive: "avvio automatico attivo",
+        codexAccount: "Account Codex",
+        codexBackgroundAccess: "Accesso Codex in background",
+        readOnly: "sola lettura",
+        active: "attivo",
+        stopped: "fermo",
+        registeredAccounts: "Account registrati",
+        accountSync: "Sync account",
+        fullScan: "Scansione completa",
+        claudeChatReplicas: "Repliche chat Claude",
+        claudeCodeArtifacts: "Artefatti Claude Code",
+        claudeChats: "Chat Claude",
+        codexTasks: "Task Codex",
+        queueable: "Accodabili",
+        claudeCli: "CLI Claude",
+        codexCli: "CLI Codex",
+        notFound: "non trovato",
+        notDetected: "non rilevato",
+        replicaWaiting: "in attesa del primo controllo",
+        replicaConsistent: "{accounts} account · {chats} chat per account · numero e contenuto identici",
+        replicaFailed: "verifica non superata · conteggi: {counts}",
+        countsUnavailable: "non disponibili",
+        artifactStatus: "{artifacts} · copie private create: {copies}",
+        waitingAuthentication: "in attesa di autenticazione: {count}",
+        synchronized: "sincronizzati",
+        noneDetected: "nessuno rilevato",
+        syncError: "attiva, errore: {error}",
+        syncChecking: "attiva · controllo in corso",
+        firstAccountUnlock: "Primo account che si sblocca",
+        currentlyLimitedAccounts: "Account attualmente limitati",
+        firstQuotaReset: "Primo reset di quota",
+        limit: "Limite",
+        noFutureReset: "Nessun reset futuro rilevato nei dati disponibili.",
+        claudeStagger: "Sfasamento Claude 2 h 30",
+        staggerNeedsTwoLogins: "servono due login simultanei",
+        staggerReadyToStart: "due account pronti",
+        staggerScheduleSecond: "secondo ciclo da avviare",
+        staggerBalanced: "cicli sfalsati correttamente",
+        staggerRebalance: "sfasamento da correggere",
+        nextWindow: "prossima finestra: {time}",
+        detectedOffset: "sfasamento rilevato: {minutes} min",
+        staggerNeedsTwoLoginsMessage: "Servono due profili Claude autenticati e leggibili contemporaneamente.",
+        staggerReadyToStartMessage: "Entrambi gli account sono leggibili. Avvia il primo ciclo con il prossimo lavoro reale; la finestra del secondo verra calcolata 2 h 30 dopo.",
+        staggerScheduleSecondMessage: "Il secondo account e pronto: usa su di lui il primo lavoro reale disponibile nella finestra indicata.",
+        staggerBalancedMessage: "Cicli gia sfalsati correttamente. Al prossimo reset usa il primo lavoro reale disponibile.",
+        staggerRebalanceMessage: "Entrambi i cicli sono attivi, ma lo sfasamento non e ancora vicino a 2 h 30.",
+        dataUpdated: "Dati aggiornati: {time}",
+        readingAccounts: "Lettura account in corso...",
+        waitingUsage: "In attesa del primo dato di utilizzo.",
+        checkInProgress: "controllo in corso",
+        noRegisteredAccounts: "Nessun account registrato",
+        available: "Disponibile",
+        limited: "Limitato",
+        lastKnownData: "Ultimo dato noto",
+        needsUpdate: "Da aggiornare",
+        unknown: "Non rilevato",
+        notAvailable: "n/d",
+        resetPassed: "Reset trascorso",
+        resetNotSpecified: "Reset non comunicato",
+        quotaUnreadable: "Quota non leggibile ora. Verra acquisita automaticamente al prossimo accesso dell'account.",
+        activeNow: "attivo ora",
+        configuredNow: "configurato ora",
+        storedAccount: "account memorizzato",
+        plan: "piano",
+        readAt: "letto {time}",
+        neverRead: "mai letto",
+        usable: "Utilizzabile",
+        marginIncluded: "margine incluso",
+        sessionWindow: "Sessione",
+        weeklyWindow: "Settimanale",
+        syncedAccounts: "sincronizzata su {count} account: {accounts}",
+        providerActive: "{provider} attivo: {account}",
+        otherAccount: "altro account: {account}",
+        accountLabel: "account: {account}",
+        unlinkedAccount: "account non associato",
+        chatSetting: "Chat",
+        lastMessage: "Ultimo messaggio:",
+        unavailable: "non disponibile",
+        loadingLower: "caricamento...",
+        usableLower: "utilizzabile",
+        viewOnly: "solo visibile",
+        autoContinueActive: "auto-continua attivo",
+        untitled: "Senza titolo",
+        nativeTryAgain: "Try again nativo",
+        retryWithoutDuplicate: "reinvio senza duplicato: {prompt}",
+        lastMessageLower: "ultimo messaggio",
+        inspectCodexTurn: "analisi automatica del turno Codex",
+        continueAction: "continua",
+        continueInterrupted: "continua per completare il turno interrotto",
+        runnerActiveLower: "runner attivo",
+        runnerStoppedLower: "runner fermo",
+        nextCheckSuffix: ", nuovo controllo tra {duration}",
+        lastTryAgainSuffix: ", ultimo Try again eseguito {time}",
+        checkSuffix: ", controllo tra {duration}",
+        untilSuffix: " fino a {time}",
+        autoMonitoring: "Auto-continua attivo su {id}{title}: monitoraggio nativo{action}{wait}, {runner}.",
+        autoWaitingLimit: "Auto-continua attivo su {id}{title}: attendo reset + margine{until}; poi {action}{wait}, {runner}.",
+        autoWaitingRetry: "Auto-continua attivo su {id}{title}: Try again non era ancora visibile; nessun messaggio inviato, riprovo automaticamente, {runner}.",
+        autoSending: "Auto-continua attivo su {id}{title}: {action} in corso, {runner}.",
+        autoEnabled: "Auto-continua attivo su {id}{title}, {runner}.",
+        autoFailed: "Auto-continua {status} su {id}{title}: {error}.",
+        autoDone: "Auto-continua completato su {id}{title}.",
+        autoDisabled: "Auto-continua disattivato su {id}{title}.",
+        autoOff: "Auto-continua {status} su {id}{title}.",
+        autoActiveCount: "{count} chat con auto-continua attivo.",
+        errorLower: "errore",
+        off: "spento",
+        stateArmed: "armato",
+        stateMonitoring: "monitoraggio",
+        stateWaitingLimit: "in attesa del reset",
+        stateWaitingRetry: "in attesa di riprovare",
+        stateSending: "invio in corso",
+        stateFailed: "fallito",
+        stateBlocked: "bloccato",
+        stateBlockedPermission: "permesso bloccato",
+        stateDone: "completato",
+        stateDisabled: "disattivato",
+        automaticAnalysis: "analisi automatica",
+        recoveryTitle: "Recovery attiva: la prossima azione sara'",
+        onChat: "sulla chat",
+        recoveredFollowups: "Altri {count} messaggi falliti sono in coda nello stesso ordine.",
+        notBefore: "Non prima di {time}",
+        action: "Azione",
+        recoveredMessages: "Messaggi recuperati in coda",
+        runner: "Runner",
+        source: "Origine",
+        ideIntegrationUnused: "Integrazione IDE: non usata",
+        checks: "Controlli",
+        tryAgainExecuted: "Try again eseguiti",
+        lastAction: "Ultima azione",
+        sendingStarted: "Invio iniziato",
+        nextAttempt: "Prossimo tentativo",
+        nextCheck: "Prossimo controllo",
+        inDuration: "tra {duration}",
+        lastCheck: "Ultimo check",
+        updated: "Aggiornato",
+        autoContinue: "Auto-continua",
+        attemptsAbbrev: "tent.",
+        queueStatePending: "in attesa",
+        queueStateRunning: "in esecuzione",
+        queueStateDone: "completato",
+        queueStateFailed: "fallito",
+        queueStateRateLimited: "limite raggiunto",
+        queueStateBlocked: "bloccato",
+        environmentError: "Errore ambiente: {error}",
+        queueError: "Errore coda: {error}",
+        chatError: "Errore chat: {error}",
+        refreshError: "Errore refresh: {error}",
+        otherAccountCannotSend: "Questa chat/task appartiene a un altro account: cambia account o associala prima di inviare.",
+        viewOnlyCannotQueue: "Questa chat/task e' solo visibile e non e' accodabile.",
+        queuedMessages: "Accodati {count} messaggi.",
+        addError: "Errore add: {error}",
+        noQueueItems: "Nessun elemento in coda.",
+        settingsError: "Errore impostazioni: {error}",
+        autoDisableProgress: "Disattivazione auto-continua...",
+        autoEnablePrepareProgress: "Attivazione auto-continua: preparo il contesto e controllo le impostazioni remote...",
+        autoEnableProgress: "Attivazione auto-continua in corso...",
+        autoDisabledSuccess: "Auto-continua disattivato.",
+        autoEnabledSuccess: "Auto-continua attivato.",
+        autoContinueError: "Errore auto-continua: {error}",
+        confirmCopyCodex: "Creare una nuova task nell'account ChatGPT/Codex attivo? Verra copiato l'intero contesto in un nuovo ID; archiviazione, ripristino ed eliminazione resteranno sincronizzati tra le due copie locali.",
+        confirmMoveClaude: "Spostare questa chat da un altro account nell'account Claude attivo?",
+        confirmImportOtherClaude: "Importare questa chat da un altro account nell'account Claude attivo?",
+        confirmImportTranscriptClaude: "Importare questa chat dalla transcript locale nell'account Claude attivo?",
+        artifactsSuffix: " · artefatti: {count}",
+        importCompleted: "Import completato: {status} · {title}{artifacts}",
+        missingArtifacts: "Attenzione: {count} artefatti hanno il manifesto ma manca il file locale.",
+        pendingClaudeArtifacts: "Artefatti Claude Code in attesa: {count} account non ha ancora una credenziale valida in cache.",
+        artifactError: "Errore artefatto Claude Code: {error}",
+        importError: "Errore import account: {error}",
+        runtimeChatNotFound: "Chat non trovata",
+        runtimeChatNotFoundAuto: "Chat non trovata per auto-continua",
+        runtimeChatNotFoundRecovery: "Chat non trovata durante recovery",
+        runtimeSettingsChanged: "Impostazioni cambiate: {details}",
+        runtimeDifferentAccount: "account diverso",
+        runtimeUsageLimitWait: "Usage limit attivo: attendo reset + 1 minuto prima di riprovare."
       }
     };
 
-    function t(key, fallback = "") {
-      return I18N[CURRENT_LANG]?.[key] || I18N.en?.[key] || fallback || key;
+    function languageForLocale(locale) {
+      return String(locale || "").toLowerCase().startsWith("it") ? "it" : "en";
     }
+
+    function languageForPage(locale, search) {
+      const requested = new URLSearchParams(String(search || "")).get("lang");
+      return requested === "it" || requested === "en" ? requested : languageForLocale(locale);
+    }
+
+    function translate(language, key, values = {}) {
+      const template = I18N[language]?.[key] ?? I18N.en?.[key] ?? key;
+      return Object.entries(values).reduce(
+        (text, [name, value]) => text.split(`{${name}}`).join(String(value ?? "")),
+        template,
+      );
+    }
+
+    function translateRuntimeMessage(language, message) {
+      const text = String(message || "");
+      const exact = {
+        "Chat non trovata": "runtimeChatNotFound",
+        "Chat non trovata.": "runtimeChatNotFound",
+        "Chat non trovata per auto-continua": "runtimeChatNotFoundAuto",
+        "Chat non trovata durante recovery": "runtimeChatNotFoundRecovery",
+        "Usage limit attivo: attendo reset + 1 minuto prima di riprovare.": "runtimeUsageLimitWait",
+      };
+      if (exact[text]) return translate(language, exact[text]);
+      const settingsPrefix = "Impostazioni cambiate: ";
+      if (text.startsWith(settingsPrefix)) {
+        const details = text.slice(settingsPrefix.length).split("; ").map((detail) => (
+          detail === "account diverso" ? translate(language, "runtimeDifferentAccount") : detail
+        )).join("; ");
+        return translate(language, "runtimeSettingsChanged", { details });
+      }
+      return text;
+    }
+    // I18N_CORE_END
+
+    const USER_LOCALE = navigator.language || "en-US";
+    const CURRENT_LANG = languageForPage(USER_LOCALE, window.location.search);
+    const t = (key, values = {}) => translate(CURRENT_LANG, key, values);
+    const localizeRuntimeMessage = (message) => translateRuntimeMessage(CURRENT_LANG, message);
+    document.documentElement.lang = CURRENT_LANG;
 
     function applyStaticI18n() {
       document.querySelectorAll("[data-i18n]").forEach((el) => {
@@ -1739,7 +2160,6 @@ HTML = r"""<!doctype html>
       });
     }
 
-    // Call it immediately on script load
     applyStaticI18n();
 
     const state = { chats: [], selected: null, queue: [], autoContinues: [], runner: {}, autoBusy: false, autoBusyAction: null, settingsSession: null, transferBusy: false, refreshBusy: false, doctorBusy: false, messagePreviews: {}, previewRequests: {} };
@@ -1752,7 +2172,6 @@ HTML = r"""<!doctype html>
     const SANDBOX_OPTIONS = ["read-only", "workspace-write", "danger-full-access"];
     const APPROVAL_OPTIONS = ["untrusted", "on-request", "on-failure", "never"];
     const USER_TIME_ZONE = Intl.DateTimeFormat().resolvedOptions().timeZone;
-     //const USER_LOCALE = navigator.language || "it-IT";
     const DATE_TIME_OPTIONS = {
       year: "numeric",
       month: "2-digit",
@@ -1809,55 +2228,79 @@ HTML = r"""<!doctype html>
       const claudeReplicaContentMatches = claudeInventories.length > 0
         && claudeInventories.every((inventory) => inventory && inventory.consistent === true);
 
-      const isIt = CURRENT_LANG === "it";
-
       const claudeReplicaStatus = claudeInventories.length === 0
-        ? (isIt ? "in attesa del primo controllo" : "waiting for first check")
+        ? t("replicaWaiting")
         : claudeReplicaAccountCount >= 2 && claudeReplicaCountsMatch && claudeReplicaContentMatches
-        ? `${claudeReplicaAccountCount} ${isIt ? "account ·" : "accounts ·"} ${claudeReplicaValues[0]} ${isIt ? "chat per account · numero e contenuto identici" : "chats per account · identical count and content"}`
-        : `${isIt ? "verifica non superata · conteggi:" : "verification failed · counts:"} ${claudeReplicaValues.join(" / ") || (isIt ? "non disponibili" : "unavailable")}`;
+        ? t("replicaConsistent", {
+            accounts: claudeReplicaAccountCount,
+            chats: claudeReplicaValues[0],
+          })
+        : t("replicaFailed", {
+            counts: claudeReplicaValues.join(" / ") || t("countsUnavailable"),
+          });
 
       const codeArtifacts = Number(claudeSync.code_artifacts || 0);
       const pendingArtifactAccounts = Number(claudeSync.code_artifact_pending_accounts || 0);
       const artifactStatus = codeArtifacts > 0
-        ? `${codeArtifacts} · ${isIt ? "copie private create:" : "private copies created:"} ${Number(claudeSync.code_artifact_copies_created || 0)}`
-          + (pendingArtifactAccounts > 0 ? ` · ${isIt ? "in attesa di autenticazione:" : "waiting for authentication:"} ${pendingArtifactAccounts}` : ` · ${isIt ? "sincronizzati" : "synchronized"}`)
-        : (isIt ? "nessuno rilevato" : "none detected");
+        ? [
+            t("artifactStatus", {
+              artifacts: codeArtifacts,
+              copies: Number(claudeSync.code_artifact_copies_created || 0),
+            }),
+            pendingArtifactAccounts > 0
+              ? t("waitingAuthentication", { count: pendingArtifactAccounts })
+              : t("synchronized"),
+          ].join(" · ")
+        : t("noneDetected");
 
       const syncStatus = accountSync.running
         ? (accountSync.last_error
-          ? `${isIt ? "attiva, errore:" : "active, error:"} ${accountSync.last_error}`
-          : (accountSync.in_progress ? (isIt ? "attiva · controllo in corso" : "active · check in progress") : (isIt ? "attiva" : "active")))
-        : (isIt ? "ferma" : "stopped");
+          ? t("syncError", { error: localizeRuntimeMessage(accountSync.last_error) })
+          : (accountSync.in_progress ? t("syncChecking") : t("active")))
+        : t("stopped");
+      const claudeProfileStatus = [
+        t("connectedProfiles", { count: Number(claudeProfiles.connected_count) || 0 }),
+        t("distinctAccounts", { count: Number(claudeProfiles.distinct_account_count) || 0 }),
+        claudeProfiles.simultaneous_ready ? t("ready") : t("incomplete"),
+        claudeProfiles.auto_launch_enabled ? t("autoLaunchActive") : "",
+      ].filter(Boolean).join(" · ");
 
       $("doctor").innerHTML = [
-        `<b>${isIt ? "Ora PC" : "PC Time"}</b>: ${escapeHtml(formatDateTime(data.local_time || new Date().toISOString()))}`,
-        `<b>${isIt ? "Versione app" : "App version"}</b>: ${escapeHtml(data.app_version || "")}`,
-        `<b>Claude</b>: ${escapeHtml(data.claude_version || (isIt ? "non trovato" : "not found"))}`,
-        `<b>${isIt ? "Account app Claude" : "Claude app account"}</b>: ${escapeHtml(account ? account.label : (isIt ? "non rilevato" : "not detected"))}`,
-        `<b>${isIt ? "Account CLI Claude Code" : "Claude Code CLI account"}</b>: ${escapeHtml(claudeCodeAccount ? claudeCodeAccount.label : (isIt ? "non rilevato" : "not detected"))}`,
-        `<b>${isIt ? "Profili Claude simultanei" : "Simultaneous Claude profiles"}</b>: ${escapeHtml(String(Number(claudeProfiles.connected_count) || 0))} ${isIt ? "collegati ·" : "connected ·"} `
-          + `${escapeHtml(String(Number(claudeProfiles.distinct_account_count) || 0))} ${isIt ? "account distinti ·" : "distinct accounts ·"}`
-          + `${claudeProfiles.simultaneous_ready ? (isIt ? "pronti" : "ready") : (isIt ? "da completare" : "incomplete")}`
-          + `${claudeProfiles.auto_launch_enabled ? (isIt ? " · avvio automatico attivo" : " · auto-launch active") : ""}`,
-        `<b>Codex</b>: ${escapeHtml(data.codex_version || (isIt ? "non trovato" : "not found"))}`,
-        `<b>${isIt ? "Account Codex" : "Codex account"}</b>: ${escapeHtml(codexAccount ? codexAccount.label : (isIt ? "non rilevato" : "not detected"))}`,
-        `<b>${isIt ? "Accesso Codex in background" : "Codex background access"}</b>: ${data.codex_background_access === "passive" ? (isIt ? "sola lettura" : "read-only") : (isIt ? "attivo" : "active")}`,
-        `<b>${isIt ? "Account registrati" : "Registered accounts"}</b>: ${escapeHtml(String(accounts.length))}`,
-        `<b>Sync account</b>: ${escapeHtml(syncStatus)}${accountSync.last_check_at ? ` · ${escapeHtml(formatDateTime(accountSync.last_check_at))}` : ""}`,
-        accountSync.last_full_check_at ? `<b>${isIt ? "Scansione completa" : "Full scan"}</b>: ${escapeHtml(formatDateTime(accountSync.last_full_check_at))}` : "",
-        `<b>${isIt ? "Repliche chat Claude" : "Claude chat replicas"}</b>: ${escapeHtml(claudeReplicaStatus)}`,
-        `<b>${isIt ? "Artefatti Claude Code" : "Claude Code artifacts"}</b>: ${escapeHtml(artifactStatus)}`,
-        `<b>${isIt ? "Chat Claude" : "Claude chats"}</b>: ${data.claude_chat_count || 0}`,
-        `<b>${isIt ? "Task Codex" : "Codex tasks"}</b>: ${data.codex_chat_count || 0}`,
-        `<b>${isIt ? "Accodabili" : "Queueable"}</b>: ${data.queueable_chat_count}`,
-        `<b>${isIt ? "Coda" : "Queue"}</b>: ${escapeHtml(data.queue_file || "")}`,
-        `<b>${isIt ? "CLI Claude" : "Claude CLI"}</b>: ${escapeHtml(data.claude_exe || (isIt ? "non trovato" : "not found"))}`,
-        `<b>${isIt ? "CLI Codex" : "Codex CLI"}</b>: ${escapeHtml(data.codex_exe || (isIt ? "non trovato" : "not found"))}`,
+        `<b>${t("pcTime")}</b>: ${escapeHtml(formatDateTime(data.local_time || new Date().toISOString()))}`,
+        `<b>${t("appVersion")}</b>: ${escapeHtml(data.app_version || "")}`,
+        `<b>Claude</b>: ${escapeHtml(data.claude_version || t("notFound"))}`,
+        `<b>${t("claudeAppAccount")}</b>: ${escapeHtml(account ? account.label : t("notDetected"))}`,
+        `<b>${t("claudeCodeCliAccount")}</b>: ${escapeHtml(claudeCodeAccount ? claudeCodeAccount.label : t("notDetected"))}`,
+        `<b>${t("simultaneousClaudeProfiles")}</b>: ${escapeHtml(claudeProfileStatus)}`,
+        `<b>Codex</b>: ${escapeHtml(data.codex_version || t("notFound"))}`,
+        `<b>${t("codexAccount")}</b>: ${escapeHtml(codexAccount ? codexAccount.label : t("notDetected"))}`,
+        `<b>${t("codexBackgroundAccess")}</b>: ${data.codex_background_access === "passive" ? t("readOnly") : t("active")}`,
+        `<b>${t("registeredAccounts")}</b>: ${escapeHtml(String(accounts.length))}`,
+        `<b>${t("accountSync")}</b>: ${escapeHtml(syncStatus)}${accountSync.last_check_at ? ` · ${escapeHtml(formatDateTime(accountSync.last_check_at))}` : ""}`,
+        accountSync.last_full_check_at ? `<b>${t("fullScan")}</b>: ${escapeHtml(formatDateTime(accountSync.last_full_check_at))}` : "",
+        `<b>${t("claudeChatReplicas")}</b>: ${escapeHtml(claudeReplicaStatus)}`,
+        `<b>${t("claudeCodeArtifacts")}</b>: ${escapeHtml(artifactStatus)}`,
+        `<b>${t("claudeChats")}</b>: ${data.claude_chat_count || 0}`,
+        `<b>${t("codexTasks")}</b>: ${data.codex_chat_count || 0}`,
+        `<b>${t("queueable")}</b>: ${data.queueable_chat_count}`,
+        `<b>${t("queue")}</b>: ${escapeHtml(data.queue_file || "")}`,
+        `<b>${t("claudeCli")}</b>: ${escapeHtml(data.claude_exe || t("notFound"))}`,
+        `<b>${t("codexCli")}</b>: ${escapeHtml(data.codex_exe || t("notFound"))}`,
       ].filter(Boolean).join("<br>");
 
       renderAccountLimits(data.account_limits || {}, accountSync);
       renderRunner(data.runner || {});
+    }
+
+    function localizeLimitWindowLabel(value) {
+      const label = String(value || "");
+      if (!label) return t("limit");
+      if (label === "Sessione") return t("sessionWindow");
+      if (label === "Settimanale") return t("weeklyWindow");
+      if (label.endsWith(": Settimanale")) {
+        return `${label.slice(0, -"Settimanale".length)}${t("weeklyWindow")}`;
+      }
+      return label;
     }
 
     function renderAccountLimits(overview, accountSync) {
@@ -1866,92 +2309,74 @@ HTML = r"""<!doctype html>
       const firstAvailable = overview.first_available || null;
       const stagger = overview.stagger_plan || null;
       const summary = [];
-      const isIt = CURRENT_LANG === "it";
 
       if (firstAvailable) {
         summary.push(
-          `<b>${isIt ? "Primo account che si sblocca" : "First account to unlock"}</b>: ${escapeHtml(firstAvailable.provider_label)} · `
+          `<b>${t("firstAccountUnlock")}</b>: ${escapeHtml(firstAvailable.provider_label)} · `
           + `${escapeHtml(firstAvailable.account_label)} · ${escapeHtml(firstAvailable.account_short_key || "")} · `
           + `${escapeHtml(formatDateTime(firstAvailable.available_at))}`
         );
       } else {
-        summary.push(`<b>${isIt ? "Account attualmente limitati" : "Currently limited accounts"}</b>: ${escapeHtml(String(Number(overview.limited_count) || 0))}`);
+        summary.push(`<b>${t("currentlyLimitedAccounts")}</b>: ${escapeHtml(String(Number(overview.limited_count) || 0))}`);
       }
       if (firstReset) {
         summary.push(
-          `<b>${isIt ? "Primo reset di quota" : "First quota reset"}</b>: ${escapeHtml(firstReset.provider_label)} · `
+          `<b>${t("firstQuotaReset")}</b>: ${escapeHtml(firstReset.provider_label)} · `
           + `${escapeHtml(firstReset.account_label)} · ${escapeHtml(firstReset.account_short_key || "")} · `
-          + `${escapeHtml(firstReset.window_label || (isIt ? "Limite" : "Limit"))} · ${escapeHtml(formatDateTime(firstReset.reset_at))}`
+          + `${escapeHtml(localizeLimitWindowLabel(firstReset.window_label))} · ${escapeHtml(formatDateTime(firstReset.reset_at))}`
         );
       } else {
-        summary.push(isIt ? "Nessun reset futuro rilevato nei dati disponibili." : "No future resets detected in available data.");
+        summary.push(t("noFutureReset"));
       }
       if (stagger) {
-        const stateLabels = isIt ? {
-          needs_two_logins: "servono due login simultanei",
-          ready_to_start: "due account pronti",
-          schedule_second: "secondo ciclo da avviare",
-          balanced: "cicli sfalsati correttamente",
-          rebalance: "sfasamento da correggere",
-        } : {
-          needs_two_logins: "two simultaneous logins required",
-          ready_to_start: "two accounts ready",
-          schedule_second: "second cycle to schedule",
-          balanced: "cycles balanced correctly",
-          rebalance: "stagger imbalance to correct",
+        const stateKeys = {
+          needs_two_logins: "staggerNeedsTwoLogins",
+          ready_to_start: "staggerReadyToStart",
+          schedule_second: "staggerScheduleSecond",
+          balanced: "staggerBalanced",
+          rebalance: "staggerRebalance",
+        };
+        const messageKeys = {
+          needs_two_logins: "staggerNeedsTwoLoginsMessage",
+          ready_to_start: "staggerReadyToStartMessage",
+          schedule_second: "staggerScheduleSecondMessage",
+          balanced: "staggerBalancedMessage",
+          rebalance: "staggerRebalanceMessage",
         };
         const nextActivation = stagger.next_activation_at
-          ? ` · ${isIt ? "prossima finestra:" : "next window:"} ${escapeHtml(formatDateTime(stagger.next_activation_at))}`
+          ? ` · ${t("nextWindow", { time: formatDateTime(stagger.next_activation_at) })}`
             + (stagger.next_account_label ? ` · ${escapeHtml(stagger.next_account_label)}` : "")
           : "";
         const offset = stagger.offset_minutes !== null
           && stagger.offset_minutes !== undefined
           && Number.isFinite(Number(stagger.offset_minutes))
-          ? ` · ${isIt ? "sfasamento rilevato:" : "detected offset:"} ${escapeHtml(String(stagger.offset_minutes))} min`
+          ? ` · ${t("detectedOffset", { minutes: escapeHtml(String(stagger.offset_minutes)) })}`
           : "";
         summary.push(
-          `<b>${isIt ? "Sfasamento Claude 2 h 30" : "Claude 2h 30m stagger"}</b>: ${escapeHtml(stateLabels[stagger.state] || stagger.state || (isIt ? "in attesa" : "waiting"))}`
+          `<b>${t("claudeStagger")}</b>: ${escapeHtml(t(stateKeys[stagger.state] || "detecting"))}`
           + `${offset}${nextActivation}`
         );
-        const staggerMessages = isIt ? {
-          "Servono due profili Claude autenticati e leggibili contemporaneamente.": "Servono due profili Claude autenticati e leggibili contemporaneamente.",
-          "Entrambi gli account sono leggibili. Avvia il primo ciclo con il prossimo lavoro reale; la finestra del secondo verra calcolata 2 h 30 dopo.": "Entrambi gli account sono leggibili. Avvia il primo ciclo con il prossimo lavoro reale; la finestra del secondo verra calcolata 2 h 30 dopo.",
-          "Il secondo account e pronto: usa su di lui il primo lavoro reale disponibile nella finestra indicata.": "Il secondo account e pronto: usa su di lui il primo lavoro reale disponibile nella finestra indicata.",
-          "Cicli gia sfalsati correttamente. Al prossimo reset usa il primo lavoro reale disponibile.": "Cicli gia sfalsati correttamente. Al prossimo reset usa il primo lavoro reale disponibile.",
-          "Entrambi i cicli sono attivi, ma lo sfasamento non e ancora vicino a 2 h 30.": "Entrambi i cicli sono attivi, ma lo sfasamento non e ancora vicino a 2 h 30."
-        } : {
-          "Servono due profili Claude autenticati e leggibili contemporaneamente.": "Two Claude profiles must be authenticated and readable simultaneously.",
-          "Entrambi gli account sono leggibili. Avvia il primo ciclo con il prossimo lavoro reale; la finestra del secondo verra calcolata 2 h 30 dopo.": "Both accounts are readable. Start the first cycle with the next real job; the window of the second will be calculated 2h 30m later.",
-          "Il secondo account e pronto: usa su di lui il primo lavoro reale disponibile nella finestra indicata.": "The second account is ready: use the first available real job on it within the specified window.",
-          "Cicli gia sfalsati correttamente. Al prossimo reset usa il primo lavoro reale disponibile.": "Cycles already correctly staggered. At the next reset, use the first available real job.",
-          "Entrambi i cicli sono attivi, ma lo sfasamento non e ancora vicino a 2 h 30.": "Both cycles are active, but the stagger is not yet close to 2h 30m."
-        };
-        const msg = staggerMessages[stagger.message] || stagger.message || "";
-        summary.push(`<span class="meta">${escapeHtml(msg)}</span>`);
+        const messageKey = messageKeys[stagger.state];
+        const message = messageKey ? t(messageKey) : (stagger.message || "");
+        if (message) summary.push(`<span class="meta">${escapeHtml(message)}</span>`);
       }
       const checking = !!(accountSync && accountSync.in_progress);
       const refreshed = overview.refreshed_at
-        ? `${isIt ? "Dati aggiornati:" : "Data updated:"} ${escapeHtml(formatDateTime(overview.refreshed_at))}`
-        : (checking ? (isIt ? "Lettura account in corso..." : "Reading accounts...") : (isIt ? "In attesa del primo dato di utilizzo." : "Waiting for initial usage data."));
-      summary.push(`<span class="meta">${refreshed}${checking ? (isIt ? " · controllo in corso" : " · check in progress") : ""}</span>`);
+        ? t("dataUpdated", { time: formatDateTime(overview.refreshed_at) })
+        : (checking ? t("readingAccounts") : t("waitingUsage"));
+      summary.push(`<span class="meta">${escapeHtml(refreshed)}${checking ? ` · ${t("checkInProgress")}` : ""}</span>`);
       $("limit-summary").innerHTML = summary.join("<br>");
 
       if (!accounts.length) {
-        $("limit-list").innerHTML = `<div class="empty">${isIt ? "Nessun account registrato" : "No registered accounts"}</div>`;
+        $("limit-list").innerHTML = `<div class="empty">${t("noRegisteredAccounts")}</div>`;
         return;
       }
-      const stateLabels = isIt ? {
-        available: "Disponibile",
-        limited: "Limitato",
-        known: "Ultimo dato noto",
-        stale: "Da aggiornare",
-        unknown: "Non rilevato",
-      } : {
-        available: "Available",
-        limited: "Limited",
-        known: "Last known data",
-        stale: "To update",
-        unknown: "Not detected",
+      const stateKeys = {
+        available: "available",
+        limited: "limited",
+        known: "lastKnownData",
+        stale: "needsUpdate",
+        unknown: "unknown",
       };
       const sourceLabels = {
         claude_oauth_live: "Claude live",
@@ -1966,36 +2391,36 @@ HTML = r"""<!doctype html>
               const numeric = Number(window.used_percent);
               const hasPercent = Number.isFinite(numeric);
               const percent = hasPercent ? Math.max(0, Math.min(100, numeric)) : 0;
-              const percentLabel = hasPercent ? `${Math.round(numeric)}%` : "n/d";
+              const percentLabel = hasPercent ? `${Math.round(numeric)}%` : t("notAvailable");
               const resetLabel = window.reset_at
-                ? `${window.future ? "Reset" : (isIt ? "Reset trascorso" : "Reset passed")}: ${formatDateTime(window.reset_at)}`
-                : (isIt ? "Reset non comunicato" : "Reset not specified");
+                ? `${window.future ? t("reset") : t("resetPassed")}: ${formatDateTime(window.reset_at)}`
+                : t("resetNotSpecified");
               return `
                 <div class="limit-window">
-                  <span class="limit-window-label">${escapeHtml(window.label || (isIt ? "Limite" : "Limit"))}</span>
+                  <span class="limit-window-label">${escapeHtml(localizeLimitWindowLabel(window.label))}</span>
                   <span title="${escapeAttr(percentLabel)}"><progress max="100" value="${escapeAttr(percent)}"></progress> ${escapeHtml(percentLabel)}</span>
                   <span class="limit-window-reset">${escapeHtml(resetLabel)}</span>
                 </div>
               `;
             }).join("")
-          : `<div class="meta">${isIt ? "Quota non leggibile ora. Verra acquisita automaticamente al prossimo accesso dell'account." : "Quota currently unreadable. It will be acquired automatically on next account access."}</div>`;
+          : `<div class="meta">${t("quotaUnreadable")}</div>`;
         const activityLabel = account.active
-          ? (account.state === "available" || account.state === "limited" ? (isIt ? "attivo ora" : "active now") : (isIt ? "configurato ora" : "configured now"))
-          : (isIt ? "account memorizzato" : "stored account");
+          ? (account.state === "available" || account.state === "limited" ? t("activeNow") : t("configuredNow"))
+          : t("storedAccount");
         const details = [
           activityLabel,
-          account.plan ? `${isIt ? "piano" : "plan"} ${account.plan}` : "",
-          account.observed_at ? `${isIt ? "letto" : "read"} ${formatDateTime(account.observed_at)}` : (isIt ? "mai letto" : "never read"),
+          account.plan ? `${t("plan")} ${account.plan}` : "",
+          account.observed_at ? t("readAt", { time: formatDateTime(account.observed_at) }) : t("neverRead"),
           sourceLabels[account.source] || "",
         ].filter(Boolean).join(" · ");
         const availability = account.available_at
-          ? `<div class="meta"><b>${isIt ? "Utilizzabile" : "Usable"}</b>: ${escapeHtml(formatDateTime(account.available_at))} (${isIt ? "margine incluso" : "margin included"})</div>`
+          ? `<div class="meta"><b>${t("usable")}</b>: ${escapeHtml(formatDateTime(account.available_at))} (${t("marginIncluded")})</div>`
           : "";
         return `
           <div class="limit-account">
             <div class="limit-account-head">
               <div class="limit-account-name"><b>${escapeHtml(account.provider_label)}</b> · ${escapeHtml(account.label)} · ${escapeHtml(account.short_key || "")}</div>
-              <span class="limit-state ${escapeAttr(account.state || "unknown")}">${escapeHtml(stateLabels[account.state] || (isIt ? "Non rilevato" : "Not detected"))}</span>
+              <span class="limit-state ${escapeAttr(account.state || "unknown")}">${escapeHtml(t(stateKeys[account.state] || "unknown"))}</span>
             </div>
             ${windowRows}
             ${availability}
@@ -2005,13 +2430,12 @@ HTML = r"""<!doctype html>
       }).join("");
     }
 
-   function renderRunner(runner) {
+    function renderRunner(runner) {
       state.runner = runner || {};
       const running = !!runner.running;
       const automatic = !!runner.automatic;
       $("runner-dot").className = "dot " + (running || automatic ? "on" : "off");
-      
-      const autoPrefix = automatic ? (CURRENT_LANG === "it" ? "Automatico · " : "Automatic · ") : "";
+      const autoPrefix = automatic ? t("runnerAutomaticPrefix") : "";
       $("runner-text").textContent = running
         ? `${autoPrefix}${t("runnerActive")}${runner.pid ? ` #${runner.pid}` : ""}`
         : (automatic ? t("runnerWaiting") : t("runnerStopped"));
@@ -2093,20 +2517,18 @@ HTML = r"""<!doctype html>
       const provider = chat.provider === "codex" ? "Codex" : "Claude";
       const copies = Array.isArray(chat.account_copies) ? chat.account_copies.filter(Boolean) : [];
       if (copies.length > 1) {
-        return CURRENT_LANG === "it"
-          ? `sincronizzata su ${copies.length} account: ${copies.join(", ")}`
-          : `synced across ${copies.length} accounts: ${copies.join(", ")}`;
+        return t("syncedAccounts", { count: copies.length, accounts: copies.join(", ") });
       }
       if (chat.account_status === "active") {
-        return `${provider} ${CURRENT_LANG === "it" ? "attivo" : "active"}: ${chat.account_label || chat.account_short_key || ""}`;
+        return t("providerActive", { provider, account: chat.account_label || chat.account_short_key || "" });
       }
       if (chat.account_status === "other") {
-        return `${CURRENT_LANG === "it" ? "altro account" : "other account"}: ${chat.account_label || chat.account_short_key || ""}`;
+        return t("otherAccount", { account: chat.account_label || chat.account_short_key || "" });
       }
       if (chat.account_status === "known") {
-        return `account: ${chat.account_label || chat.account_short_key || ""}`;
+        return t("accountLabel", { account: chat.account_label || chat.account_short_key || "" });
       }
-      return CURRENT_LANG === "it" ? "account non associato" : "unlinked account";
+      return t("unlinkedAccount");
     }
 
     function renderSelect(select, currentValue, options, previousValue) {
@@ -2116,7 +2538,7 @@ HTML = r"""<!doctype html>
       select.innerHTML = "";
       const base = document.createElement("option");
       base.value = "";
-      base.textContent = normalizedCurrent ? `Chat (${normalizedCurrent})` : "Chat";
+      base.textContent = normalizedCurrent ? `${t("chatSetting")} (${normalizedCurrent})` : t("chatSetting");
       select.appendChild(base);
       for (const value of values) {
         const option = document.createElement("option");
@@ -2127,7 +2549,7 @@ HTML = r"""<!doctype html>
       select.value = previousValue && values.includes(previousValue) ? previousValue : "";
     }
 
-function renderSettingsControls() {
+    function renderSettingsControls() {
       const chat = selectedChat();
       const isCodex = !!(chat && chat.provider === "codex");
       const reset = state.settingsSession !== state.selected;
@@ -2145,11 +2567,7 @@ function renderSettingsControls() {
       );
       renderSelect($("approval-select"), chat && chat.approval_policy, APPROVAL_OPTIONS, previousApproval);
 
-      // --- LOCALIZED PERMISSION/SANDBOX LABEL ---
-      const permLabel = $("permission-field").querySelector("span") || $("permission-field").childNodes[0];
-      if (permLabel) {
-        permLabel.textContent = isCodex ? t("sandbox") : t("permissions");
-      }
+      $("permission-field").querySelector("span").textContent = isCodex ? t("sandbox") : t("permissions");
 
       $("approval-field").classList.toggle("hidden", !isCodex);
       const disabled = !(chat && chat.can_queue);
@@ -2184,7 +2602,7 @@ function renderSettingsControls() {
       $("auto-btn").disabled = !selectedAvailable || state.autoBusy;
       $("auto-btn").className = activeForSelected ? "danger" : "blue";
       $("auto-btn").textContent = state.autoBusy
-        ? (state.autoBusyAction === "disable" ? "..." : "...")
+        ? (state.autoBusyAction === "disable" ? t("disablingAutoContinue") : t("enablingAutoContinue"))
         : activeForSelected
         ? t("disableAutoContinue")
         : t("enableAutoContinue");
@@ -2205,22 +2623,21 @@ function renderSettingsControls() {
       moveToggle.disabled = isCodex || !available || state.transferBusy || !(chat && chat.account_status === "other");
       if (moveToggle.disabled) moveToggle.checked = false;
       $("transfer-btn").disabled = !available || state.transferBusy;
-      
       if (state.transferBusy) {
-        $("transfer-btn").textContent = CURRENT_LANG === "it" ? "Importo..." : "Importing...";
+        $("transfer-btn").textContent = t("importInProgress");
         return;
       }
       if (isCodex) {
-        $("transfer-btn").textContent = CURRENT_LANG === "it" ? "Copia nell'account ChatGPT attivo" : "Copy to active ChatGPT account";
+        $("transfer-btn").textContent = t("copyToActiveChatGpt");
         return;
       }
       if (chat && chat.account_status === "other") {
         $("transfer-btn").textContent = moveToggle.checked
-          ? (CURRENT_LANG === "it" ? "Sposta da altro account" : "Move from other account")
-          : (CURRENT_LANG === "it" ? "Importa da altro account" : "Import from other account");
+          ? t("moveFromOtherAccount")
+          : t("importFromOtherAccount");
         return;
       }
-      $("transfer-btn").textContent = CURRENT_LANG === "it" ? "Importa nell'account attivo" : "Import into active account";
+      $("transfer-btn").textContent = t("importToActiveAccount");
     }
 
     function formatDateTime(value) {
@@ -2241,47 +2658,82 @@ function renderSettingsControls() {
     }
 
     function autoActionLabel(auto) {
-      if (!auto) return "continua";
-      if (auto.action === "claude_try_again") return "Try again nativo";
-      if (auto.action === "retry_failed_prompt") return `reinvio senza duplicato: ${auto.recovery_prompt_preview || "ultimo messaggio"}`;
-      if (auto.action === "codex_inspect") return "analisi automatica del turno Codex";
-      return `continua${auto.action === "continue_interrupted" ? " per completare il turno interrotto" : ""}`;
+      if (!auto) return t("continueAction");
+      if (auto.action === "claude_try_again") return t("nativeTryAgain");
+      if (auto.action === "retry_failed_prompt") {
+        return t("retryWithoutDuplicate", { prompt: auto.recovery_prompt_preview || t("lastMessageLower") });
+      }
+      if (auto.action === "codex_inspect") return t("inspectCodexTurn");
+      return auto.action === "continue_interrupted" ? t("continueInterrupted") : t("continueAction");
+    }
+
+    function autoStatusLabel(status) {
+      const keys = {
+        armed: "stateArmed",
+        monitoring: "stateMonitoring",
+        waiting_limit: "stateWaitingLimit",
+        waiting_retry: "stateWaitingRetry",
+        sending: "stateSending",
+        failed: "stateFailed",
+        blocked: "stateBlocked",
+        blocked_permission: "stateBlockedPermission",
+        done: "stateDone",
+        disabled: "stateDisabled",
+      };
+      return t(keys[status] || "off");
     }
 
     function autoStatusText(auto) {
       if (!auto) return "";
       const shortId = (auto.session_id || "").slice(0, 8);
       const title = auto.title ? ` · ${auto.title}` : "";
-      const runnerText = state.runner && state.runner.running ? "runner attivo" : "runner fermo";
+      const runnerText = state.runner && state.runner.running ? t("runnerActiveLower") : t("runnerStoppedLower");
       if (auto.enabled) {
         if (auto.status === "armed" || auto.status === "monitoring") {
-          const wait = auto.next_check_in_seconds ? `, nuovo controllo tra ${formatDuration(auto.next_check_in_seconds)}` : "";
-          const action = auto.last_observation === "try_again_invoked" && auto.last_action_at
-            ? `, ultimo Try again eseguito ${formatDateTime(auto.last_action_at)}`
+          const wait = auto.next_check_in_seconds
+            ? t("nextCheckSuffix", { duration: formatDuration(auto.next_check_in_seconds) })
             : "";
-          return `Auto-continua attivo su ${shortId}${title}: monitoraggio nativo${action}${wait}, ${runnerText}.`;
+          const action = auto.last_observation === "try_again_invoked" && auto.last_action_at
+            ? t("lastTryAgainSuffix", { time: formatDateTime(auto.last_action_at) })
+            : "";
+          return t("autoMonitoring", { id: shortId, title, action, wait, runner: runnerText });
         }
         if (auto.status === "waiting_limit") {
-          const wait = auto.next_check_in_seconds ? `, controllo tra ${formatDuration(auto.next_check_in_seconds)}` : "";
-          return `Auto-continua attivo su ${shortId}${title}: attendo reset + margine${auto.not_before ? ` fino a ${formatDateTime(auto.not_before)}` : ""}; poi ${autoActionLabel(auto)}${wait}, ${runnerText}.`;
+          const wait = auto.next_check_in_seconds
+            ? t("checkSuffix", { duration: formatDuration(auto.next_check_in_seconds) })
+            : "";
+          const until = auto.not_before ? t("untilSuffix", { time: formatDateTime(auto.not_before) }) : "";
+          return t("autoWaitingLimit", {
+            id: shortId,
+            title,
+            until,
+            action: autoActionLabel(auto),
+            wait,
+            runner: runnerText,
+          });
         }
-        if (auto.status === "waiting_retry") return `Auto-continua attivo su ${shortId}${title}: Try again non era ancora visibile; nessun messaggio inviato, riprovo automaticamente, ${runnerText}.`;
-        if (auto.status === "sending") return `Auto-continua attivo su ${shortId}${title}: ${autoActionLabel(auto)} in corso, ${runnerText}.`;
-        return `Auto-continua attivo su ${shortId}${title}, ${runnerText}.`;
+        if (auto.status === "waiting_retry") return t("autoWaitingRetry", { id: shortId, title, runner: runnerText });
+        if (auto.status === "sending") return t("autoSending", { id: shortId, title, action: autoActionLabel(auto), runner: runnerText });
+        return t("autoEnabled", { id: shortId, title, runner: runnerText });
       }
       if (auto.status === "failed" || auto.status === "blocked" || auto.status === "blocked_permission") {
-        return `Auto-continua ${auto.status} su ${shortId}${title}: ${auto.last_error || "errore"}.`;
+        return t("autoFailed", {
+          status: autoStatusLabel(auto.status),
+          id: shortId,
+          title,
+          error: localizeRuntimeMessage(auto.last_error) || t("errorLower"),
+        });
       }
-      if (auto.status === "done") return `Auto-continua completato su ${shortId}${title}.`;
-      if (auto.status === "disabled") return `Auto-continua disattivato su ${shortId}${title}.`;
-      return `Auto-continua ${auto.status || "spento"} su ${shortId}${title}.`;
+      if (auto.status === "done") return t("autoDone", { id: shortId, title });
+      if (auto.status === "disabled") return t("autoDisabled", { id: shortId, title });
+      return t("autoOff", { status: autoStatusLabel(auto.status), id: shortId, title });
     }
 
     function renderAutoFeedback(message = null, level = null) {
       const el = $("auto-feedback");
       const auto = selectedAutoContinue();
       const activeCount = activeAutoContinues().length;
-      const text = message ?? (autoStatusText(auto) || (activeCount ? `${activeCount} chat con auto-continua attivo.` : ""));
+      const text = message ?? (autoStatusText(auto) || (activeCount ? t("autoActiveCount", { count: activeCount }) : ""));
       el.textContent = text || "";
       const resolvedLevel = level || (
         auto && (auto.status === "failed" || auto.status === "blocked" || auto.status === "blocked_permission")
@@ -2316,7 +2768,7 @@ function renderSettingsControls() {
       }).sort((a, b) => Date.parse(b.last_timestamp || 0) - Date.parse(a.last_timestamp || 0));
       list.innerHTML = "";
       if (!chats.length) {
-          list.innerHTML = `<div class="empty">${t("noChats")}</div>`;
+        list.innerHTML = `<div class="empty">${t("noChats")}</div>`;
         renderSettingsControls();
         renderAutoButton();
         renderTransferButton();
@@ -2330,20 +2782,15 @@ function renderSettingsControls() {
         const accountBadge = accountText(chat);
         const lastMessage = chat.last_user_message || chat.last_prompt || "";
         const lastMessageLoaded = !!(chat.last_user_message_loaded || lastMessage);
-        const lastMessageLabel = CURRENT_LANG === "it" ? "Ultimo messaggio:" : "Last message:";
-        const unavailableText = CURRENT_LANG === "it" ? "non disponibile" : "unavailable";
-        const loadingText = CURRENT_LANG === "it" ? "caricamento..." : "loading...";
-        const usableBadge = chat.can_queue 
-          ? (CURRENT_LANG === "it" ? "utilizzabile" : "usable") 
-          : (CURRENT_LANG === "it" ? "solo visibile" : "view-only");
-        const autoBadge = autoContinueForSession(chat.session_id)?.enabled 
-          ? `<span class="badge">${CURRENT_LANG === "it" ? "auto-continua attivo" : "auto-continue active"}</span>` 
+        const lastMessageLabel = t("lastMessage");
+        const lastMessageText = lastMessage || (lastMessageLoaded ? t("unavailable") : t("loadingLower"));
+        const usableBadge = chat.can_queue ? t("usableLower") : t("viewOnly");
+        const autoBadge = autoContinueForSession(chat.session_id)?.enabled
+          ? `<span class="badge">${t("autoContinueActive")}</span>`
           : "";
-        const untitledText = CURRENT_LANG === "it" ? "Senza titolo" : "Untitled";
-        const lastMessageText = lastMessage || (lastMessageLoaded ? unavailableText : loadingText);
 
         btn.innerHTML = `
-          <span class="chat-title">${escapeHtml(chat.short_id)} · ${escapeHtml(chat.title || untitledText)}</span>
+          <span class="chat-title">${escapeHtml(chat.short_id)} · ${escapeHtml(chat.title || t("untitled"))}</span>
           <span class="chat-last-message${lastMessage ? "" : " unavailable"}" title="${escapeAttr(`${lastMessageLabel} ${lastMessageText}`)}"><b>${lastMessageLabel}</b> ${escapeHtml(lastMessageText)}</span>
           <span class="chat-sub">
             <span class="badge">${escapeHtml(chat.source || "")}</span>
@@ -2361,7 +2808,7 @@ function renderSettingsControls() {
         btn.onclick = () => {
           state.selected = chat.session_id;
           state.settingsSession = null;
-          $("selected-chat").textContent = `${chat.provider === "codex" ? "Codex" : "Claude"} · ${chat.short_id} · ${chat.title || location || ""} · ${chat.can_queue ? "utilizzabile" : "solo visibile"} · ${accountText(chat)}`;
+          $("selected-chat").textContent = `${chat.provider === "codex" ? "Codex" : "Claude"} · ${chat.short_id} · ${chat.title || location || ""} · ${usableBadge} · ${accountText(chat)}`;
           renderSettingsControls();
           renderAutoButton();
           renderAutoFeedback();
@@ -2395,45 +2842,48 @@ function renderSettingsControls() {
       const recovery = data.recovery || null;
       const recoveryBox = recovery ? `
         <div class="recovery-box">
-          Recovery: <b>${escapeHtml(recovery.recovery_prompt_preview || recovery.prompt || "analisi automatica")}</b> ${CURRENT_LANG === "it" ? "sulla chat" : "on chat"} ${escapeHtml((recovery.session_id || "").slice(0, 8))}.
-          ${recovery.recovery_followup_count ? `<br><span class="meta">${escapeHtml(String(recovery.recovery_followup_count))} ${CURRENT_LANG === "it" ? "altri messaggi falliti in coda." : "more failed messages in queue."}</span>` : ""}
-          ${recovery.not_before ? `<br><span class="meta">${CURRENT_LANG === "it" ? "Non prima di" : "Not before"} ${escapeHtml(formatDateTime(recovery.not_before))}</span>` : ""}
+          ${t("recoveryTitle")}: <b>${escapeHtml(recovery.recovery_prompt_preview || recovery.prompt || t("automaticAnalysis"))}</b> ${t("onChat")} ${escapeHtml((recovery.session_id || "").slice(0, 8))}.
+          ${recovery.recovery_followup_count ? `<br><span class="meta">${escapeHtml(t("recoveredFollowups", { count: recovery.recovery_followup_count }))}</span>` : ""}
+          ${recovery.not_before ? `<br><span class="meta">${escapeHtml(t("notBefore", { time: formatDateTime(recovery.not_before) }))}</span>` : ""}
         </div>
       ` : "";
       const runner = state.runner || {};
+      const runnerLabel = runner.running
+        ? `${t("runnerActive")}${runner.pid ? ` #${escapeHtml(runner.pid)}` : ""}`
+        : (runner.automatic ? t("runnerWaiting") : t("runnerStopped"));
       const autos = [...state.autoContinues].sort((a, b) => Number(!!b.enabled) - Number(!!a.enabled));
       const autoBoxes = autos.map((auto) => {
         const effective = auto.fingerprint && auto.fingerprint.effective ? auto.fingerprint.effective : {};
         const autoIsCodex = auto.provider === "codex";
         const autoDetails = [
-          `${t("status")}: ${escapeHtml(auto.status || "off")}`,
-          `Action: ${escapeHtml(autoActionLabel(auto))}`,
-          auto.recovery_followup_count ? `Recovered messages: ${escapeHtml(String(auto.recovery_followup_count))}` : "",
-          `Runner: ${runner.running ? `active${runner.pid ? ` #${escapeHtml(runner.pid)}` : ""}` : (runner.automatic ? "automatic waiting" : "stopped")}`,
-          `Source: ${escapeHtml(auto.source || (autoIsCodex ? "Codex App" : "Claude Code"))}`,
-          !autoIsCodex && auto.source_key === "claude_windows_app" ? "IDE integration: unused" : "",
+          `${t("status")}: ${escapeHtml(autoStatusLabel(auto.status))}`,
+          `${t("action")}: ${escapeHtml(autoActionLabel(auto))}`,
+          auto.recovery_followup_count ? `${t("recoveredMessages")}: ${escapeHtml(String(auto.recovery_followup_count))}` : "",
+          `${t("runner")}: ${runnerLabel}`,
+          `${t("source")}: ${escapeHtml(auto.source || (autoIsCodex ? "Codex App" : "Claude Code"))}`,
+          !autoIsCodex && auto.source_key === "claude_windows_app" ? t("ideIntegrationUnused") : "",
           `${t("model")}: ${escapeHtml(auto.model_override || effective.model || "chat")}`,
           `${t("effort")}: ${escapeHtml(auto.effort_level_override || effective.effortLevel || "chat")}`,
           autoIsCodex
             ? `${t("sandbox")}: ${escapeHtml(auto.sandbox_mode_override || effective.sandboxMode || "task")}`
             : `${t("permissions")}: ${escapeHtml(auto.permission_mode_override || effective.permissionMode || "chat")}`,
           autoIsCodex ? `${t("approvals")}: ${escapeHtml(auto.approval_policy_override || effective.approvalPolicy || "task")}` : "",
-          `Checks: ${escapeHtml(String(auto.attempts || 0))}`,
-          auto.actions_completed ? `Try again executed: ${escapeHtml(String(auto.actions_completed))}` : "",
-          auto.last_action_at ? `Last action: ${escapeHtml(formatDateTime(auto.last_action_at))}` : "",
-          auto.sending_started_at ? `Sending started: ${escapeHtml(formatDateTime(auto.sending_started_at))}` : "",
-          auto.not_before && auto.status !== "sending" ? `Next attempt: ${escapeHtml(formatDateTime(auto.not_before))}` : "",
-          auto.next_check_in_seconds ? `Next check: in ${escapeHtml(formatDuration(auto.next_check_in_seconds))}` : "",
-          auto.last_check_at ? `Last check: ${escapeHtml(formatDateTime(auto.last_check_at))}` : "",
-          auto.updated_at ? `Updated: ${escapeHtml(formatDateTime(auto.updated_at))}` : "",
+          `${t("checks")}: ${escapeHtml(String(auto.attempts || 0))}`,
+          auto.actions_completed ? `${t("tryAgainExecuted")}: ${escapeHtml(String(auto.actions_completed))}` : "",
+          auto.last_action_at ? `${t("lastAction")}: ${escapeHtml(formatDateTime(auto.last_action_at))}` : "",
+          auto.sending_started_at ? `${t("sendingStarted")}: ${escapeHtml(formatDateTime(auto.sending_started_at))}` : "",
+          auto.not_before && auto.status !== "sending" ? `${t("nextAttempt")}: ${escapeHtml(formatDateTime(auto.not_before))}` : "",
+          auto.next_check_in_seconds ? `${t("nextCheck")}: ${escapeHtml(t("inDuration", { duration: formatDuration(auto.next_check_in_seconds) }))}` : "",
+          auto.last_check_at ? `${t("lastCheck")}: ${escapeHtml(formatDateTime(auto.last_check_at))}` : "",
+          auto.updated_at ? `${t("updated")}: ${escapeHtml(formatDateTime(auto.updated_at))}` : "",
         ].filter(Boolean).join("<br>");
         return `
           <div class="auto-box">
-            Auto-continue: <b>${auto.enabled ? "active" : escapeHtml(auto.status || "off")}</b>
-            ${CURRENT_LANG === "it" ? "sulla chat" : "on chat"} ${escapeHtml((auto.session_id || "").slice(0, 8))}
+            ${t("autoContinue")}: <b>${auto.enabled ? t("active") : escapeHtml(autoStatusLabel(auto.status))}</b>
+            ${t("onChat")} ${escapeHtml((auto.session_id || "").slice(0, 8))}
             ${auto.title ? ` · ${escapeHtml(auto.title)}` : ""}.
             <br><span class="meta">${autoDetails}</span>
-            ${auto.last_error && auto.status !== "sending" ? `<br><span class="meta">${escapeHtml(auto.last_error)}</span>` : ""}
+            ${auto.last_error && auto.status !== "sending" ? `<br><span class="meta">${escapeHtml(localizeRuntimeMessage(auto.last_error))}</span>` : ""}
           </div>
         `;
       }).join("");
@@ -2443,11 +2893,10 @@ function renderSettingsControls() {
         return;
       }
 
-      const attemptsSuffix = CURRENT_LANG === "it" ? "tent." : "att.";
       const rows = state.queue.map((item) => `
         <tr>
-          <td style="width:82px"><span class="status-pill ${escapeHtml(item.status || "")}">${escapeHtml(item.status || "")}</span></td>
-          <td style="width:90px">${escapeHtml(item.id || "")}<br><span class="meta">${escapeHtml(String(item.attempts || 0))} ${attemptsSuffix}</span></td>
+          <td style="width:82px"><span class="status-pill ${escapeHtml(item.status || "")}">${escapeHtml(queueStatusLabel(item.status))}</span></td>
+          <td style="width:90px">${escapeHtml(item.id || "")}<br><span class="meta">${escapeHtml(String(item.attempts || 0))} ${t("attemptsAbbrev")}</span></td>
           <td><span class="badge">${item.provider === "codex" ? "Codex" : "Claude"}</span> ${escapeHtml(item.title || item.session_id || "")}<br><span class="meta">${t("priority")}: ${escapeHtml(String(item.priority ?? 100))} · ${escapeHtml((item.prompt || "").slice(0, 180))}</span></td>
           <td style="width:178px">
             <button onclick="removeItem('${escapeAttr(item.id || "")}')">${t("remove")}</button>
@@ -2459,13 +2908,25 @@ function renderSettingsControls() {
       $("queue").innerHTML = autoBoxes + recoveryBox + `<table><thead><tr><th>${t("status")}</th><th>${t("id")}</th><th>${t("item")}</th><th>${t("actions")}</th></tr></thead><tbody>${rows}</tbody></table>`;
     }
 
+    function queueStatusLabel(status) {
+      const key = {
+        pending: "queueStatePending",
+        running: "queueStateRunning",
+        done: "queueStateDone",
+        failed: "queueStateFailed",
+        rate_limited: "queueStateRateLimited",
+        blocked: "queueStateBlocked",
+      }[status];
+      return key ? t(key) : (status || t("off"));
+    }
+
     async function refreshDoctor() {
       if (state.doctorBusy) return;
       state.doctorBusy = true;
       try {
         renderDoctor(await api("/api/doctor"));
       } catch (err) {
-        appendLog("Errore ambiente: " + err.message);
+        appendLog(t("environmentError", { error: localizeRuntimeMessage(err.message) }));
       } finally {
         state.doctorBusy = false;
       }
@@ -2484,12 +2945,12 @@ function renderSettingsControls() {
           renderChats();
         });
         const [queueResult, chatsResult] = await Promise.allSettled([queueTask, chatsTask]);
-        if (queueResult.status === "rejected") appendLog("Errore coda: " + queueResult.reason.message);
+        if (queueResult.status === "rejected") appendLog(t("queueError", { error: localizeRuntimeMessage(queueResult.reason.message) }));
         if (chatsResult.status === "rejected") {
-          appendLog("Errore chat: " + chatsResult.reason.message);
+          appendLog(t("chatError", { error: localizeRuntimeMessage(chatsResult.reason.message) }));
         }
       } catch (err) {
-        appendLog("Errore refresh: " + err.message);
+        appendLog(t("refreshError", { error: localizeRuntimeMessage(err.message) }));
       } finally {
         state.refreshBusy = false;
       }
@@ -2498,17 +2959,17 @@ function renderSettingsControls() {
     async function addMessages() {
       try {
         const selected = selectedChat();
-        if (selected && selected.account_status === "other") throw new Error("Questa chat/task appartiene a un altro account: cambia account o associala prima di inviare.");
-        if (selected && !selected.can_queue) throw new Error("Questa chat/task e' solo visibile e non e' accodabile.");
+        if (selected && selected.account_status === "other") throw new Error(t("otherAccountCannotSend"));
+        if (selected && !selected.can_queue) throw new Error(t("viewOnlyCannotQueue"));
         const result = await api("/api/add", {
           method: "POST",
           body: JSON.stringify({ session_id: state.selected, messages: $("messages").value, ...selectedSettingPayload() }),
         });
         $("messages").value = "";
-        appendLog(`Accodati ${result.added} messaggi.`);
+        appendLog(t("queuedMessages", { count: result.added }));
         await refreshAll();
       } catch (err) {
-        appendLog("Errore add: " + err.message);
+        appendLog(t("addError", { error: localizeRuntimeMessage(err.message) }));
       }
     }
 
@@ -2516,9 +2977,9 @@ function renderSettingsControls() {
       try {
         const result = await api("/api/check-settings", { method: "POST", body: "{}" });
         const lines = result.results.map((r) => `${r.id}: ${r.ok ? "ok" : r.diffs.join("; ")}`);
-        appendLog(lines.length ? lines.join("\n") : "Nessun elemento in coda.");
+        appendLog(lines.length ? lines.join("\n") : t("noQueueItems"));
       } catch (err) {
-        appendLog("Errore impostazioni: " + err.message);
+        appendLog(t("settingsError", { error: localizeRuntimeMessage(err.message) }));
       }
     }
 
@@ -2528,8 +2989,8 @@ function renderSettingsControls() {
       state.autoBusy = true;
       state.autoBusyAction = activeForSelected ? "disable" : "enable";
       renderAutoButton();
-      renderAutoFeedback(activeForSelected ? "Disattivazione auto-continua..." : "Attivazione auto-continua: preparo il contesto e controllo le impostazioni remote...", "warn");
-      appendLog(activeForSelected ? "Disattivazione auto-continua..." : "Attivazione auto-continua in corso...");
+      renderAutoFeedback(activeForSelected ? t("autoDisableProgress") : t("autoEnablePrepareProgress"), "warn");
+      appendLog(activeForSelected ? t("autoDisableProgress") : t("autoEnableProgress"));
       try {
         const result = await api("/api/auto-continue", {
           method: "POST",
@@ -2539,13 +3000,14 @@ function renderSettingsControls() {
           ? result.auto_continues
           : (result.auto_continue ? [result.auto_continue] : []);
         const changed = result.auto_continue || selectedAutoContinue();
-        const message = autoStatusText(changed) || (activeForSelected ? "Auto-continua disattivato." : "Auto-continua attivato.");
+        const message = autoStatusText(changed) || (activeForSelected ? t("autoDisabledSuccess") : t("autoEnabledSuccess"));
         appendLog(message);
         renderAutoFeedback(message, changed && (changed.status === "failed" || changed.status === "blocked") ? "error" : "ok");
         await refreshAll();
       } catch (err) {
-        renderAutoFeedback("Errore auto-continua: " + err.message, "error");
-        appendLog("Errore auto-continua: " + err.message);
+        const message = t("autoContinueError", { error: localizeRuntimeMessage(err.message) });
+        renderAutoFeedback(message, "error");
+        appendLog(message);
       } finally {
         state.autoBusy = false;
         state.autoBusyAction = null;
@@ -2558,11 +3020,11 @@ function renderSettingsControls() {
       if (!transferAvailable(selected)) return;
       const move = $("transfer-move").checked && selected.account_status === "other";
       const isCodex = selected.provider === "codex";
-      const action = move ? "Spostare" : "Importare";
-      const label = selected.account_status === "other" ? "da un altro account" : "dalla transcript locale";
       const question = isCodex
-        ? "Creare una nuova task nell'account ChatGPT/Codex attivo? Verrà copiato l'intero contesto in un nuovo ID; archiviazione, ripristino ed eliminazione resteranno sincronizzati tra le due copie locali."
-        : `${action} questa chat ${label} nell'account Claude attivo?`;
+        ? t("confirmCopyCodex")
+        : (move
+          ? t("confirmMoveClaude")
+          : t(selected.account_status === "other" ? "confirmImportOtherClaude" : "confirmImportTranscriptClaude"));
       if (!window.confirm(question)) return;
       state.transferBusy = true;
       renderTransferButton();
@@ -2582,21 +3044,25 @@ function renderSettingsControls() {
         ].reduce((total, key) => total + Number(artifactSync[key] || 0), 0);
         const codeArtifactChanges = Number(artifactSync.code_artifact_copies_created || 0)
           + Number(artifactSync.code_artifact_transcripts_created || 0);
-        const artifactText = isCodex ? "" : ` · artefatti: ${artifactChanges + codeArtifactChanges}`;
-        appendLog(`Import completato: ${transfer.status || "ok"} · ${transfer.title || selected.title || state.selected}${artifactText}`);
+        const artifactText = isCodex ? "" : t("artifactsSuffix", { count: artifactChanges + codeArtifactChanges });
+        appendLog(t("importCompleted", {
+          status: transfer.status || "ok",
+          title: transfer.title || selected.title || state.selected,
+          artifacts: artifactText,
+        }));
         if (Number(artifactSync.artifact_missing_files || 0) > 0) {
-          appendLog(`Attenzione: ${artifactSync.artifact_missing_files} artefatti hanno il manifesto ma manca il file locale.`);
+          appendLog(t("missingArtifacts", { count: artifactSync.artifact_missing_files }));
         }
         if (Number(artifactSync.code_artifact_pending_accounts || 0) > 0) {
-          appendLog(`Artefatti Claude Code in attesa: ${artifactSync.code_artifact_pending_accounts} account non ha ancora una credenziale valida in cache.`);
+          appendLog(t("pendingClaudeArtifacts", { count: artifactSync.code_artifact_pending_accounts }));
         }
         for (const error of (artifactSync.code_artifact_errors || [])) {
-          appendLog(`Errore artefatto Claude Code: ${error}`);
+          appendLog(t("artifactError", { error }));
         }
         renderChats();
         await refreshAll();
       } catch (err) {
-        appendLog("Errore import account: " + err.message);
+        appendLog(t("importError", { error: localizeRuntimeMessage(err.message) }));
       } finally {
         state.transferBusy = false;
         renderTransferButton();

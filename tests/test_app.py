@@ -3,7 +3,9 @@ from __future__ import annotations
 import base64
 import datetime as dt
 import json
+import shutil
 import sqlite3
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -40,7 +42,7 @@ class QueueAppTests(unittest.TestCase):
         self.assertNotIn("Promise.allSettled([doctorTask, chatsTask])", web.HTML)
 
     def test_public_version_and_legacy_state_compatibility(self) -> None:
-        self.assertEqual(claude_codex_queue.__version__, "0.3.0")
+        self.assertEqual(claude_codex_queue.__version__, "0.3.1")
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             legacy = root / app.LEGACY_APP_DIR_NAME
@@ -1737,6 +1739,58 @@ class QueueAppTests(unittest.TestCase):
         self.assertIn("numero e contenuto identici", web.HTML)
         self.assertIn("Accesso Codex in background", web.HTML)
         self.assertIn("sola lettura", web.HTML)
+
+    @unittest.skipUnless(shutil.which("node"), "Node.js is required for JavaScript localization checks")
+    def test_dashboard_localization_is_complete_and_uses_browser_locale(self) -> None:
+        core = web.HTML.split("// I18N_CORE_START", 1)[1].split("// I18N_CORE_END", 1)[0]
+        script = core + r"""
+const result = {
+  enKeys: Object.keys(I18N.en).sort(),
+  itKeys: Object.keys(I18N.it).sort(),
+  locales: ["it-IT", "it-CH", "en-US", "fr-FR"].map(languageForLocale),
+  pageLanguages: [
+    languageForPage("it-IT", ""),
+    languageForPage("it-IT", "?lang=en"),
+    languageForPage("en-US", "?lang=it"),
+    languageForPage("en-US", "?lang=unsupported"),
+  ],
+  enQueued: translate("en", "queuedMessages", { count: 3 }),
+  itQueued: translate("it", "queuedMessages", { count: 3 }),
+  enWaiting: translate("en", "autoWaitingRetry", {
+    id: "12345678",
+    title: " · Recovery",
+    runner: "runner active",
+  }),
+  itWaiting: translate("it", "autoWaitingRetry", {
+    id: "12345678",
+    title: " · Recovery",
+    runner: "runner attivo",
+  }),
+  enRuntimeError: translateRuntimeMessage("en", "Impostazioni cambiate: account diverso"),
+  itRuntimeError: translateRuntimeMessage("it", "Impostazioni cambiate: account diverso"),
+};
+process.stdout.write(JSON.stringify(result));
+"""
+        completed = subprocess.run(
+            [shutil.which("node") or "node", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        result = json.loads(completed.stdout)
+
+        self.assertEqual(result["enKeys"], result["itKeys"])
+        self.assertEqual(result["locales"], ["it", "it", "en", "en"])
+        self.assertEqual(result["pageLanguages"], ["it", "en", "it", "en"])
+        self.assertEqual(result["enQueued"], "Queued 3 messages.")
+        self.assertEqual(result["itQueued"], "Accodati 3 messaggi.")
+        self.assertIn("no message was sent", result["enWaiting"])
+        self.assertIn("nessun messaggio inviato", result["itWaiting"])
+        self.assertEqual(result["enRuntimeError"], "Settings changed: different account")
+        self.assertEqual(result["itRuntimeError"], "Impostazioni cambiate: account diverso")
+        self.assertIn('languageForPage(USER_LOCALE, window.location.search)', web.HTML)
+        self.assertIn('document.documentElement.lang = CURRENT_LANG', web.HTML)
+        self.assertNotIn('CURRENT_LANG === "it"', web.HTML)
 
     def test_settings_fingerprint_detects_changed_settings_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

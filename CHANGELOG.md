@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+## 0.3.1 - 2026-08-01
+
+- Added complete zero-dependency English and Italian dashboard localization selected from the browser locale, with an optional per-tab URL override and translated dynamic queue, account, error and auto-continue states.
+- Kept date and time formatting tied to the browser's regional settings in both languages.
+- Added executable localization coverage for translation-key parity, locale selection and critical auto-continue feedback.
+
 ## 0.3.0 - 2026-07-30
 
 - Added a per-account Claude and ChatGPT usage dashboard with the next reset, first available account and browser-local date formatting.
